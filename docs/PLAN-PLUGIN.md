@@ -1,6 +1,6 @@
 # Plan — Plugin para Pi (`rp-plugin`)
 
-Contexto: [ARQUITECTURA.md](ARQUITECTURA.md) · Compatibilidad con herdr / gentle-ai / gentle-shell y separación por PC:
+Contexto: [ARQUITECTURA.md](ARQUITECTURA.md) · Resiliencia e independencia: [RESILIENCIA.md](RESILIENCIA.md) · Compatibilidad con herdr / gentle-ai / gentle-shell y separación por PC:
 [COMPATIBILIDAD.md](COMPATIBILIDAD.md) · Contrato de red: `rp-relay/docs/PROTOCOLO.md`.
 Versiones de referencia: Pi **1.2.0**, gentle-pi **4.1.0**, herdr **0.9.3**. Las rutas `src/...` son de
 `earendil-works/pi/packages/coding-agent/`; las de gentle-pi y herdr se indican con su prefijo.
@@ -43,7 +43,7 @@ rp-plugin/
 │   │   ├── forwarder.ts     # eventos Pi → agent.event (coalescido, truncado, redacción)
 │   │   ├── snapshot.ts      # getBranch() → agent.snapshot
 │   │   ├── inbound.ts       # user.message / abort / prompt.answer
-│   │   ├── delivery/{api.ts, herdr.ts}   # entrega por sendUserMessage o "como tecleado" vía herdr
+│   │   ├── delivery/{api.ts, interactive.ts, herdr.ts}   # sendUserMessage · tecleado en el proceso · vía herdr
 │   │   ├── attachments.ts
 │   │   ├── prompts/
 │   │   │   ├── broker.ts    # prompts abiertos, carrera terminal vs. móvil
@@ -83,7 +83,7 @@ que `pi` y `gentle-shell` (homes distintos) compartan el emparejamiento de la PC
     "useAnnotations": true
   },
   "mirrorDialogs": true,
-  "delivery": { "default": "auto" }, // auto | api | terminal   (auto = terminal si herdr y gentle en AUTO; api en otro caso)
+  "delivery": { "method": "auto", "interactive": true },  // auto | api | interactive | herdr  (auto: gentle AUTO → interactive → herdr → api; si no, api)
   "subagents": "skip",               // skip (defecto) | connect
   "inboxDir": null                   // por defecto ~/.config/rp/inbox
 }
@@ -98,9 +98,10 @@ Overrides: `RP_RELAY_URL`, `RP_DISABLED=1`, `RP_CONFIG`; flag `--rp-off`.
 | Lanzado por gentle-shell | `GENTLE_SHELL_USER_PI_HOME` definido o `PI_CODING_AGENT_DIR` termina en `.gentle-shell/agent` | `launcher:"gentle-shell"` en `agent.hello` |
 | gentle-pi cargado | `pi.getAllTools()` contiene `ask_user_choice`/`ask_user_question`, o se observa `setStatus("gentle:mode", …)` | gate `auto-detect` → off; adaptadores activos |
 | Modo de permisos gentle | último `setStatus("gentle:mode", "Permissions: X")` | `agent.hello.gentle.mode` + `agent.statuses` → la app avisa en AUTO |
-| Dentro de herdr | `HERDR_ENV==="1"` y `HERDR_PANE_ID` | `herdr:{paneId,tabId,workspaceId,session}`; habilita entrega "terminal" |
+| Dentro de herdr | `HERDR_ENV==="1"` y `HERDR_PANE_ID` | `herdr:{paneId,tabId,workspaceId,session}`; habilita entrega `herdr` (opcional) |
+| Sistema operativo | `process.platform` (`linux` en la PC personal, `win32` en la de la empresa) | rutas de config/inbox, backend de rp-host |
 | Modo Pi | `ctx.mode` (`tui`/`rpc`/`json`/`print`) | ver §12 |
-| Lanzado por rp-host | `RP_SPAWN_ID` | `spawnId` en `agent.hello` |
+| Lanzado por rp-host | `RP_SPAWN_ID` o flag `--rp-spawn-id` | `spawnId` en `agent.hello` |
 
 ## 5. Ciclo de vida
 
@@ -112,6 +113,7 @@ export default function rp(pi: ExtensionAPI) {
   const env = detectStaticEnv(process.env);            // child, herdr, launcher, spawnId
   const cfg = loadConfig();                            // sync, sólo lectura
   registerCommands(pi, cfg); pi.registerFlag("rp-off", { type: "boolean", description: "Disable RP for this run" });
+  pi.registerFlag("rp-spawn-id", { type: "string", description: "Internal: id assigned by rp-host" });
   if (env.isGentleChild && cfg.subagents === "skip") return;       // nada más en subagentes
   let rt: Runtime | undefined;
   pi.on("session_start", async (ev, ctx) => {
@@ -278,17 +280,20 @@ Se registra en `session_start` **sólo** si no existe ninguna herramienta llamad
 ## 9. Entrada desde el móvil
 
 ### 9.1 Entrega del mensaje (`delivery/`)
-| Modo | Cómo | Cuándo |
-|---|---|---|
-| `api` | `pi.sendUserMessage(content, {deliverAs})` (ocupado → `followUp` o `steer`); `source:"extension"` | por defecto |
-| `terminal` | `herdr agent prompt $HERDR_PANE_ID <texto>` (vía `pi.exec("herdr", [...])`); entra como tecleado (`source:"interactive"`) | si el usuario lo elige en la app, o en `auto` cuando el agente está en herdr **y** gentle-pi está en modo AUTO |
-| comando | `pi.sendUserMessage("/…", {expandPromptTemplates:true})` | mensajes que empiezan con `/` y el usuario marcó "ejecutar como comando" (p. ej. `/gentle:mode normal`) |
+| Método | Cómo | `source` en Pi | Cuándo |
+|---|---|---|---|
+| `api` | `pi.sendUserMessage(content, {deliverAs})` | `extension` | sin modo Auto de gentle; adjuntos de imagen nativos |
+| `interactive` | el plugin **teclea** el texto en la TUI de su propio proceso (`process.stdin.emit("data", …)`, pegado entre corchetes + Enter). Detalle y salvaguardas en RESILIENCIA §2 | `interactive` | gentle en **AUTO** (por defecto), o si el usuario lo elige; **no depende de herdr**; Linux y Windows |
+| `herdr` | `pi.exec("herdr", ["agent","prompt", HERDR_PANE_ID, texto])` (sin shell) | `interactive` | alternativa si `interactive` no está disponible y el agente corre en herdr |
+| comando | `pi.sendUserMessage("/…", {expandPromptTemplates:true})` (`agent-session.ts:2062`) | — | texto `/…` marcado "ejecutar como comando" |
 
-- `terminal` sólo texto; adjuntos → se guardan en inbox y se agregan como rutas al texto. Si herdr responde
-  `agent_blocked` (hay un diálogo abierto) → `user.message.ack{disposition:"rejected", error:"agent_blocked"}` y la app
-  ofrece responder el prompt primero o reenviar por `api`.
-- El texto en `terminal` se envía como argumento (sin shell) para evitar inyección.
-- `pi.appendEntry("rp.origin", {clientMsgId, deviceId, delivery})` marca el origen (no entra al contexto del modelo).
+- `method:"auto"`: gentle en AUTO → `interactive` → `herdr` → `api` + aviso "no autoriza en Auto".
+- `interactive` y `herdr` sólo llevan texto; los adjuntos se guardan en el inbox y se citan por ruta.
+- `interactive` requiere `ctx.mode === "tui"`; espera a que no haya diálogo abierto; guarda y restaura el borrador del
+  editor; para *follow-up* espera a `agent_settled` (no depende de la tecla configurada, que en Windows es `ctrl+q`);
+  confirma con el evento `input` (`source:"interactive"`, texto igual) en ≤3 s o revierte y cae al siguiente método.
+- Idempotencia: el plugin recuerda los últimos 500 `clientMsgId` por agente; repetido → `ack{disposition:"duplicate"}`.
+- `pi.appendEntry("rp.origin", {clientMsgId, deviceId, method})` marca el origen (auditoría; no entra al contexto).
 
 ### 9.2 Adjuntos
 Igual que el plan v1: descarga `GET /v1/blobs/{id}` (token de máquina), verificación `sha256`; imágenes ≤10 MB →
@@ -299,11 +304,12 @@ Igual que el plan v1: descarga `GET /v1/blobs/{id}` (token de máquina), verific
 
 ## 10. `rp-host` (fase 3): crear agentes desde el móvil
 
-- Servicio por PC: Linux `systemctl --user enable --now rp-host`; macOS `launchd`; Windows tarea programada al iniciar
-  sesión. Usa el `machineToken` de `~/.config/rp/`.
+- Servicio por PC: **Linux (PC personal)** `systemctl --user enable --now rp-host`; **Windows (PC empresa)** tarea
+  programada al iniciar sesión (`schtasks /Create /SC ONLOGON /TN rp-host /TR "rp-host run"`, sin administrador);
+  macOS `launchd`. Usa el `machineToken` de la config de RP.
 - `~/.config/rp/host.json`:
   ```jsonc
-  { "roots": ["~/proyectos"], "backend": "herdr",          // herdr | tmux
+  { "roots": ["~/proyectos"], "backend": "auto",           // auto | herdr | tmux | wt | console  (auto: herdr si está; si no tmux en Linux, wt en Windows)
     "launchers": { "gentle-shell": "gentle-shell", "pi": "pi" }, "defaultLauncher": "gentle-shell",
     "herdrSession": null }                                  // null = sesión por defecto de herdr
   ```
@@ -311,7 +317,10 @@ Igual que el plan v1: descarga `GET /v1/blobs/{id}` (token de máquina), verific
   - **herdr** (COMPATIBILIDAD H4): `herdr workspace create --cwd <cwd> --label <name> --env RP_SPAWN_ID=<ulid> --no-focus`
     → leer `.result.root_pane.pane_id` → `herdr pane run <pane> "<launcher>"`. El agente aparece en tu herdr (lo ves al
     volver al PC) y en la app.
-  - **tmux**: `tmux new-session -d -s rp-<short> -c <cwd> -e RP_SPAWN_ID=<ulid> "<launcher>"` (tmux ≥ 3.2).
+  - **tmux** (Linux): `tmux new-session -d -s rp-<short> -c <cwd> -e RP_SPAWN_ID=<ulid> "<launcher>"` (tmux ≥ 3.2).
+  - **wt** (Windows Terminal): `wt.exe -w rp new-tab -d <cwd> --title <name> <launcher> --rp-spawn-id <ulid>`
+    (Pi pasa flags desconocidos a las extensiones, `cli/args.ts:56-257`; gentle-shell los reenvía a Pi como passthrough).
+  - **console** (Windows sin `wt`): `cmd /c start "<name>" /D <cwd> <launcher> --rp-spawn-id <ulid>`.
   - El plugin envía `spawnId` en `agent.hello`; el relay entrega `initialPrompt` como `user.message` a ese agente.
 - `host.list_dirs {path}` (sólo dentro de `roots`), `host.kill {spawnId}` (sólo agentes creados por rp-host:
   `herdr workspace close` / `tmux kill-session`).
@@ -338,7 +347,7 @@ Igual que el plan v1: descarga `GET /v1/blobs/{id}` (token de máquina), verific
 | `rpc` (IDE, cliente RPC) | sí (`rpc-mode.ts:90-115` respeta `signal`) | cliente + móvil | subagentes gentle excluidos por `GENTLE_PI_AGENTS_CHILD` |
 | `json` / `print` | no (`hasUI=false`) | sólo móvil (broker sin rama local) | agentes headless controlables desde el móvil |
 
-Compatibilidad mínima: Pi ≥ 1.2.0. gentle-pi probado 4.x. herdr ≥ 0.9 (sólo para entrega `terminal`/rp-host).
+Compatibilidad mínima: Pi ≥ 1.2.0. gentle-pi probado 4.x. herdr ≥ 0.9 (sólo para entrega `herdr`/rp-host).
 Plataformas: Linux, macOS, Windows (plugin); rp-host: herdr en las tres, tmux en Linux/macOS.
 
 ## 13. Tests
@@ -349,7 +358,7 @@ Plataformas: Linux, macOS, Windows (plugin); rp-host: herdr en las tres, tmux en
 | Contrato | mensajes vs `@j3pf/rp-protocol` |
 | Integración Pi | SDK `createAgentSession` + proveedor falso + relay en memoria (flujo gate, respuestas remotas) |
 | Integración gentle-pi | Pi + `gentle-pi@4.1.0` + plugin, en `pi --mode rpc` con `RpcClient` (+ `GENTLE_SHELL_INTERACTIVE_HOST` sin definir): confirmación de comando peligroso respondida desde el "móvil"; `ask_user_question` respondida por adaptador en TUI real dentro de `tmux`/herdr (E2E con `herdr pane read` para verificar que el diálogo se cerró) |
-| E2E herdr | panel herdr con gentle-shell: `herdr agent prompt` desde la entrega `terminal`; `rp-host` crea workspace; reinicio del servidor herdr conserva `agentId` |
+| E2E herdr | panel herdr con gentle-shell: `herdr agent prompt` desde la entrega `herdr`; `rp-host` crea workspace; reinicio del servidor herdr conserva `agentId` |
 | Regresión gentle-ai | `gentle-ai sync` en un home de prueba conserva `npm:@j3pf/pi-rp` |
 | Manual | `docs/QA.md` |
 
@@ -362,7 +371,8 @@ CI: matriz Pi `1.2.0`/`latest` × gentle-pi `4.1.0`/`latest`.
 | P0 | **Spike S1**: parche de `ctx.ui` + cierre de diálogo TUI con `signal`, junto a `permission-gate.ts` | 0 | 1 d |
 | P0b | **Spike S4**: gentle-shell (aislado y takeover) carga `npm:@j3pf/pi-rp`; responder desde fuera: confirmación de gentle-pi, `ask_user_question` por adaptador, pregunta de subagente; `/gentle:mode normal` por `sendUserMessage` | 0 | 1,5 d |
 | P0c | **Spike S5**: herdr — `herdr agent prompt` como entrega, `workspace create` + `pane run gentle-shell`, reanudación conserva `sessionId` | 0 | 0,5 d |
-| P0d | **Spike S6**: conectividad desde la PC de la empresa (proxy, WS, TLS) | 0 | 0,5 d |
+| P0d | **Spike S6**: conectividad desde la PC Windows de la empresa (proxy, WS, TLS) | 0 | 0,5 d |
+| P0e | **Spike S7**: entrega `interactive` (stdin en el proceso) en Linux y Windows, con Pi y con gentle-shell (incluido modo Vim), y que gentle-pi en AUTO la cuente como petición humana | 0 | 1 d |
 | P1 | Esqueleto, config XDG, entorno, `/rp pair|status|doctor`, compat | 1 | 1,5 d |
 | P2 | Conexión WS + proxy + hello/snapshot/reconexión/cola | 1 | 2 d |
 | P3 | Forwarder + statuses + redacción | 1 | 1,5 d |
@@ -370,8 +380,8 @@ CI: matriz Pi `1.2.0`/`latest` × gentle-pi `4.1.0`/`latest`.
 | P5 | Broker + mirror + clasificador + herdr:blocked | 2 | 2,5 d |
 | P6 | Adaptadores gentle-pi + fixtures | 2 | 2 d |
 | P7 | Gate propio + `rp_ask_user` condicional | 2 | 1,5 d |
-| P8 | Entrega `terminal` (herdr) | 2 | 0,5 d |
+| P8 | Entregas `interactive` (stdin) y `herdr` + idempotencia | 2 | 1,5 d |
 | P9 | Transporte long-poll de respaldo | 2 | 1 d |
 | P10 | Adjuntos | 3 | 1 d |
-| P11 | rp-host (herdr + tmux, launchers) | 3 | 2,5 d |
+| P11 | rp-host (herdr, tmux, Windows Terminal, consola; servicio systemd/schtasks) | 3 | 3 d |
 | P12 | Tests de integración gentle-pi/herdr, publicación npm | 1–3 | 3 d |

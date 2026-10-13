@@ -3,7 +3,8 @@
 > Documento maestro. Es el mismo para los tres repos (`rp-relay`, `rp-plugin`, `rp-app`).
 > La copia canónica vive en `rp-relay/docs/ARQUITECTURA.md`; el contrato de red en
 > `rp-relay/docs/PROTOCOLO.md`; la compatibilidad con **herdr, gentle-ai y gentle-shell/gentle-pi** y la
-> **separación por PC** en `COMPATIBILIDAD.md` (incluye la matriz requisito × entorno). Cada repo tiene además su plan detallado:
+> **separación por PC** en `COMPATIBILIDAD.md` (incluye la matriz requisito × entorno); escalabilidad, resiliencia e
+> independencia (sin servicios de terceros obligatorios) en `RESILIENCIA.md`. Cada repo tiene además su plan detallado:
 > `rp-relay/docs/PLAN-RELAY.md`, `rp-plugin/docs/PLAN-PLUGIN.md`, `rp-app/docs/PLAN-APP.md`.
 
 Fecha de la investigación: 2026-10-13. Versión de Pi analizada: `@earendil-works/pi-coding-agent` **1.2.0**
@@ -24,7 +25,10 @@ Desde un teléfono Android:
 5. **Separar por PC** (PC personal con proyectos personales / PC de la empresa con proyectos de la empresa): filtros,
    agrupación y notificaciones configurables por PC.
 6. Funcionar con el entorno real del usuario: **Pi lanzado con `gentle-shell` (gentle-pi), configurado con gentle-ai,
-   corriendo dentro de herdr** — además de Pi "a secas".
+   corriendo dentro de herdr** — además de Pi "a secas". PC personal **Linux**, PC de la empresa **Windows**;
+   gentle-pi en modo **Auto**.
+7. **Escalable, resiliente y totalmente independiente**: nada de servicios de terceros obligatorios (ni Google, ni
+   herdr, ni tmux); cada pieza degrada con elegancia (ver RESILIENCIA.md).
 
 Todo pasando por un **Relay propio** instalable en **Ubuntu Server**.
 
@@ -67,7 +71,7 @@ Todo pasando por un **Relay propio** instalable en **Ubuntu Server**.
 | D2 | **Conexiones salientes** desde plugin y app hacia el relay (WebSocket sobre TLS). | Que el relay se conecte a las máquinas. | No hay que abrir puertos en las máquinas de desarrollo; funciona detrás de NAT. |
 | D3 | **Relay en TypeScript** (mismo lenguaje que el plugin). | Rust (Remote Pi), Go. | Comparte los esquemas del protocolo (TypeBox) con el plugin → validación idéntica en ambos lados, menos incertidumbre. La carga (1 usuario, decenas de agentes) es trivial para Node. |
 | D4 | **SQLite** como única base de datos. | Postgres, Redis. | Un solo usuario, un solo servidor. Cero operación; backup = copiar un archivo. |
-| D5 | **Push con FCM (Firebase Cloud Messaging) mensajes *data* de prioridad alta, con payload cifrado AES‑256‑GCM** por dispositivo. | Socket persistente en servicio foreground; UnifiedPush/ntfy. | FCM es lo único que despierta la app de forma fiable en Doze/app cerrada sin gastar batería. Google sólo ve texto cifrado. UnifiedPush queda como alternativa opcional (fase 4) para quien no quiera Google. |
+| D5 | **Push por dos canales: canal directo propio (servicio en primer plano `remoteMessaging` con WebSocket al relay) por defecto + FCM opcional** (payload cifrado AES‑256‑GCM); deduplicación por `promptId`. | Sólo FCM; UnifiedPush/ntfy. | Requisito de independencia total: funciona sin Google. FCM, si se configura, añade robustez y ahorro de batería. |
 | D6 | **Responder desde la notificación** con botones de acción (Permitir / Denegar / opciones) y *RemoteInput* (respuesta de texto), enviados por HTTPS directo al relay. | Obligar a abrir la app. | Requisito principal del usuario. |
 | D7 | **"Primera respuesta gana"**: una pregunta se puede responder en la terminal **o** en el móvil; la que llegue primero resuelve y la otra se cancela automáticamente. | Bloquear la terminal mientras el móvil decide. | Los diálogos de Pi aceptan `AbortSignal` (verificado en código), así que se puede cancelar el diálogo de la terminal cuando responde el móvil, y viceversa. |
 | D8 | **TLS sí, cifrado extremo a extremo no (v1)**. | E2E tipo Happy. | El relay es del propio usuario. E2E añade gestión de claves compleja sin beneficio real en este modelo de amenazas. Se deja el protocolo preparado (campo `enc`) para fase futura. |
@@ -76,7 +80,9 @@ Todo pasando por un **Relay propio** instalable en **Ubuntu Server**.
 | D11 | **Plugin distribuido por npm** (`npm:@j3pf/pi-rp`) e instalado en el home de Pi **y** en el de gentle-shell. | Instalar desde git. | El *takeover* de gentle-shell descarta paquetes git y por defecto usa `~/.gentle-shell/agent` (COMPATIBILIDAD G1, G2). |
 | D12 | **Credenciales de la PC en `~/.config/rp/`**, no en `PI_CODING_AGENT_DIR`. | Guardarlas en el home de Pi. | Un solo emparejamiento por PC compartido por `pi` y `gentle-shell`. |
 | D13 | **Adaptadores para diálogos `custom()` conocidos** (gentle-pi `ask_user_choice`, `ask_user_question`). | Sólo espejar `select/confirm/input`. | Son las preguntas del agente en gentle-pi; sin adaptador no serían respondibles desde el móvil (COMPATIBILIDAD P3). |
-| D14 | **Entrega "como tecleado" vía herdr** (`herdr agent prompt`) como opción. | Sólo `sendUserMessage`. | gentle-pi en modo Auto no acepta mensajes de extensiones como autorización (P4); lo tecleado sí. |
+| D14 | **Entrega "interactiva" nativa**: el plugin teclea el mensaje en la TUI de su propio proceso (`process.stdin`), con herdr como alternativa y `sendUserMessage` como último recurso. Protegida con biometría en la app. | Sólo `sendUserMessage`; depender de herdr. | gentle-pi en Auto sólo acepta lo tecleado (P4); el usuario usa Auto y pide independencia de herramientas externas (RESILIENCIA §2). |
+| D18 | **rp-host con backend por SO**: Linux → tmux, Windows → Windows Terminal/consola, herdr cuando exista. | Sólo tmux/herdr. | PC de la empresa es Windows; independencia de herdr. |
+| D19 | **Relay con TLS y backups integrados**; Caddy/Litestream opcionales. | Exigir Caddy. | Independencia y menos piezas que mantener. |
 | D15 | **PC como eje de primer nivel** (nombre, contexto personal/empresa, color; canales de notificación por PC; prefs por PC en el relay). | Etiquetas libres por agente. | Requisito explícito; además permite políticas distintas (silenciar empresa fuera de horario, redacción de contenido). |
 | D16 | **`agentId = machineId:piSessionId`** (estable). | Id por proceso. | herdr reanuda sesiones tras reiniciar; el historial en la app debe continuar (H5). |
 | D17 | **Subagentes de gentle-pi no se registran como agentes**; sus preguntas llegan por el padre. | Registrar cada subagente. | Evita ruido y duplicados (G4, G5). Vista de subagentes dentro del agente padre en fase 4. |
@@ -154,7 +160,7 @@ pendientes.
 
 | Fase | Contenido | Criterio de "hecho" |
 |---|---|---|
-| **0. Spikes (1,5 semanas)** | S1: interceptar `ctx.ui` y cancelar diálogo TUI con `signal` (Pi 1.2.0). S2: FCM data high‑priority con app cerrada + acción en notificación → HTTP. S3: relay mínimo WS eco detrás de Caddy. **S4: gentle-shell** (aislado y takeover) carga el plugin npm; responder desde fuera confirmación de gentle-pi, `ask_user_question` (adaptador) y pregunta de subagente; `/gentle:mode normal` como comando. **S5: herdr**: entrega `herdr agent prompt`, `workspace create` + `pane run gentle-shell`, reanudación conserva `sessionId`. **S6: red de la PC de la empresa** (proxy/WS/TLS). | Cada spike con demo grabada y nota en `docs/spikes/`; la matriz de COMPATIBILIDAD §2 pasa de 🔬 a ✅. |
+| **0. Spikes (1,5 semanas)** | S1: interceptar `ctx.ui` y cancelar diálogo TUI con `signal` (Pi 1.2.0). S2: FCM data high‑priority con app cerrada + acción en notificación → HTTP. S3: relay mínimo WS eco detrás de Caddy. **S4: gentle-shell** (aislado y takeover) carga el plugin npm; responder desde fuera confirmación de gentle-pi, `ask_user_question` (adaptador) y pregunta de subagente; `/gentle:mode normal` como comando. **S5: herdr**: entrega `herdr agent prompt`, `workspace create` + `pane run gentle-shell`, reanudación conserva `sessionId`. **S6: red de la PC Windows de la empresa** (proxy/WS/TLS). **S7: entrega interactiva** por `process.stdin` en Linux y Windows, con Pi y gentle-shell (incluido Vim) y aceptada por gentle-pi en AUTO. | Cada spike con demo grabada y nota en `docs/spikes/`; la matriz de COMPATIBILIDAD §2 pasa de 🔬 a ✅. |
 | **1. MVP "ver y hablar" (2–3 sem.)** | Relay (auth, WS, agentes, eventos, historial). Plugin (conexión, eventos, `sendUserMessage`, abort). App (emparejar, lista de agentes, chat en vivo, enviar texto). | Desde el móvil veo 2 agentes en 2 máquinas, les escribo y veo la respuesta en streaming. |
 | **2. Preguntas, autorizaciones y push (2 sem.)** | Prompts en relay + FCM. Plugin: permission gate, `ask_user`, espejo de diálogos. App: bandeja, hoja de respuesta, notificaciones con acciones y RemoteInput. | Con la app cerrada llega la notificación; "Permitir" desde la notificación desbloquea el agente en <2 s; la terminal se cierra sola. |
 | **3. Adjuntos + lanzar agentes (1–2 sem.)** | Blobs, cámara/archivos en la app; `rp-host` para crear agentes en tmux desde el móvil. | Envío una foto y un PDF; creo un agente nuevo en `~/proyecto` desde el móvil. |
@@ -170,7 +176,8 @@ pendientes.
 | R4 | Requiere crear proyecto Firebase propio. | Cierta | Guía paso a paso en `PLAN-RELAY.md §9`; el relay funciona sin FCM (sólo notificaciones con la app abierta). |
 | R5 | Cambios de API entre versiones de Pi. | Media | `peerDependencies: "*"` + matriz de CI contra la versión mínima soportada (1.2.0) y `latest`; capa `compat.ts` que aísla accesos. |
 | R6 | gentle-pi cambia la forma de `ask_user_choice`/`ask_user_question` (adaptadores). | Media | Rango de versión probado + fixtures en CI contra `gentle-pi@latest`; fuera de rango → notificación "esperando en la terminal" (degradación, no rotura). |
-| R7 | gentle-pi en modo **Auto** ignora órdenes no tecleadas (por diseño de seguridad). | Cierta | Entrega "como tecleado" vía herdr; botón "Pasar a Normal"; aviso en el chat. Las respuestas a diálogos sí autorizan. |
+| R7 | gentle-pi en modo **Auto** ignora órdenes no tecleadas (por diseño de seguridad). | Cierta | Entrega interactiva nativa (sin herdr) con biometría; herdr como alternativa; "Pasar a Normal" como último recurso. Las respuestas a diálogos ya autorizan. Spike S7. |
+| R11 | La entrega interactiva depende de que la TUI de Pi lea `process.stdin` en el mismo proceso (detalle interno). | Baja-media | Confirmación por evento `input` en ≤3 s y reversión automática; test de contrato en CI contra Pi `latest`; alternativas herdr/api. |
 | R8 | La PC de la empresa bloquea WebSocket o inspecciona TLS. | Media | Proxy + CA corporativa; transporte long-poll; spike S6 antes de construir. |
-| R9 | Política de la empresa contra enviar código a un servidor personal. | Desconocida | `redactContent` por PC; modelo listo para un segundo relay (de la empresa) en la app. **Decisión del usuario.** |
+| R9 | Política de la empresa contra enviar código a un servidor personal. | Baja (el usuario confirmó que está permitido) | Se mantiene `redactContent` por PC (apagado) y el modelo listo para un segundo relay por si cambia la política. |
 | R10 | Olvidar instalar el plugin en el home de gentle-shell. | Media | `/rp doctor` lo detecta; instrucciones en el README; la app marca PCs sin agentes recientes. |

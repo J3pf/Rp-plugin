@@ -11,6 +11,7 @@ Instalación prevista: `pi install npm:@j3pf/pi-rp` **y** `gentle-shell install 
 | Documento | Contenido |
 |---|---|
 | [docs/PLAN-PLUGIN.md](docs/PLAN-PLUGIN.md) | Plan detallado del plugin |
+| [docs/RESILIENCIA.md](docs/RESILIENCIA.md) | Escalabilidad, resiliencia e independencia total (push sin Google, entrega interactiva sin herdr, Linux/Windows) |
 | [docs/COMPATIBILIDAD.md](docs/COMPATIBILIDAD.md) | herdr, gentle-ai, gentle-shell/gentle-pi y separación por PC: hechos verificados y matriz requisito × entorno |
 | [docs/ARQUITECTURA.md](docs/ARQUITECTURA.md) | Visión global (copia; canónica en `rp-relay`) |
 | [`rp-relay/docs/PROTOCOLO.md`](https://github.com/j3pf/rp-relay/blob/main/docs/PROTOCOLO.md) | Contrato de red |
