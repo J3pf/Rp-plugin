@@ -1,337 +1,377 @@
 # Plan — Plugin para Pi (`rp-plugin`)
 
-Contexto: [ARQUITECTURA.md](ARQUITECTURA.md). Contrato de red: `rp-relay/docs/PROTOCOLO.md`.
-Versión de Pi de referencia: **1.2.0** (`@earendil-works/pi-coding-agent`). Las rutas `src/...` citadas abajo son
-del repo `earendil-works/pi`, `packages/coding-agent/`.
+Contexto: [ARQUITECTURA.md](ARQUITECTURA.md) · Compatibilidad con herdr / gentle-ai / gentle-shell y separación por PC:
+[COMPATIBILIDAD.md](COMPATIBILIDAD.md) · Contrato de red: `rp-relay/docs/PROTOCOLO.md`.
+Versiones de referencia: Pi **1.2.0**, gentle-pi **4.1.0**, herdr **0.9.3**. Las rutas `src/...` son de
+`earendil-works/pi/packages/coding-agent/`; las de gentle-pi y herdr se indican con su prefijo.
 
 ## 1. Qué es
 
-Un **Pi package** que contiene:
+Un **Pi package** publicado en **npm** como `@j3pf/pi-rp` que contiene:
 
-1. **La extensión** `rp` (se carga en cada proceso `pi`): conecta el agente al relay, transmite su actividad,
-   recibe mensajes/adjuntos/abort, y lleva preguntas y autorizaciones al móvil.
-2. **`rp-host`** (fase 3): pequeño daemon opcional por máquina que permite **crear agentes nuevos desde el móvil**
-   (los lanza en `tmux` con Pi + esta extensión).
+1. **La extensión `rp`** (se carga en cada proceso `pi`, también cuando lo lanza `gentle-shell` o herdr): conecta el
+   agente al relay, transmite su actividad, recibe mensajes/adjuntos/abort y lleva preguntas y autorizaciones al móvil.
+2. **`rp-host`** (fase 3): daemon opcional por PC para **crear agentes nuevos desde el móvil** dentro de herdr
+   (preferido) o tmux, lanzando `gentle-shell` o `pi`.
 
-Instalación del usuario:
+### Instalación (por cada PC)
 ```bash
-pi install git:github.com/j3pf/rp-plugin@v0.1.0     # o: pi install npm:@j3pf/pi-rp@0.1.0
-# dentro de pi:
-/rp pair https://relay.midominio.com ABCD2345         # código de `rp-relay pair machine` o de la app
+# 1. Pi "normal" (~/.pi/agent). Sobrevive a `gentle-ai sync` (COMPATIBILIDAD A1).
+pi install npm:@j3pf/pi-rp
+# 2. gentle-shell usa por defecto su propio home ~/.gentle-shell/agent (COMPATIBILIDAD G1) → instalar también ahí.
+#    (no hace falta si siempre lanzas `gentle-shell --link`)
+gentle-shell install npm:@j3pf/pi-rp
+# 3. Emparejar la PC una sola vez (la credencial se comparte entre ambos homes, vive en ~/.config/rp/)
+pi            # o gentle-shell
+/rp pair https://relay.midominio.com ABCD2345 --name "PC Empresa" --context work
 ```
-Desde ahí, **toda** sesión de Pi en esa máquina aparece en el móvil automáticamente.
+**Nunca** `pi install git:…`: el *takeover* de gentle-shell descarta paquetes git (COMPATIBILIDAD G2).
+`rp doctor` (comando `/rp doctor`) verifica que el plugin esté declarado en **ambos** homes y avisa si falta.
 
 ## 2. Estructura del paquete
 
 ```
 rp-plugin/
-├── package.json             # "keywords":["pi-package"], "pi":{"extensions":["./src/extension/index.ts"]}
+├── package.json             # name @j3pf/pi-rp, "keywords":["pi-package"], "pi":{"extensions":["./src/extension/index.ts"]}
 ├── src/
 │   ├── extension/
-│   │   ├── index.ts         # factory: SÓLO registra handlers/commands/tools/flags (nada de sockets aquí)
+│   │   ├── index.ts         # factory: SÓLO registra handlers/commands/flags (nada de sockets aquí)
 │   │   ├── runtime.ts       # estado por sesión: se crea en session_start, se destruye en session_shutdown
-│   │   ├── config.ts        # ~/.pi/agent/rp/config.json (respeta PI_CODING_AGENT_DIR)
-│   │   ├── connection.ts    # WS con reconexión, cola de salida acotada, hello/welcome
-│   │   ├── forwarder.ts     # eventos Pi → agent.event (coalescido de deltas, truncados)
-│   │   ├── snapshot.ts      # getBranch() → agent.snapshot normalizado
+│   │   ├── environment.ts   # detecta launcher (pi/gentle-shell), herdr, subagente, modo
+│   │   ├── config.ts        # ~/.config/rp/config.json (Windows: %APPDATA%\rp\config.json)
+│   │   ├── connection.ts    # WS (con proxy) + respaldo long-poll, reconexión, cola acotada
+│   │   ├── forwarder.ts     # eventos Pi → agent.event (coalescido, truncado, redacción)
+│   │   ├── snapshot.ts      # getBranch() → agent.snapshot
 │   │   ├── inbound.ts       # user.message / abort / prompt.answer
-│   │   ├── attachments.ts   # descarga de blobs, imagen→ImageContent, archivos→inbox
+│   │   ├── delivery/{api.ts, herdr.ts}   # entrega por sendUserMessage o "como tecleado" vía herdr
+│   │   ├── attachments.ts
 │   │   ├── prompts/
-│   │   │   ├── broker.ts    # registro de prompts abiertos, carrera terminal vs. móvil
-│   │   │   ├── mirror.ts    # parche de ctx.ui.select/confirm/input (espejo de diálogos de cualquier extensión)
-│   │   │   ├── gate.ts      # autorizaciones de herramientas (tool_call)
-│   │   │   └── askUser.ts   # herramienta ask_user para el modelo
-│   │   ├── status.ts        # derivación idle/working/waiting_input/compacting
-│   │   ├── commands.ts      # /rp pair|status|on|off|gate|test
-│   │   └── compat.ts        # TODO acceso "no público" a Pi pasa por aquí (detección de capacidades)
+│   │   │   ├── broker.ts    # prompts abiertos, carrera terminal vs. móvil
+│   │   │   ├── mirror.ts    # parche de ctx.ui: select/confirm/input (+custom vía adaptadores, +setStatus observado)
+│   │   │   ├── adapters/{gentle-ask-user-choice.ts, gentle-ask-user-question.ts, index.ts}
+│   │   │   ├── classify.ts  # categoría permission/question/dialog (usa eventos de gentle-pi)
+│   │   │   ├── gate.ts      # autorizaciones propias (desactivado si gentle-pi ya las hace)
+│   │   │   └── askUser.ts   # herramienta rp_ask_user (sólo si no hay otra de preguntas)
+│   │   ├── herdr.ts         # herdr:blocked, ubicación del panel
+│   │   ├── status.ts
+│   │   ├── commands.ts      # /rp pair|status|on|off|gate|test|doctor|unpair
+│   │   └── compat.ts        # TODO acceso no público (Pi interno, formas de gentle-pi) pasa por aquí
 │   ├── host/                # rp-host (fase 3)
-│   └── shared/              # cliente HTTP, logger a archivo
+│   └── shared/
 ├── test/
 └── docs/
 ```
-`package.json`:
-- `peerDependencies`: `@earendil-works/pi-coding-agent: "*"`, `@earendil-works/pi-ai: "*"`, `typebox: "*"`
-  (provistos por Pi; **no** ponerlos en `dependencies`, ver `docs/packages.md`).
-- `dependencies`: `ws`, `@j3pf/rp-protocol`, `ulid`.
-- `bin`: `rp-host` → `src/host/cli.ts` (compilado a `dist/` para el bin; la extensión se carga con jiti).
+`package.json`: `peerDependencies` `@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, `typebox` = `"*"`
+(provistos por Pi; no en `dependencies`). `dependencies`: `ws`, `proxy-agent`, `@j3pf/rp-protocol`, `ulid`.
+`bin`: `rp-host`. `engines.node >= 22.19` (igual que gentle-pi).
 
 ## 3. Configuración
 
-`~/.pi/agent/rp/config.json` (permisos 600):
+`~/.config/rp/config.json` (respeta `XDG_CONFIG_HOME`; permisos 600). **Independiente** de `PI_CODING_AGENT_DIR` para
+que `pi` y `gentle-shell` (homes distintos) compartan el emparejamiento de la PC.
 ```jsonc
 {
   "relayUrl": "https://relay.midominio.com",
-  "machineId": "01JA…", "machineToken": "…",          // obtenidos en /rp pair
+  "machineId": "01JA…", "machineToken": "…",
+  "machine": { "name": "PC Empresa", "context": "work" },   // se envía al relay al emparejar; editable desde la app
   "enabled": true,
+  "redactContent": false,          // true = sólo estados/preguntas/respuestas, sin transcript (política de empresa)
   "gate": {
-    "mode": "dangerous",            // off | dangerous | writes | all
+    "mode": "auto-detect",         // auto-detect | off | dangerous | writes | all  (auto-detect = off si hay gentle-pi, dangerous si no)
     "dangerousPatterns": ["\\brm\\s+-[a-z]*r", "\\bsudo\\b", "\\bgit\\s+push\\b.*--force", "\\bchmod\\b.*777", "\\bdd\\b", "\\bmkfs"],
     "alwaysAllowTools": ["read", "grep", "find", "ls"],
-    "useAnnotations": true          // usar annotations MCP (destructiveHint/readOnlyHint) para tools de terceros
+    "useAnnotations": true
   },
   "mirrorDialogs": true,
-  "notifyOnSettled": true,
-  "inboxDir": null                  // por defecto ~/.pi/agent/rp/inbox
+  "delivery": { "default": "auto" }, // auto | api | terminal   (auto = terminal si herdr y gentle en AUTO; api en otro caso)
+  "subagents": "skip",               // skip (defecto) | connect
+  "inboxDir": null                   // por defecto ~/.config/rp/inbox
 }
 ```
-Overrides: env `RP_RELAY_URL`, `RP_DISABLED=1`; flag de Pi `--rp-off` (registrado con `pi.registerFlag`).
+Overrides: `RP_RELAY_URL`, `RP_DISABLED=1`, `RP_CONFIG`; flag `--rp-off`.
 
-## 4. Ciclo de vida (respetando las reglas de Pi)
+## 4. Entorno (`environment.ts`)
 
-Reglas de `docs/extensions.md`: *no* abrir sockets/timers en la factory; abrir en `session_start`; cerrar en
-`session_shutdown` de forma idempotente; tras reload el runtime anterior queda inválido.
+| Detección | Cómo | Uso |
+|---|---|---|
+| Subagente de gentle-pi | `process.env.GENTLE_PI_AGENTS_CHILD === "1"` | `subagents:"skip"` → el plugin no conecta (sus preguntas ya llegan por el padre, COMPATIBILIDAD G5) |
+| Lanzado por gentle-shell | `GENTLE_SHELL_USER_PI_HOME` definido o `PI_CODING_AGENT_DIR` termina en `.gentle-shell/agent` | `launcher:"gentle-shell"` en `agent.hello` |
+| gentle-pi cargado | `pi.getAllTools()` contiene `ask_user_choice`/`ask_user_question`, o se observa `setStatus("gentle:mode", …)` | gate `auto-detect` → off; adaptadores activos |
+| Modo de permisos gentle | último `setStatus("gentle:mode", "Permissions: X")` | `agent.hello.gentle.mode` + `agent.statuses` → la app avisa en AUTO |
+| Dentro de herdr | `HERDR_ENV==="1"` y `HERDR_PANE_ID` | `herdr:{paneId,tabId,workspaceId,session}`; habilita entrega "terminal" |
+| Modo Pi | `ctx.mode` (`tui`/`rpc`/`json`/`print`) | ver §12 |
+| Lanzado por rp-host | `RP_SPAWN_ID` | `spawnId` en `agent.hello` |
+
+## 5. Ciclo de vida
+
+Reglas de Pi (`docs/extensions.md`): nada de sockets/timers en la factory; abrir en `session_start`; cerrar en
+`session_shutdown` idempotente; tras reload el runtime anterior queda inválido.
 
 ```ts
 export default function rp(pi: ExtensionAPI) {
-  const cfg = loadConfig();                     // sync, sólo lectura de archivo
-  registerCommands(pi); registerFlags(pi);
-  registerAskUserTool(pi);                      // siempre registrada; si no hay relay funciona sólo local
+  const env = detectStaticEnv(process.env);            // child, herdr, launcher, spawnId
+  const cfg = loadConfig();                            // sync, sólo lectura
+  registerCommands(pi, cfg); pi.registerFlag("rp-off", { type: "boolean", description: "Disable RP for this run" });
+  if (env.isGentleChild && cfg.subagents === "skip") return;       // nada más en subagentes
   let rt: Runtime | undefined;
-
   pi.on("session_start", async (ev, ctx) => {
-    if (!cfg.enabled || pi.getFlag("rp-off")) return;
-    rt = new Runtime(pi, ctx, cfg, ev.reason);  // crea agentId/epoch, instala mirror, conecta WS (no bloquea)
+    if (!cfg.enabled || !cfg.machineToken || pi.getFlag("rp-off")) return;
+    rt = new Runtime(pi, ctx, cfg, env, ev.reason);    // identidad, mirror, rp_ask_user condicional, WS en 2º plano
   });
   pi.on("session_shutdown", async () => { await rt?.dispose(); rt = undefined; });
-
-  // Todos los demás handlers delegan en rt si existe:
   for (const e of FORWARDED_EVENTS) pi.on(e, (ev, ctx) => rt?.forward(ev, ctx));
-  pi.on("tool_call", (ev, ctx) => rt?.gate(ev, ctx) ?? localGate(ev, ctx, cfg));
+  pi.on("tool_call", (ev, ctx) => rt?.onToolCall(ev, ctx));          // gate + seguimiento de herramientas adaptadas
+  pi.on("tool_execution_start", (ev) => rt?.adapters.onStart(ev));
+  pi.on("tool_execution_end",   (ev) => rt?.adapters.onEnd(ev));
   pi.on("ui_prompt_start", (ev) => rt?.terminalWait(ev, true));
   pi.on("ui_prompt_end",   (ev) => rt?.terminalWait(ev, false));
+  pi.events.on("pi-permission-system:permission-request", (d) => rt?.classify.onPermissionRequest(d)); // gentle-pi P1
 }
 ```
-- `agentId = ctx.sessionManager.getSessionId() + "~" + randomHex(3)`; `epoch = ulid()` por cada `session_start`.
-- Cambios de sesión (`/new`, `/resume`, `/fork`): Pi emite `session_shutdown` + `session_start` → nuevo `epoch` y
-  posiblemente nuevo `agentId`; el relay ve un agente nuevo y el anterior offline (correcto: es otra conversación).
-- El WS se abre en segundo plano: **nunca** se bloquea el arranque de Pi esperando al relay.
-- `dispose()`: resuelve como "cancelled" sus prompts abiertos (enviando `prompt.resolved{by:"cancelled"}`),
-  restaura `ctx.ui` original, cierra WS con 1000.
 
-## 5. Conexión (`connection.ts`)
+### Identidad (estable a través de reanudaciones de herdr, COMPATIBILIDAD H5)
+- `agentId = "<machineId>:<piSessionId>"` (`ctx.sessionManager.getSessionId()`).
+- `instance = ulid()` por proceso; si dos procesos abren la misma sesión, el relay conserva el más reciente y marca el
+  otro con cierre `4003`.
+- `epoch = ulid()` por cada `session_start` (cambia con `/new`, `/resume`, `/fork`, reload).
 
-- `new WebSocket(relayWsUrl, { headers: { Authorization: "Bearer " + token } })`.
-- Reconexión: backoff 1→30 s con jitter; al reconectar: `agent.hello` (incluye `openPrompts`) → `agent.welcome`
-  → `agent.snapshot` → vaciar cola.
-- Cola de salida mientras está desconectado: máx. **500** mensajes o 2 MB; si se desborda se descartan los
-  `agent.event` más viejos y se marca `needsSnapshot` (el snapshot reconstruye el estado). `prompt.*` nunca se descartan.
-- Cierre `4001`/`4002`: no reconectar; `ctx.ui.notify("RP: token revocado / versión incompatible", "error")` y
-  `ctx.ui.setStatus("rp", "RP ✗")`.
-- Indicador en el footer: `ctx.ui.setStatus("rp", "📱 RP")` conectado / `"RP …"` reconectando.
+## 6. Conexión (`connection.ts`)
 
-## 6. Reenvío de eventos (`forwarder.ts`)
+- `new WebSocket(url, { headers:{Authorization:"Bearer …"}, agent: new ProxyAgent() })` → respeta `HTTPS_PROXY`,
+  `NO_PROXY`; Node respeta `NODE_EXTRA_CA_CERTS` para CA corporativas.
+- Reconexión 1→30 s con jitter. Tras 3 fallos consecutivos de *upgrade* WS (p. ej. proxy que bloquea WebSocket) →
+  **transporte long-poll** (`POST /v1/agent/send`, `POST /v1/agent/poll` con espera 25 s) con los mismos mensajes; se
+  reintenta WS cada 10 min.
+- Al conectar: `agent.hello` (con `openPrompts`) → `agent.welcome` → `agent.snapshot` → vaciar cola.
+- Cola: máx. 500 mensajes / 2 MB; si desborda se descartan `agent.event` viejos y se marca `needsSnapshot`;
+  `prompt.*` nunca se descartan.
+- Cierres `4001`/`4002` → no reconectar; `ctx.ui.notify` + `setStatus("rp","RP ✗")`. Conectado: `setStatus("rp","📱")`.
+- El arranque de Pi nunca espera al relay.
 
-Eventos de Pi suscritos (`pi.on`): `agent_start`, `agent_settled`, `turn_start`, `turn_end`, `message_start`,
-`message_update`, `message_end`, `tool_execution_start`, `tool_execution_update`, `tool_execution_end`,
-`session_info_changed`, `model_select`, `thinking_level_select`, `session_compact`.
+## 7. Reenvío de eventos (`forwarder.ts`)
 
-Reglas (las del PROTOCOLO §4):
-- `message_update`: se acumulan los `assistantMessageEvent` `text_delta`/`thinking_delta`/`toolcall_delta` por
-  `contentIndex` y se emite un `message_delta` cada 100 ms (o al recibir `message_end`).
-- `tool_execution_update`: máx. 1 cada 500 ms por `toolCallId`, `partialResult` truncado a 8 KiB.
-- `tool_execution_end`: contenido de texto truncado a 32 KiB; imágenes de resultados → `image_ref` (no se mandan bytes).
-- Herramientas anidadas (`parentToolCallId`) se reenvían con ese campo; la app las agrupa.
-- Handlers **no** hacen `await` de red (sólo encolan) → no ralentizan el stream de Pi (los handlers se esperan en orden).
-- Estado derivado (`status.ts`): `agent_start`→`working`; `ui_prompt_start` o prompt abierto→`waiting_input`;
-  compactación→`compacting`; `agent_settled`→`idle`; error del proveedor→`error`.
-- `agent_settled` además envía `lastMessagePreview` (primeros 140 caracteres del último texto del asistente) para la
-  notificación "terminó".
-
-## 7. Entrada desde el móvil (`inbound.ts`, `attachments.ts`)
-
-### `user.message`
-```ts
-const content = await buildContent(msg);          // string | (TextContent|ImageContent)[]
-if (ctx.isIdle()) pi.sendUserMessage(content);                      // dispara turno
-else pi.sendUserMessage(content, { deliverAs: msg.delivery === "steer" ? "steer" : "followUp" });
-send("user.message.ack", { clientMsgId, disposition });
-```
-- `delivery:"auto"` = `followUp` si está ocupado.
-- **No** se usa `expandPromptTemplates` salvo que el texto empiece con `/` y el usuario lo active en la app
-  (permite usar plantillas y comandos de skills desde el móvil; fase 4).
-- Se marca el origen: el plugin guarda `pi.appendEntry("rp.origin", { clientMsgId, deviceId })` para que el historial
-  pueda mostrar "enviado desde el móvil" (no entra en el contexto del modelo).
-
-### Adjuntos
-- Descarga `GET /v1/blobs/{id}` (token de máquina), verifica `sha256`.
-- `image/png|jpeg|webp|gif` ≤ 10 MB → `{ type:"image", data: base64, mimeType }`. Pi ya redimensiona imágenes
-  (worker `image-resize-worker`) antes de mandarlas al proveedor.
-- Otros → `<inboxDir>/<sessionId>/<YYYYMMDD-HHmmss>-<nombre-saneado>`; se añade al texto:
-  `\n\n[Archivo adjunto desde el móvil: <ruta absoluta> (<mime>, <tamaño>)]`.
-  Nombre saneado: sólo `[A-Za-z0-9._-]`, máx. 100 chars, sin rutas.
-- Modelo sin visión + imagen → también se guarda en inbox y se referencia por ruta.
-
-### `agent.abort` → `ctx.abort()`.
+Eventos: `agent_start`, `agent_settled`, `turn_start`, `turn_end`, `message_start`, `message_update`, `message_end`,
+`tool_execution_start/update/end`, `session_info_changed`, `model_select`, `thinking_level_select`, `session_compact`.
+- `message_update` coalescido cada 100 ms en `message_delta`; `tool_execution_update` ≤ 1/500 ms, 8 KiB;
+  `tool_execution_end` texto ≤ 32 KiB; imágenes → `image_ref`.
+- Llamadas anidadas (`parentToolCallId`, p. ej. codemode) se reenvían con ese campo.
+- Herramientas de gentle-pi (`subagent_run`, `subagent_status`…) se reenvían como cualquier otra; la app las muestra
+  como tarjetas (fase 4: vista dedicada de subagentes).
+- `agent.statuses`: cada `setStatus(key, text)` de cualquier extensión (observado por el espejo, §8.1) se reenvía
+  coalescido (≤1/s): así la app ve `gentle:mode`, `gentle:yolo`, `herdr`, etc.
+- `redactContent:true` → no se envían `message_*` ni resultados de herramientas; sólo estado, nombre de herramienta,
+  prompts y respuestas.
+- Los handlers sólo encolan (no `await` de red) → no ralentizan a Pi.
 
 ## 8. Preguntas y autorizaciones
 
-Tres fuentes, un único **broker**:
-
 ```
-                ┌──────── gate.ts (tool_call) ─────────┐
-                │                                      │
- ask_user tool ─┼──► ctx.ui.select/confirm/input ──► mirror.ts ──► broker.race(terminal, móvil)
-                │                                      ▲
- otras extensiones (permission-gate, plan-mode, …) ────┘  (mismo objeto ctx.ui compartido)
+ gentle-pi confirm (P1,P2) ─┐
+ subagentes gentle (G5) ────┤
+ otras extensiones ─────────┼─► ctx.ui.select/confirm/input ─► mirror ─┐
+ gate propio (si no gentle) ┤                                          ├─► broker.race(terminal, móvil)
+ rp_ask_user ───────────────┘                                          │
+ gentle ask_user_choice / ask_user_question ─► ctx.ui.custom ─► adaptador ┘
+ otros custom() / editor() ─► ui_prompt_start ─► "esperando en la terminal" (sólo notificación)
 ```
 
-### 8.1 `mirror.ts` — espejo de diálogos (núcleo)
-
-Hecho verificado: `ctx.ui` devuelve `runner.uiContext`, un objeto plano creado por `wrapUIPromptContext` y
-compartido por todas las extensiones del runner (`src/core/extensions/runner.ts:572-591, 889-891`). Reemplazar sus
-métodos afecta a todos los diálogos posteriores de cualquier extensión.
+### 8.1 `mirror.ts`
+`ctx.ui` es **un único objeto compartido** por todas las extensiones del runner (`runner.ts:572-591, 889-891`), y los
+llamadores invocan `ui.select(...)` como método → parchearlo **en el sitio** (no reemplazar el objeto) afecta a todos,
+incluidos los que guardaron la referencia a `ctx.ui` antes (como `answerThroughUi` de gentle-agents).
 
 ```ts
-function installMirror(ctx: ExtensionContext, broker: Broker): () => void {
-  if (!ctx.hasUI) return () => {};                 // print/json: noOpUIContext es un singleton del módulo → NO tocar
-  const ui = ctx.ui as any;
-  if (ui.__rpMirrored) return () => {};
-  const orig = { select: ui.select, confirm: ui.confirm, input: ui.input };
-  ui.select = (title, options, opts) => broker.race({ kind:"select", title, options, opts },
-                  (signal) => orig.select.call(ui, title, options, { ...opts, signal: anySignal(opts?.signal, signal) }));
-  ui.confirm = (title, message, opts) => broker.race({ kind:"confirm", title, message, opts },
-                  (signal) => orig.confirm.call(ui, title, message, { ...opts, signal: anySignal(opts?.signal, signal) }));
-  ui.input  = (title, placeholder, opts) => broker.race({ kind:"input", title, placeholder, opts },
-                  (signal) => orig.input.call(ui, title, placeholder, { ...opts, signal: anySignal(opts?.signal, signal) }));
-  ui.__rpMirrored = true;
-  return () => { Object.assign(ui, orig); delete ui.__rpMirrored; };
+function installMirror(ctx, broker, adapters, statuses): () => void {
+  if (!ctx.hasUI) return () => {};                 // print/json: noOpUIContext es singleton del módulo → NO tocar
+  const ui = ctx.ui as any; if (ui.__rp) return () => {};
+  const orig = { select: ui.select, confirm: ui.confirm, input: ui.input, custom: ui.custom, setStatus: ui.setStatus };
+  ui.select  = (t, o, opts)  => broker.race({kind:"select", title:t, options:o, opts}, s => orig.select.call(ui, t, o, withSignal(opts, s)));
+  ui.confirm = (t, m, opts)  => broker.race({kind:"confirm", title:t, message:m, opts}, s => orig.confirm.call(ui, t, m, withSignal(opts, s)));
+  ui.input   = (t, p, opts)  => broker.race({kind:"input", title:t, placeholder:p, opts}, s => orig.input.call(ui, t, p, withSignal(opts, s)));
+  ui.custom  = (factory, o)  => adapters.active()
+      ? adapters.race(factory, o, (f) => orig.custom.call(ui, f, o))     // §8.5
+      : orig.custom.call(ui, factory, o);
+  ui.setStatus = (k, v) => { statuses.observe(k, v); return orig.setStatus.call(ui, k, v); };
+  ui.__rp = true;
+  return () => { Object.assign(ui, orig); delete ui.__rp; };
 }
 ```
-`compat.ts` verifica tras instalar que `ctx.ui.select === nuestro wrapper` (si Pi en el futuro devuelve objetos
-nuevos o congelados, se detecta, se registra la característica `mirror_ui` como **no** disponible y se notifica una vez).
-Se reinstala en cada `session_start` (el runner puede recrear `uiContext` con `setUIContext`).
+`compat.ts` verifica tras instalar que `ctx.ui.select` es el wrapper; si no, desactiva `mirror_ui` y avisa una vez.
+Se reinstala en cada `session_start`.
 
 ### 8.2 `broker.race` — "primera respuesta gana"
-
 ```ts
 async race(req, runLocal: (signal) => Promise<T>): Promise<T> {
-  const p = this.open(req);                       // promptId, guarda en mapa, envía prompt.open (si conectado)
-  const localAbort = new AbortController();
-  const remote = p.remoteAnswer;                  // Promise que resuelve al llegar prompt.answer
-  const local  = ctx.hasUI ? runLocal(localAbort.signal).then(v => ({ src:"local", v }))
-                           : new Promise(() => {}); // sin UI local: sólo móvil
-  const winner = await Promise.race([local, remote.then(a => ({ src:"remote", v: toLocalValue(req, a) }))]);
-  if (winner.src === "remote") { localAbort.abort(); send("prompt.ack", { promptId, accepted:true }); }
-  else { send("prompt.resolved", { promptId, by: localResolution(req, winner.v), answer: fromLocal(req, winner.v) }); }
-  this.close(p); return winner.v;
+  const p = this.open(req);                                  // promptId; clasifica (§8.3); prompt.open; herdr:blocked si aplica
+  const ac = new AbortController();
+  const local  = ctx.hasUI ? runLocal(ac.signal).then(v => ({src:"local", v})) : never();
+  const remote = p.remoteAnswer.then(a => ({src:"remote", v: toLocalValue(req, a)}));
+  const w = await Promise.race([local, remote]);
+  if (w.src === "remote") { ac.abort(); send("prompt.ack", {promptId: p.id, accepted:true}); }
+  else send("prompt.resolved", {promptId: p.id, by: localBy(req, w.v), answer: fromLocal(req, w.v)});
+  this.close(p); return w.v;
 }
 ```
-Detalles:
-- Si llega `prompt.answer` de un prompt ya cerrado → `prompt.ack{accepted:false}`.
-- `opts.timeout` del llamador: se respeta (Pi auto‑resuelve el diálogo local con el valor por defecto) → se envía
-  `prompt.resolved{by:"timeout"}`.
-- `opts.signal` del llamador abortado → `prompt.resolved{by:"cancelled"}`.
-- Sin conexión al relay: el prompt se encola y se envía al reconectar (en `hello.openPrompts`), el diálogo local
-  funciona igual.
-- Conversión de respuestas: `select` → `options[i]` (texto exacto de la opción, porque Pi devuelve el string);
-  `confirm` → boolean; `input` → string. `cancelled` → `undefined`/`false`.
-- Prompts concurrentes (herramientas en paralelo) se manejan independientemente; cada uno tiene su `promptId`.
-- Diálogos con `kind:"custom"` o `editor()` **no** se espejan (no hay forma pública de cancelarlos/responderlos);
-  `ui_prompt_start/end` → `terminal_wait` para que el móvil notifique "esperando en la terminal".
+- `prompt.answer` de un prompt ya cerrado → `prompt.ack{accepted:false}`.
+- `opts.timeout` del llamador → `by:"timeout"`; `opts.signal` abortado → `by:"cancelled"`.
+- Sin conexión: el prompt viaja en `hello.openPrompts` al reconectar; el diálogo local funciona igual.
+- `select` devuelve el **texto exacto** de la opción (Pi y gentle-pi comparan por etiqueta); `confirm` boolean; `input` string.
+- Prompts concurrentes: independientes (cada uno su `promptId`).
+- Respuesta remota a un diálogo de gentle-pi pasa por su propio `ctx.ui` → gentle-pi la registra como **respuesta
+  humana** (cuenta como autorización también en modo Auto, COMPATIBILIDAD P4).
 
-### 8.3 `gate.ts` — autorizaciones
+### 8.3 Clasificación (`classify.ts`)
+| Origen | Señal | `category` | `danger` |
+|---|---|---|---|
+| Gate propio | contexto AsyncLocalStorage del gate | `permission` | según patrón |
+| gentle-pi confirmación de comando | evento `pi-permission-system:permission-request` `state:"waiting"` justo antes del `confirm` (mismo tick) | `permission` (+`tool:{name:"bash"}`, comando = `message` del confirm) | `high` si el título contiene "data-loss", si no `medium` |
+| Subagente gentle | título empieza con `❀ ` (`AGENTS_GLYPH`, gentle-pi `lib/agents-widget.ts:11`) | `question` (+ `subagent:true`) | `low` |
+| `rp_ask_user`, adaptadores | — | `question` | `low` |
+| Resto | — | `dialog` | `low` |
 
-`pi.on("tool_call", …)`: decide si la llamada necesita aprobación:
+### 8.4 `gate.ts` — autorizaciones propias
+Sólo si **no** hay gentle-pi (o `gate.mode` explícito ≠ `auto-detect`), para no duplicar las confirmaciones de
+gentle-pi. Modos `off|dangerous|writes|all` (tabla del plan v1). Diálogo: `ctx.ui.select("⚠ <tool>: <resumen>",
+["Permitir","Permitir siempre en esta sesión","Denegar","Denegar con motivo…"])` → pasa por el espejo.
+"Permitir siempre" se guarda con `pi.appendEntry("rp.allow", …)` y se reconstruye desde `getBranch()`.
+Sin UI local y sin relay → bloquear (fail-safe).
 
-| `gate.mode` | Pide aprobación para |
-|---|---|
-| `off` | nada |
-| `dangerous` (defecto) | `bash` cuyo comando coincide con `dangerousPatterns`; herramientas con `annotations.destructiveHint===true` |
-| `writes` | lo anterior + `write`, `edit`, cualquier `bash`, tools sin `readOnlyHint` |
-| `all` | todo excepto `alwaysAllowTools` |
-
-Diálogo: `ctx.ui.select("⚠ <tool>: <resumen>", ["Permitir", "Permitir siempre en esta sesión", "Denegar", "Denegar con motivo…"])`
-(pasa por el espejo → llega al móvil con `category:"permission"`, `tool`, `danger`). "Denegar con motivo…" →
-`ctx.ui.input("Motivo")`. Resultado: `{ block:true, reason:"Denegado por el usuario: <motivo>" }` (el modelo lo ve).
-"Permitir siempre" guarda la regla (tool + patrón de comando) en memoria de la sesión y en
-`pi.appendEntry("rp.allow", …)` para reconstruirla en `session_start` desde `getBranch()`.
-Sin UI local y sin relay conectado → bloquear con razón "sin forma de aprobar" (fail‑safe, como el ejemplo oficial).
-El gate se cambia desde Pi (`/rp gate writes`) y desde la app (mensaje `agent.config` — fase 4).
-
-Para que el broker sepa que es `category:"permission"` y adjunte `tool`, el gate llama `broker.withContext({category, tool, danger}, () => ctx.ui.select(...))` (AsyncLocalStorage); el espejo lee ese contexto. Diálogos de otras extensiones van como `category:"dialog"`.
-
-### 8.4 `askUser.ts` — herramienta para que el modelo pregunte
+### 8.5 Adaptadores de `custom()` (gentle-pi `ask_user_choice` y `ask_user_question`)
+Problema: en la TUI estas herramientas usan `ctx.ui.custom()` (COMPATIBILIDAD P3), que no tiene equivalente remoto.
+Solución: el adaptador conoce los **parámetros** de la herramienta (los ve en `tool_call`) y el **tipo de resultado**
+que espera su `custom()`, y resuelve el diálogo llamando al `done` que Pi le pasa a la *factory*.
 
 ```ts
-pi.registerTool({
-  name: "ask_user", label: "Preguntar al usuario", executionMode: "sequential",
-  description: "Ask the user a question when you need a decision or missing information. The user may answer from their phone. Prefer 2-5 concise options; set allowFreeText when an open answer is acceptable.",
-  parameters: Type.Object({
-    question: Type.String(),
-    options: Type.Optional(Type.Array(Type.String(), { maxItems: 8 })),
-    allowFreeText: Type.Optional(Type.Boolean({ default: true })),
-  }),
-  async execute(id, p, signal, _u, ctx) { /* withContext({category:"question"}) → select (+ "Otra respuesta…" → input) o input */ }
-});
+// seguimiento: tool_call / tool_execution_start de una herramienta con adaptador → adapters.current = {toolCallId, args, adapter}
+// ambas herramientas son executionMode:"sequential", así que hay como mucho una activa a la vez
+adapters.race(factory, opts, runOrig) {
+  const cur = this.current; let doneRef: ((v:any)=>void) | undefined;
+  const wrapped = (tui, theme, kb, done) => { doneRef = done; return factory(tui, theme, kb, done); };
+  const p = broker.open(cur.adapter.toPrompt(cur.args));       // kind "questionnaire"/"select"
+  p.remoteAnswer.then(a => { doneRef?.(cur.adapter.toResult(cur.args, a)); send("prompt.ack", {promptId:p.id, accepted:true}); });
+  return runOrig(wrapped).then(v => { if (!p.closed) send("prompt.resolved", {promptId:p.id, by:"local", answer: cur.adapter.fromResult(v)}); broker.close(p); return v; });
+}
 ```
-Devuelve `content:[{type:"text", text:"User answered: …"}]`, `details:{question, answer, source:"local"|"remote"}`.
-Si el usuario ya tiene `@eko24ive/pi-ask` (su propio `ask_user`), detectar con `pi.getAllTools()` y **no** registrar el
-nuestro con el mismo nombre (registrar `rp_ask_user`); el puente de eventos `@eko24ive/pi-ask:*` queda para fase 4.
+| Herramienta (gentle-pi 4.1.0) | `toPrompt` | `toResult` (tipo esperado) |
+|---|---|---|
+| `ask_user_choice {question, options[{label,description,value}], allowCustomResponse?}` | `kind:"select"`, opciones con descripción, `allowFreeText` | `{value,label,index}` (índice base 1) o `{customResponse}`; cancelado → `undefined` (`extensions/ask-user-choice.ts:54`) |
+| `ask_user_question {questions[1..4]{question, header, options[2..4]{label,description,preview?}, multiSelect?}}` | `kind:"questionnaire"` | `QuestionnaireResult {cancelled, answers:[{questionIndex, question, kind:"option"|"custom"|"multi", answer, selected?}]}` (`lib/questionnaire/questionnaire-view.ts:31-44`) |
 
-### 8.5 Notificaciones sin pregunta
-- `agent_settled` → evento normal; el relay decide si hace push "terminó" (no hace falta lógica en el plugin).
-- Error de proveedor sin reintento (`agent_settled` tras `message_end` con `stopReason:"error"`) → `agent.status{status:"error"}`.
+- Gentle-pi ejecuta su `captureAnswer(selection)` con el resultado → la respuesta remota queda registrada como respuesta
+  humana igual que la local.
+- `compat.ts` comprueba la versión de gentle-pi (lee `package.json` subiendo desde `pi.getAllTools()[i].sourceInfo.baseDir`/`path`, `ToolInfo.sourceInfo` en `types.ts:2122-2130`)
+  contra el rango probado (`>=4.0 <5`). Fuera de rango → adaptador desactivado y se usa la notificación
+  "esperando en la terminal". Tests de contrato con fixtures de parámetros/resultados de gentle-pi en CI.
+- Adaptadores adicionales (p. ej. `@eko24ive/pi-ask`, ejemplo `question.ts` de Pi) se añaden con la misma interfaz.
 
-## 9. `rp-host` (fase 3): crear agentes desde el móvil
+### 8.6 `rp_ask_user` (herramienta propia)
+Se registra en `session_start` **sólo** si no existe ninguna herramienta llamada `ask_user*`/`question*`
+(los nombres son exclusivos, COMPATIBILIDAD P6). Parámetros `{question, options?, allowFreeText?}`; usa
+`ctx.ui.select` (+ "Otra respuesta…" → `ctx.ui.input`) → espejo.
 
-- Proceso por máquina (`systemctl --user enable --now rp-host`), usa el mismo `machineToken`.
-- Conecta a `wss://relay/ws/host`; anuncia `{ machineId, hostname, roots:["~/proyectos"], tmux:true }`.
-- Recibe `host.spawn { cwd, name?, model?, initialPrompt? }` → valida que `cwd` esté bajo un `root` permitido →
-  `tmux new-session -d -s rp-<short> -c <cwd> -e RP_SPAWN_ID=<ulid> "pi --name '<name>'"`; Pi arranca con el plugin (instalado global) y
-  aparece solo en la app. El plugin envía `spawnId` (de `RP_SPAWN_ID`) en `agent.hello`; el relay entrega
-  `initialPrompt` como `user.message` a ese agente (lo retiene 60 s). `tmux new-session -e` requiere tmux ≥ 3.2.
-- `host.list_dirs { path }` para que la app navegue carpetas dentro de `roots` (sólo nombres de directorios).
-- `host.kill { agentId }` → `tmux kill-session` (sólo sesiones creadas por rp-host).
-- Requisito: `tmux` ≥ 3.2 con la config de `docs/tmux.md` de Pi. El usuario puede `tmux attach -t rp-<short>` para
-  seguir en la terminal.
-- Protocolo `host.*` se añade a `PROTOCOLO.md` §9 en la fase 3 (campos arriba).
+### 8.7 herdr
+- Al abrir un prompt remoto que **no** proviene de gentle-pi (que ya emite su propio `herdr:blocked`), el plugin emite
+  `pi.events.emit("herdr:blocked", {active:true, label:title})` y `{active:false}` al cerrarlo → el panel de herdr se
+  marca "blocked" también para diálogos de otras extensiones.
+- `ui_prompt_start` con `kind:"custom"`/`"editor"` → `terminal_wait` (notificación "esperando en la terminal").
 
-## 10. Comandos `/rp`
+## 9. Entrada desde el móvil
+
+### 9.1 Entrega del mensaje (`delivery/`)
+| Modo | Cómo | Cuándo |
+|---|---|---|
+| `api` | `pi.sendUserMessage(content, {deliverAs})` (ocupado → `followUp` o `steer`); `source:"extension"` | por defecto |
+| `terminal` | `herdr agent prompt $HERDR_PANE_ID <texto>` (vía `pi.exec("herdr", [...])`); entra como tecleado (`source:"interactive"`) | si el usuario lo elige en la app, o en `auto` cuando el agente está en herdr **y** gentle-pi está en modo AUTO |
+| comando | `pi.sendUserMessage("/…", {expandPromptTemplates:true})` | mensajes que empiezan con `/` y el usuario marcó "ejecutar como comando" (p. ej. `/gentle:mode normal`) |
+
+- `terminal` sólo texto; adjuntos → se guardan en inbox y se agregan como rutas al texto. Si herdr responde
+  `agent_blocked` (hay un diálogo abierto) → `user.message.ack{disposition:"rejected", error:"agent_blocked"}` y la app
+  ofrece responder el prompt primero o reenviar por `api`.
+- El texto en `terminal` se envía como argumento (sin shell) para evitar inyección.
+- `pi.appendEntry("rp.origin", {clientMsgId, deviceId, delivery})` marca el origen (no entra al contexto del modelo).
+
+### 9.2 Adjuntos
+Igual que el plan v1: descarga `GET /v1/blobs/{id}` (token de máquina), verificación `sha256`; imágenes ≤10 MB →
+`ImageContent`; resto → `<inboxDir>/<sessionId>/<YYYYMMDD-HHmmss>-<nombre-saneado>` + línea
+`[Archivo adjunto desde el móvil: <ruta> (<mime>, <tamaño>)]`.
+
+### 9.3 `agent.abort` → `ctx.abort()`.
+
+## 10. `rp-host` (fase 3): crear agentes desde el móvil
+
+- Servicio por PC: Linux `systemctl --user enable --now rp-host`; macOS `launchd`; Windows tarea programada al iniciar
+  sesión. Usa el `machineToken` de `~/.config/rp/`.
+- `~/.config/rp/host.json`:
+  ```jsonc
+  { "roots": ["~/proyectos"], "backend": "herdr",          // herdr | tmux
+    "launchers": { "gentle-shell": "gentle-shell", "pi": "pi" }, "defaultLauncher": "gentle-shell",
+    "herdrSession": null }                                  // null = sesión por defecto de herdr
+  ```
+- `host.spawn {cwd, name?, launcher?, initialPrompt?}`:
+  - **herdr** (COMPATIBILIDAD H4): `herdr workspace create --cwd <cwd> --label <name> --env RP_SPAWN_ID=<ulid> --no-focus`
+    → leer `.result.root_pane.pane_id` → `herdr pane run <pane> "<launcher>"`. El agente aparece en tu herdr (lo ves al
+    volver al PC) y en la app.
+  - **tmux**: `tmux new-session -d -s rp-<short> -c <cwd> -e RP_SPAWN_ID=<ulid> "<launcher>"` (tmux ≥ 3.2).
+  - El plugin envía `spawnId` en `agent.hello`; el relay entrega `initialPrompt` como `user.message` a ese agente.
+- `host.list_dirs {path}` (sólo dentro de `roots`), `host.kill {spawnId}` (sólo agentes creados por rp-host:
+  `herdr workspace close` / `tmux kill-session`).
+- Validaciones: `cwd` canonicalizado (`realpath`) debe estar dentro de un `root`; `launcher` debe ser una clave de
+  `launchers` (nunca un comando arbitrario del móvil).
+
+## 11. Comandos `/rp`
 
 | Comando | Acción |
 |---|---|
-| `/rp pair <url> <código>` | `POST /v1/pair/machine` → guarda config → conecta |
-| `/rp status` | relay, conexión, agentId, features, prompts abiertos |
-| `/rp on` / `/rp off` | habilita/deshabilita para esta sesión (y `--persist` en config) |
-| `/rp gate <off|dangerous|writes|all>` | cambia el modo del gate |
-| `/rp test` | crea un prompt de prueba (confirm) para verificar notificación de punta a punta |
+| `/rp pair <url> <código> [--name N] [--context personal|work|…]` | Empareja la PC (pregunta nombre/contexto si faltan) |
+| `/rp status` | relay, transporte (ws/long-poll), agentId, PC, launcher, herdr, modo gentle, features, prompts abiertos |
+| `/rp doctor` | DNS/TLS/WS/proxy, reloj, plugin declarado en `~/.pi/agent` y `~/.gentle-shell/agent`, `herdr` en PATH, versión gentle-pi soportada |
+| `/rp on` / `/rp off [--persist]` | habilitar/deshabilitar |
+| `/rp gate <auto-detect|off|dangerous|writes|all>` | modo del gate propio |
+| `/rp test` | prompt de prueba de punta a punta |
 | `/rp unpair` | borra credenciales locales |
 
-## 11. Compatibilidad y modos de Pi
+## 12. Modos de Pi
 
-| `ctx.mode` | Espejo | Gate / ask_user | Comentario |
+| `ctx.mode` | Espejo | Respuestas | Nota |
 |---|---|---|---|
-| `tui` | sí | terminal + móvil | caso principal |
-| `rpc` | sí (el UI RPC acepta `signal`, verificado en `rpc-mode.ts:90-115`) | cliente RPC + móvil | p. ej. IDEs |
-| `json` / `print` | no (`hasUI=false`) | **sólo móvil** (el broker corre sin rama local) | agentes headless/CI quedan controlables desde el móvil |
+| `tui` (pi, gentle-shell, dentro o fuera de herdr) | sí | terminal + móvil | caso principal |
+| `rpc` (IDE, cliente RPC) | sí (`rpc-mode.ts:90-115` respeta `signal`) | cliente + móvil | subagentes gentle excluidos por `GENTLE_PI_AGENTS_CHILD` |
+| `json` / `print` | no (`hasUI=false`) | sólo móvil (broker sin rama local) | agentes headless controlables desde el móvil |
 
-Versión mínima soportada: Pi 1.2.0 (requiere `ui_prompt_start`, `agent_settled`, `before_agent_start` unificado).
-`compat.ts` comprueba al cargar `typeof pi.on`, existencia de eventos y versión (`VERSION` exportado por el paquete) y
-degrada características en vez de fallar.
+Compatibilidad mínima: Pi ≥ 1.2.0. gentle-pi probado 4.x. herdr ≥ 0.9 (sólo para entrega `terminal`/rp-host).
+Plataformas: Linux, macOS, Windows (plugin); rp-host: herdr en las tres, tmux en Linux/macOS.
 
-## 12. Tests
+## 13. Tests
 
 | Nivel | Cómo |
 |---|---|
-| Unit | broker (carrera local/remoto, timeout, cancel, ack tardío), coalescedor de deltas, truncados, gate (patrones, annotations), saneado de nombres |
-| Contrato | todos los mensajes generados validan contra `@j3pf/rp-protocol`; fixtures compartidos |
-| Integración con Pi real | `createAgentSession` del SDK de Pi (`docs/sdk.md`) con un proveedor falso (`pi.registerProvider` con stream sintético) + relay real en memoria: (1) el modelo llama `bash rm -rf x` → prompt llega al "móvil" falso → respuesta → la herramienta se bloquea/permite; (2) `pi --mode rpc` como subproceso + `RpcClient` para verificar el espejo cuando hay UI (respuesta remota cancela el `extension_ui_request` local) |
-| Manual | checklist en `docs/QA.md`: TUI real en tmux, reload, `/new`, dos `pi` en la misma carpeta, red caída 2 min |
+| Unit | broker (carrera, timeout, cancel, ack tardío), adaptadores (`toPrompt`/`toResult` con fixtures reales de gentle-pi 4.1.0), clasificador, coalescedor, gate, saneado, detección de entorno |
+| Contrato | mensajes vs `@j3pf/rp-protocol` |
+| Integración Pi | SDK `createAgentSession` + proveedor falso + relay en memoria (flujo gate, respuestas remotas) |
+| Integración gentle-pi | Pi + `gentle-pi@4.1.0` + plugin, en `pi --mode rpc` con `RpcClient` (+ `GENTLE_SHELL_INTERACTIVE_HOST` sin definir): confirmación de comando peligroso respondida desde el "móvil"; `ask_user_question` respondida por adaptador en TUI real dentro de `tmux`/herdr (E2E con `herdr pane read` para verificar que el diálogo se cerró) |
+| E2E herdr | panel herdr con gentle-shell: `herdr agent prompt` desde la entrega `terminal`; `rp-host` crea workspace; reinicio del servidor herdr conserva `agentId` |
+| Regresión gentle-ai | `gentle-ai sync` en un home de prueba conserva `npm:@j3pf/pi-rp` |
+| Manual | `docs/QA.md` |
 
-CI: matriz Pi `1.2.0` y `latest` (instalando `@earendil-works/pi-coding-agent` como devDependency).
+CI: matriz Pi `1.2.0`/`latest` × gentle-pi `4.1.0`/`latest`.
 
-## 13. Tareas
+## 14. Tareas
 
 | # | Tarea | Fase | Est. |
 |---|---|---|---|
-| P0 | **Spike S1**: extensión mínima que parchea `ctx.ui.select`, responde desde un timer y verifica que el selector TUI se cierra; probar con `permission-gate.ts` oficial cargado a la vez | 0 | 1 d |
-| P1 | Esqueleto del paquete, config, `/rp pair`, `/rp status`, compat | 1 | 1 d |
-| P2 | Conexión WS + hello/welcome + snapshot + reconexión + cola | 1 | 2 d |
-| P3 | Forwarder (coalescido, truncados, estado) | 1 | 1,5 d |
-| P4 | Inbound: user.message, abort, ack | 1 | 1 d |
-| P5 | Broker + mirror | 2 | 2 d |
-| P6 | Gate + reglas persistidas | 2 | 1,5 d |
-| P7 | ask_user | 2 | 1 d |
-| P8 | Adjuntos | 3 | 1 d |
-| P9 | rp-host | 3 | 2 d |
-| P10 | Tests de integración con SDK/RPC, publicación (git tag + npm) | 1–3 | 2 d |
+| P0 | **Spike S1**: parche de `ctx.ui` + cierre de diálogo TUI con `signal`, junto a `permission-gate.ts` | 0 | 1 d |
+| P0b | **Spike S4**: gentle-shell (aislado y takeover) carga `npm:@j3pf/pi-rp`; responder desde fuera: confirmación de gentle-pi, `ask_user_question` por adaptador, pregunta de subagente; `/gentle:mode normal` por `sendUserMessage` | 0 | 1,5 d |
+| P0c | **Spike S5**: herdr — `herdr agent prompt` como entrega, `workspace create` + `pane run gentle-shell`, reanudación conserva `sessionId` | 0 | 0,5 d |
+| P0d | **Spike S6**: conectividad desde la PC de la empresa (proxy, WS, TLS) | 0 | 0,5 d |
+| P1 | Esqueleto, config XDG, entorno, `/rp pair|status|doctor`, compat | 1 | 1,5 d |
+| P2 | Conexión WS + proxy + hello/snapshot/reconexión/cola | 1 | 2 d |
+| P3 | Forwarder + statuses + redacción | 1 | 1,5 d |
+| P4 | Entrada: `api`, comando, abort, ack | 1 | 1 d |
+| P5 | Broker + mirror + clasificador + herdr:blocked | 2 | 2,5 d |
+| P6 | Adaptadores gentle-pi + fixtures | 2 | 2 d |
+| P7 | Gate propio + `rp_ask_user` condicional | 2 | 1,5 d |
+| P8 | Entrega `terminal` (herdr) | 2 | 0,5 d |
+| P9 | Transporte long-poll de respaldo | 2 | 1 d |
+| P10 | Adjuntos | 3 | 1 d |
+| P11 | rp-host (herdr + tmux, launchers) | 3 | 2,5 d |
+| P12 | Tests de integración gentle-pi/herdr, publicación npm | 1–3 | 3 d |

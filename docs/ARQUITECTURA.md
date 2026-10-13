@@ -2,7 +2,8 @@
 
 > Documento maestro. Es el mismo para los tres repos (`rp-relay`, `rp-plugin`, `rp-app`).
 > La copia canónica vive en `rp-relay/docs/ARQUITECTURA.md`; el contrato de red en
-> `rp-relay/docs/PROTOCOLO.md`. Cada repo tiene además su plan detallado:
+> `rp-relay/docs/PROTOCOLO.md`; la compatibilidad con **herdr, gentle-ai y gentle-shell/gentle-pi** y la
+> **separación por PC** en `COMPATIBILIDAD.md` (incluye la matriz requisito × entorno). Cada repo tiene además su plan detallado:
 > `rp-relay/docs/PLAN-RELAY.md`, `rp-plugin/docs/PLAN-PLUGIN.md`, `rp-app/docs/PLAN-APP.md`.
 
 Fecha de la investigación: 2026-10-13. Versión de Pi analizada: `@earendil-works/pi-coding-agent` **1.2.0**
@@ -19,6 +20,11 @@ Desde un teléfono Android:
 3. **Adjuntar archivos** (imágenes y cualquier otro archivo).
 4. **Recibir notificaciones push** cuando un agente **pregunta algo** o **pide autorización**, y **responder o aceptar
    directamente** (incluso desde la propia notificación, sin abrir la app).
+
+5. **Separar por PC** (PC personal con proyectos personales / PC de la empresa con proyectos de la empresa): filtros,
+   agrupación y notificaciones configurables por PC.
+6. Funcionar con el entorno real del usuario: **Pi lanzado con `gentle-shell` (gentle-pi), configurado con gentle-ai,
+   corriendo dentro de herdr** — además de Pi "a secas".
 
 Todo pasando por un **Relay propio** instalable en **Ubuntu Server**.
 
@@ -38,12 +44,12 @@ Todo pasando por un **Relay propio** instalable en **Ubuntu Server**.
                                                                             │ wss://relay/ws/agent
                                                      (conexión SALIENTE desde cada Pi; sin abrir puertos)
                      ┌──────────────────────────────────────────────────────┼─────────────────────────┐
-                     │ Máquina A                                            │                         │
-                     │  ┌─────────────┐  ┌─────────────┐   ┌────────────────┴──┐                      │
-                     │  │ pi (TUI)    │  │ pi (TUI)    │   │ rp-host (opcional, │  tmux new-session ... │
-                     │  │ +rp-plugin  │  │ +rp-plugin  │   │ fase 3: lanzar     │──────► pi +rp-plugin  │
-                     │  └─────────────┘  └─────────────┘   │ agentes desde app) │                      │
-                     │                                     └────────────────────┘                      │
+                     │ PC "Personal" (y otra igual: PC "Empresa")            │                         │
+                     │  herdr ─┬─ panel: gentle-shell → pi + gentle-pi + rp-plugin   ┌─────────────────┴──┐ │
+                     │         ├─ panel: gentle-shell → pi + gentle-pi + rp-plugin   │ rp-host (fase 3):  │ │
+                     │         │      └─ subagentes pi --mode rpc (plugin inactivo)  │ herdr workspace    │ │
+                     │         └─ panel: pi + rp-plugin                              │ create + pane run  │ │
+                     │  terminal suelta: pi + rp-plugin                              └────────────────────┘ │
                      └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -67,6 +73,13 @@ Todo pasando por un **Relay propio** instalable en **Ubuntu Server**.
 | D8 | **TLS sí, cifrado extremo a extremo no (v1)**. | E2E tipo Happy. | El relay es del propio usuario. E2E añade gestión de claves compleja sin beneficio real en este modelo de amenazas. Se deja el protocolo preparado (campo `enc`) para fase futura. |
 | D9 | **Emparejamiento por código QR / código corto de un solo uso**, tokens de larga duración guardados hasheados (SHA‑256) en el relay. | Usuario/contraseña, OAuth. | Un solo dueño; mínimo de fricción; revocable por dispositivo. |
 | D10 | **App Android nativa (Kotlin/Compose)**. | Flutter, React Native/Expo. | Sólo se pide Android; acceso directo a notificaciones ricas (acciones, RemoteInput, canales, `setAuthenticationRequired`), FCM y Keystore sin puentes. |
+| D11 | **Plugin distribuido por npm** (`npm:@j3pf/pi-rp`) e instalado en el home de Pi **y** en el de gentle-shell. | Instalar desde git. | El *takeover* de gentle-shell descarta paquetes git y por defecto usa `~/.gentle-shell/agent` (COMPATIBILIDAD G1, G2). |
+| D12 | **Credenciales de la PC en `~/.config/rp/`**, no en `PI_CODING_AGENT_DIR`. | Guardarlas en el home de Pi. | Un solo emparejamiento por PC compartido por `pi` y `gentle-shell`. |
+| D13 | **Adaptadores para diálogos `custom()` conocidos** (gentle-pi `ask_user_choice`, `ask_user_question`). | Sólo espejar `select/confirm/input`. | Son las preguntas del agente en gentle-pi; sin adaptador no serían respondibles desde el móvil (COMPATIBILIDAD P3). |
+| D14 | **Entrega "como tecleado" vía herdr** (`herdr agent prompt`) como opción. | Sólo `sendUserMessage`. | gentle-pi en modo Auto no acepta mensajes de extensiones como autorización (P4); lo tecleado sí. |
+| D15 | **PC como eje de primer nivel** (nombre, contexto personal/empresa, color; canales de notificación por PC; prefs por PC en el relay). | Etiquetas libres por agente. | Requisito explícito; además permite políticas distintas (silenciar empresa fuera de horario, redacción de contenido). |
+| D16 | **`agentId = machineId:piSessionId`** (estable). | Id por proceso. | herdr reanuda sesiones tras reiniciar; el historial en la app debe continuar (H5). |
+| D17 | **Subagentes de gentle-pi no se registran como agentes**; sus preguntas llegan por el padre. | Registrar cada subagente. | Evita ruido y duplicados (G4, G5). Vista de subagentes dentro del agente padre en fase 4. |
 
 ## 4. Hechos verificados de Pi (base de certeza del plan)
 
@@ -74,7 +87,7 @@ Verificados leyendo el código fuente de Pi 1.2.0 (`packages/coding-agent`):
 
 | Necesidad | API de Pi | Dónde se verificó |
 |---|---|---|
-| Cargar el plugin en todas las sesiones | Pi packages: `pi install git:github.com/j3pf/rp-plugin@vX` o `npm:`; se guarda en `~/.pi/agent/settings.json`. | `docs/packages.md` |
+| Cargar el plugin en todas las sesiones | Pi packages: `pi install npm:@j3pf/pi-rp` (y `gentle-shell install …` para su home); se guarda en `settings.json` del home de Pi. | `docs/packages.md` |
 | Saber cuándo arranca/termina una sesión | Eventos `session_start` (`reason: startup|reload|new|resume|fork`) y `session_shutdown`. No abrir sockets en la *factory*, sí en `session_start`. | `docs/extensions.md` §lifecycle, `types.ts:755,824` |
 | Ver lo que hace el agente en vivo | Eventos `agent_start`, `turn_start/end`, `message_start/update/end`, `tool_execution_start/update/end`, `agent_settled`, `session_info_changed`, `model_select`, `thinking_level_select`. | `types.ts:1405-1437`, `docs/json.md` |
 | Historial de la sesión | `ctx.sessionManager.getBranch()`, `getSessionId()`, `getSessionFile()`, `getSessionName()`, `getHeader()`. | `session-manager.ts:1140-1529` |
@@ -121,9 +134,9 @@ Si se responde en la terminal primero: plugin envía `prompt.resolved {by:"local
 
 ### 5.3 Ver todos los agentes
 
-Cada proceso `pi` con el plugin = 1 **agente** (`agentId` = `sessionId` de Pi + sufijo de proceso). Al conectar envía
+Cada proceso `pi` con el plugin = 1 **agente** (`agentId` = `machineId:sessionId` de Pi, estable entre reinicios). Al conectar envía
 `agent.hello` con máquina, cwd, rama git, nombre de sesión, modelo, estado. El relay mantiene la lista viva (online /
-offline con última vez visto, conservados 7 días). La app la muestra agrupada por máquina con contador de preguntas
+offline con última vez visto, conservados 7 días). La app la muestra filtrable por PC (Todas · Personal · Empresa) y agrupada por PC con contador de preguntas
 pendientes.
 
 ## 6. Seguridad (resumen)
@@ -141,7 +154,7 @@ pendientes.
 
 | Fase | Contenido | Criterio de "hecho" |
 |---|---|---|
-| **0. Spikes (1 semana)** | S1: interceptar `ctx.ui` y cancelar diálogo TUI con `signal` (Pi 1.2.0). S2: FCM data high‑priority con app cerrada + acción en notificación → HTTP. S3: relay mínimo WS eco. | Cada spike con demo grabada y nota en `docs/spikes/`. |
+| **0. Spikes (1,5 semanas)** | S1: interceptar `ctx.ui` y cancelar diálogo TUI con `signal` (Pi 1.2.0). S2: FCM data high‑priority con app cerrada + acción en notificación → HTTP. S3: relay mínimo WS eco detrás de Caddy. **S4: gentle-shell** (aislado y takeover) carga el plugin npm; responder desde fuera confirmación de gentle-pi, `ask_user_question` (adaptador) y pregunta de subagente; `/gentle:mode normal` como comando. **S5: herdr**: entrega `herdr agent prompt`, `workspace create` + `pane run gentle-shell`, reanudación conserva `sessionId`. **S6: red de la PC de la empresa** (proxy/WS/TLS). | Cada spike con demo grabada y nota en `docs/spikes/`; la matriz de COMPATIBILIDAD §2 pasa de 🔬 a ✅. |
 | **1. MVP "ver y hablar" (2–3 sem.)** | Relay (auth, WS, agentes, eventos, historial). Plugin (conexión, eventos, `sendUserMessage`, abort). App (emparejar, lista de agentes, chat en vivo, enviar texto). | Desde el móvil veo 2 agentes en 2 máquinas, les escribo y veo la respuesta en streaming. |
 | **2. Preguntas, autorizaciones y push (2 sem.)** | Prompts en relay + FCM. Plugin: permission gate, `ask_user`, espejo de diálogos. App: bandeja, hoja de respuesta, notificaciones con acciones y RemoteInput. | Con la app cerrada llega la notificación; "Permitir" desde la notificación desbloquea el agente en <2 s; la terminal se cierra sola. |
 | **3. Adjuntos + lanzar agentes (1–2 sem.)** | Blobs, cámara/archivos en la app; `rp-host` para crear agentes en tmux desde el móvil. | Envío una foto y un PDF; creo un agente nuevo en `~/proyecto` desde el móvil. |
@@ -155,4 +168,9 @@ pendientes.
 | R2 | Diálogos `custom()` (TUI propio de otras extensiones) y `editor()` no se pueden responder remotamente. | Cierta | Se notifica igualmente vía `ui_prompt_start` ("esperando en la terminal"). |
 | R3 | FCM retrasado por el fabricante (Xiaomi/Huawei con optimizaciones agresivas). | Media | Prioridad alta + guía en la app para excluir de optimización de batería; reintento de push cada 5 min mientras la pregunta siga abierta (máx. 3). |
 | R4 | Requiere crear proyecto Firebase propio. | Cierta | Guía paso a paso en `PLAN-RELAY.md §9`; el relay funciona sin FCM (sólo notificaciones con la app abierta). |
-| R5 | Cambios de API entre versiones de Pi. | Media | `peerDependencies: "*"` + matriz de CI contra la versión mínima soportada (1.2.0) y `latest`; capa `pi-compat.ts` que aísla accesos. |
+| R5 | Cambios de API entre versiones de Pi. | Media | `peerDependencies: "*"` + matriz de CI contra la versión mínima soportada (1.2.0) y `latest`; capa `compat.ts` que aísla accesos. |
+| R6 | gentle-pi cambia la forma de `ask_user_choice`/`ask_user_question` (adaptadores). | Media | Rango de versión probado + fixtures en CI contra `gentle-pi@latest`; fuera de rango → notificación "esperando en la terminal" (degradación, no rotura). |
+| R7 | gentle-pi en modo **Auto** ignora órdenes no tecleadas (por diseño de seguridad). | Cierta | Entrega "como tecleado" vía herdr; botón "Pasar a Normal"; aviso en el chat. Las respuestas a diálogos sí autorizan. |
+| R8 | La PC de la empresa bloquea WebSocket o inspecciona TLS. | Media | Proxy + CA corporativa; transporte long-poll; spike S6 antes de construir. |
+| R9 | Política de la empresa contra enviar código a un servidor personal. | Desconocida | `redactContent` por PC; modelo listo para un segundo relay (de la empresa) en la app. **Decisión del usuario.** |
+| R10 | Olvidar instalar el plugin en el home de gentle-shell. | Media | `/rp doctor` lo detecta; instrucciones en el README; la app marca PCs sin agentes recientes. |
