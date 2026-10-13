@@ -10,15 +10,30 @@ para lanzar agentes nuevos desde el móvil (en herdr, tmux o Windows Terminal).
 
 ## Instalación (por cada PC)
 
+### Desde la release oficial de GitHub (Recomendado)
 ```bash
-pi install npm:@j3pf/pi-rp                 # Pi "normal" (~/.pi/agent) — sobrevive a `gentle-ai sync`
-gentle-shell install npm:@j3pf/pi-rp       # gentle-shell usa su propio home (~/.gentle-shell/agent)
-pi                                         # o gentle-shell
-/rp pair https://relay.midominio.com ABCD2345 --name "PC Empresa" --context work
-/rp doctor                                 # comprueba red, proxy, CA, plugin declarado en ambos homes…
+# Pi estándar (~/.pi/agent)
+pi install https://github.com/J3pf/Rp-plugin/releases/download/v0.1.0/j3pf-pi-rp-0.1.0.tgz
+
+# gentle-shell (~/.gentle-shell/agent)
+gentle-shell install https://github.com/J3pf/Rp-plugin/releases/download/v0.1.0/j3pf-pi-rp-0.1.0.tgz
 ```
 
-Nunca `pi install git:…`: el *takeover* de gentle-shell descarta los paquetes git. Requiere Node ≥ 22.19.
+### O desde código fuente local
+```bash
+git clone https://github.com/J3pf/Rp-plugin.git
+cd Rp-plugin && npm install && npm run build
+pi install .
+```
+
+### Emparejamiento
+Una vez instalado, abre Pi (`pi` o `gentle-shell`) y ejecuta:
+```bash
+/rp pair http://IP_O_DOMINIO_DEL_RELAY:8787 CODIGO_EMPAREJAMIENTO --name "Mi PC" --context personal
+/rp doctor                                 # comprueba red, proxy, CA y conectividad
+```
+
+> Guía detallada y solución de problemas en [docs/INSTALACION.md](docs/INSTALACION.md). Requiere Node ≥ 22.19.
 
 ## Qué hace
 
@@ -34,7 +49,7 @@ Nunca `pi install git:…`: el *takeover* de gentle-shell descarta los paquetes 
 | Comandos `/rp pair|status|doctor|on|off|gate|test|unpair` | `commands.ts` |
 | `rp-host`: crear agentes desde el móvil (herdr workspace/pestaña/panel, tmux, Windows Terminal, consola) + servicio | `src/host/` |
 
-Documentos: [PLAN-PLUGIN](docs/PLAN-PLUGIN.md) (plan + estado de implementación) · [RESILIENCIA](docs/RESILIENCIA.md) ·
+Documentos: [INSTALACION](docs/INSTALACION.md) (instalación y troubleshooting) · [PLAN-PLUGIN](docs/PLAN-PLUGIN.md) (plan + estado de implementación) · [RESILIENCIA](docs/RESILIENCIA.md) ·
 [COMPATIBILIDAD](docs/COMPATIBILIDAD.md) · [ARQUITECTURA](docs/ARQUITECTURA.md) · [QA manual](docs/QA.md) ·
 [Spikes](docs/spikes/README.md) · contrato de red: [`rp-relay/docs/PROTOCOLO.md`](https://github.com/j3pf/rp-relay/blob/main/docs/PROTOCOLO.md).
 
