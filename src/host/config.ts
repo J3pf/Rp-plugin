@@ -1,0 +1,57 @@
+import fs from "node:fs";
+import path from "node:path";
+import { expandHome, hostConfigPath } from "../shared/platform.ts";
+
+export type BackendName = "herdr" | "tmux" | "wt" | "console";
+export type BackendSetting = "auto" | BackendName;
+
+export interface HostConfig {
+  roots: string[];
+  backend: BackendSetting;
+  launchers: Record<string, string>;
+  defaultLauncher: string;
+  herdrSession: string | null;
+}
+
+export const DEFAULT_HOST_CONFIG: HostConfig = {
+  roots: ["~/proyectos"],
+  backend: "auto",
+  launchers: { "gentle-shell": "gentle-shell", pi: "pi" },
+  defaultLauncher: "gentle-shell",
+  herdrSession: null,
+};
+
+const BACKENDS: BackendSetting[] = ["auto", "herdr", "tmux", "wt", "console"];
+
+export function normalizeHostConfig(raw: any, home?: string): HostConfig {
+  const r = raw && typeof raw === "object" ? raw : {};
+  const d = DEFAULT_HOST_CONFIG;
+  const launchersIn = r.launchers && typeof r.launchers === "object" ? r.launchers : d.launchers;
+  const launchers: Record<string, string> = {};
+  for (const [k, v] of Object.entries(launchersIn)) if (typeof v === "string" && v.trim()) launchers[k] = v.trim();
+  if (!Object.keys(launchers).length) Object.assign(launchers, d.launchers);
+  const defaultLauncher = typeof r.defaultLauncher === "string" && launchers[r.defaultLauncher] ? r.defaultLauncher : (launchers[d.defaultLauncher] ? d.defaultLauncher : Object.keys(launchers)[0]!);
+  const rootsIn: string[] = Array.isArray(r.roots) && r.roots.every((x: unknown) => typeof x === "string") && r.roots.length ? r.roots : d.roots;
+  return {
+    roots: rootsIn.map((p) => path.resolve(expandHome(p, home))),
+    backend: BACKENDS.includes(r.backend) ? r.backend : d.backend,
+    launchers,
+    defaultLauncher,
+    herdrSession: typeof r.herdrSession === "string" && r.herdrSession ? r.herdrSession : null,
+  };
+}
+
+export function loadHostConfig(env: NodeJS.ProcessEnv = process.env): { cfg: HostConfig; path: string; exists: boolean } {
+  const p = hostConfigPath(env);
+  try {
+    return { cfg: normalizeHostConfig(JSON.parse(fs.readFileSync(p, "utf8"))), path: p, exists: true };
+  } catch {
+    return { cfg: normalizeHostConfig({}), path: p, exists: false };
+  }
+}
+
+export function writeDefaultHostConfig(p: string): void {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const body = { roots: DEFAULT_HOST_CONFIG.roots, backend: "auto", launchers: DEFAULT_HOST_CONFIG.launchers, defaultLauncher: DEFAULT_HOST_CONFIG.defaultLauncher, herdrSession: null };
+  fs.writeFileSync(p, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
+}

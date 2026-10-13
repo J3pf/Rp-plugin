@@ -1,0 +1,405 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { normalizeHostConfig, writeDefaultHostConfig, DEFAULT_HOST_CONFIG } from "../src/host/config.ts";
+import { HostError, listDirs, resolveLauncher, resolveWithinRoots, sanitizeLabel, splitCommand, validateSpawnId } from "../src/host/validate.ts";
+import { HerdrBackend, parseJson, pick, PANE_PATHS } from "../src/host/backends/herdr.ts";
+import { TmuxBackend, parseTmuxVersion, tmuxSupportsEnv, tmuxSessionName } from "../src/host/backends/tmux.ts";
+import { WindowsTerminalBackend, ConsoleBackend, wtArgs, consoleArgs, killScript } from "../src/host/backends/windows.ts";
+import { HostManager } from "../src/host/manager.ts";
+import { HostConnection, parseTarget } from "../src/host/connection.ts";
+import { launchdPlist, schtasksCreateArgs, systemdUnit, installService, uninstallService } from "../src/host/service.ts";
+import type { Runner } from "../src/host/runner.ts";
+import { FakeRelay, waitUntil } from "./helpers.ts";
+import { envelope } from "../src/shared/protocol.ts";
+
+const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "rphost-"));
+
+/** Fake process runner: records calls, answers per command prefix. */
+function fakeRun(handlers: Record<string, (args: string[]) => { code?: number; stdout?: string; stderr?: string }> = {}) {
+  const calls: Array<{ cmd: string; args: string[]; env?: any; cwd?: string }> = [];
+  const run: Runner = async (cmd, args, opts) => {
+    calls.push({ cmd, args, env: opts?.env, cwd: opts?.cwd });
+    const key = Object.keys(handlers).find((k) => `${cmd} ${args.join(" ")}`.startsWith(k));
+    const r = key ? handlers[key]!(args) : { code: 127, stderr: "not found" };
+    return { code: r.code ?? 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  };
+  return { run, calls };
+}
+
+describe("host config", () => {
+  it("defaults, normalization and resolved roots", () => {
+    const c = normalizeHostConfig({ roots: ["~/code"], backend: "tmux", launchers: { a: "pi --x", bad: 3 }, defaultLauncher: "nope", herdrSession: "work" }, "/home/u");
+    expect(c.roots).toEqual([path.resolve("/home/u/code")]);
+    expect(c.backend).toBe("tmux");
+    expect(c.launchers).toEqual({ a: "pi --x" });
+    expect(c.defaultLauncher).toBe("a");
+    expect(c.herdrSession).toBe("work");
+    const d = normalizeHostConfig(null);
+    expect(d.launchers).toEqual(DEFAULT_HOST_CONFIG.launchers);
+    expect(d.backend).toBe("auto");
+    expect(normalizeHostConfig({ backend: "zzz" }).backend).toBe("auto");
+  });
+  it("writeDefaultHostConfig creates a 0600 file", () => {
+    const p = path.join(tmp(), "x", "host.json");
+    writeDefaultHostConfig(p);
+    expect(JSON.parse(fs.readFileSync(p, "utf8")).defaultLauncher).toBe("gentle-shell");
+    if (process.platform !== "win32") expect(fs.statSync(p).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("validation (the phone can only pick a directory under roots and a launcher key)", () => {
+  it("accepts directories inside roots, rejects outside, files, missing, NUL", () => {
+    const root = tmp();
+    fs.mkdirSync(path.join(root, "proj"));
+    fs.writeFileSync(path.join(root, "file.txt"), "x");
+    const cfg = normalizeHostConfig({ roots: [root] });
+    expect(resolveWithinRoots(cfg, path.join(root, "proj"))).toBe(fs.realpathSync(path.join(root, "proj")));
+    expect(resolveWithinRoots(cfg, root)).toBe(fs.realpathSync(root));
+    expect(() => resolveWithinRoots(cfg, os.tmpdir())).toThrow(/outside/);
+    expect(() => resolveWithinRoots(cfg, path.join(root, "..", "etc"))).toThrow();
+    expect(() => resolveWithinRoots(cfg, path.join(root, "file.txt"))).toThrow(/not a directory/);
+    expect(() => resolveWithinRoots(cfg, path.join(root, "missing"))).toThrow(/does not exist/);
+    expect(() => resolveWithinRoots(cfg, "a\0b")).toThrow(/invalid/);
+    expect(() => resolveWithinRoots(cfg, "")).toThrow();
+  });
+  it("symlinks escaping the root are rejected (realpath)", () => {
+    if (process.platform === "win32") return;
+    const root = tmp();
+    const outside = tmp();
+    fs.symlinkSync(outside, path.join(root, "link"));
+    const cfg = normalizeHostConfig({ roots: [root] });
+    expect(() => resolveWithinRoots(cfg, path.join(root, "link"))).toThrow(/outside/);
+    expect(() => listDirs(cfg, path.join(root, "link"))).toThrow(/outside/);
+  });
+  it("sibling directories sharing a prefix are not inside the root", () => {
+    const base = tmp();
+    fs.mkdirSync(path.join(base, "proj"));
+    fs.mkdirSync(path.join(base, "proj-evil"));
+    const cfg = normalizeHostConfig({ roots: [path.join(base, "proj")] });
+    expect(() => resolveWithinRoots(cfg, path.join(base, "proj-evil"))).toThrow(/outside/);
+  });
+  it("listDirs lists non-hidden subdirectories sorted; empty path lists the roots", () => {
+    const root = tmp();
+    for (const d of ["b", "a", ".hidden"]) fs.mkdirSync(path.join(root, d));
+    fs.writeFileSync(path.join(root, "f"), "");
+    const cfg = normalizeHostConfig({ roots: [root] });
+    expect(listDirs(cfg, root).dirs).toEqual(["a", "b"]);
+    expect(listDirs(cfg, "").dirs).toEqual([root]);
+  });
+  it("launcher is a key, never a command", () => {
+    const cfg = normalizeHostConfig({ launchers: { pi: "pi", "gentle-shell": "gentle-shell --link" } });
+    expect(resolveLauncher(cfg, undefined).key).toBe(cfg.defaultLauncher);
+    expect(resolveLauncher(cfg, "gentle-shell").command).toBe("gentle-shell --link");
+    expect(() => resolveLauncher(cfg, "rm -rf /")).toThrow(/unknown launcher/);
+    expect(() => resolveLauncher(cfg, "__proto__")).toThrow(/unknown launcher/);
+    expect(() => resolveLauncher(cfg, "constructor")).toThrow(/unknown launcher/);
+  });
+  it("labels and spawn ids are sanitized", () => {
+    expect(sanitizeLabel("a;b\"c`$\\\n d", "x")).toBe("a b c d");
+    expect(sanitizeLabel("   ", "fallback")).toBe("fallback");
+    expect(sanitizeLabel("x".repeat(200), "f").length).toBe(60);
+    expect(validateSpawnId("01JABCDEFGHJKMNPQRSTVWXYZ0")).toBeTruthy();
+    expect(() => validateSpawnId("a'; rm -rf /")).toThrow(HostError);
+    expect(() => validateSpawnId(5)).toThrow(HostError);
+    expect(splitCommand(`gentle-shell --home "C:\\Program Files\\x"`)).toEqual(["gentle-shell", "--home", "C:\\Program Files\\x"]);
+  });
+});
+
+describe("herdr backend", () => {
+  const ws = (id = "w1", pane = "p1") => JSON.stringify({ result: { workspace: { workspace_id: id }, root_pane: { pane_id: pane } } });
+  const mkH = (extra: Record<string, any> = {}, session: string | null = null) => {
+    const f = fakeRun({
+      "herdr --version": () => ({ stdout: "herdr 0.9.3\n" }),
+      "herdr status server": () => ({ code: 0 }),
+      "herdr workspace create": () => ({ stdout: ws() }),
+      "herdr pane run": () => ({ code: 0 }),
+      ...extra,
+    });
+    return { ...f, b: new HerdrBackend({ run: f.run, platform: "linux", herdrSession: session }) };
+  };
+  const req = { cwd: "/p", name: "api", launcherCommand: "gentle-shell", spawnId: "SPAWN1234567" };
+
+  it("detects the version", async () => {
+    expect(await mkH().b.detect()).toBe("0.9.3");
+    expect(await new HerdrBackend({ run: fakeRun().run, platform: "linux", herdrSession: null }).detect()).toBeNull();
+  });
+  it("new workspace: create → pane run launcher; never steals focus; env carries RP_SPAWN_ID", async () => {
+    const { b, calls } = mkH();
+    const rec = await b.spawn(req);
+    expect(calls.find((c) => c.args[0] === "workspace")!.args).toEqual(["workspace", "create", "--cwd", "/p", "--label", "api", "--env", "RP_SPAWN_ID=SPAWN1234567", "--no-focus"]);
+    expect(calls.find((c) => c.args[0] === "pane")!.args).toEqual(["pane", "run", "p1", "gentle-shell"]);
+    expect(rec).toMatchObject({ backend: "herdr", herdr: { workspaceId: "w1", paneId: "p1" }, tmuxSession: null });
+  });
+  it("new tab in an existing workspace", async () => {
+    const { b, calls } = mkH({ "herdr tab create": () => ({ stdout: JSON.stringify({ result: { tab: { tab_id: "t9" }, root_pane: { pane_id: "p9" } } }) }) });
+    const rec = await b.spawn({ ...req, herdrTarget: { type: "tab", workspaceId: "w7" } });
+    expect(calls.find((c) => c.args[0] === "tab")!.args).toEqual(["tab", "create", "--workspace", "w7", "--cwd", "/p", "--label", "api", "--env", "RP_SPAWN_ID=SPAWN1234567", "--no-focus"]);
+    expect(rec.herdr).toMatchObject({ workspaceId: "w7", tabId: "t9", paneId: "p9" });
+  });
+  it("split an existing pane", async () => {
+    const { b, calls } = mkH({ "herdr pane split": () => ({ stdout: JSON.stringify({ result: { pane_id: "p5" } }) }) });
+    const rec = await b.spawn({ ...req, herdrTarget: { type: "split", paneId: "p2", direction: "down" } });
+    expect(calls.find((c) => c.args[1] === "split")!.args).toEqual(["pane", "split", "p2", "--direction", "down", "--cwd", "/p", "--env", "RP_SPAWN_ID=SPAWN1234567", "--no-focus"]);
+    expect(calls.find((c) => c.args[1] === "run")!.args).toEqual(["pane", "run", "p5", "gentle-shell"]);
+    expect(rec.herdr!.paneId).toBe("p5");
+  });
+  it("passes HERDR_SESSION when configured", async () => {
+    const { b, calls } = mkH({}, "work");
+    await b.spawn(req);
+    expect(calls.every((c) => c.env?.HERDR_SESSION === "work")).toBe(true);
+  });
+  it("errors: failed create, missing pane id, failed pane run, bad direction", async () => {
+    await expect(mkH({ "herdr workspace create": () => ({ code: 1, stderr: "boom" }) }).b.spawn(req)).rejects.toThrow(/boom/);
+    await expect(mkH({ "herdr workspace create": () => ({ stdout: "{}" }) }).b.spawn(req)).rejects.toThrow(/pane id/);
+    await expect(mkH({ "herdr pane run": () => ({ code: 1, stderr: "denied" }) }).b.spawn(req)).rejects.toThrow(/denied/);
+    await expect(mkH().b.spawn({ ...req, herdrTarget: { type: "split", paneId: "p", direction: "left" as any } })).rejects.toThrow(/direction/);
+  });
+  it("kill: workspace close for owned workspaces, pane close otherwise", async () => {
+    const { b, calls } = mkH({ "herdr workspace close": () => ({}), "herdr pane close": () => ({}) });
+    await b.kill({ spawnId: "s", backend: "herdr", herdr: { workspaceId: "w1", paneId: "p1" }, tmuxSession: null, createdAt: 0 });
+    await b.kill({ spawnId: "s", backend: "herdr", herdr: { workspaceId: "w1", tabId: "t1", paneId: "p2" }, tmuxSession: null, createdAt: 0 });
+    expect(calls.map((c) => c.args.slice(0, 3).join(" "))).toEqual(["workspace close w1", "pane close p2"]);
+  });
+  it("starts the herdr server headless when it is not running", async () => {
+    let up = false;
+    const { b, calls } = mkH({ "herdr status server": () => ({ code: up ? 0 : 1 }) });
+    // simulate the server coming up shortly after being asked to start
+    setTimeout(() => (up = true), 300);
+    await expect(b.ensureServer()).resolves.toBeUndefined();
+    expect(calls.filter((c) => c.args[0] === "status").length).toBeGreaterThan(1);
+  });
+  it("layout: workspaces with their tabs and panes", async () => {
+    const { b } = mkH({
+      "herdr workspace list": () => ({ stdout: JSON.stringify({ result: { workspaces: [{ workspace_id: "w1", label: "api", cwd: "/p/api" }, { workspace_id: "w2", label: "web" }] } }) }),
+      "herdr tab list": () => ({ stdout: JSON.stringify({ result: { tabs: [{ tab_id: "t1", workspace_id: "w1", label: "main", panes: [{ pane_id: "p1", agent: "pi" }, { pane_id: "p2" }] }, { tab_id: "t2", workspace_id: "w2", label: "x" }] } }) }),
+    });
+    const l = await b.layout();
+    expect(l.workspaces).toEqual([
+      { id: "w1", label: "api", cwd: "/p/api", tabs: [{ id: "t1", label: "main", panes: [{ id: "p1", agent: "pi" }, { id: "p2" }] }] },
+      { id: "w2", label: "web", cwd: null, tabs: [{ id: "t2", label: "x", panes: [] }] },
+    ]);
+  });
+  it("json helpers are tolerant", () => {
+    expect(parseJson('noise {"a":1} tail')).toEqual({ a: 1 });
+    expect(parseJson("")).toBeNull();
+    expect(pick({ result: { pane_id: 7 } }, PANE_PATHS)).toBe("7");
+  });
+});
+
+describe("tmux backend", () => {
+  it("version gate ≥ 3.2 and session naming", () => {
+    expect(parseTmuxVersion("tmux 3.4")).toBe("3.4");
+    expect(parseTmuxVersion("tmux next-3.5")).toBe("3.5");
+    expect(parseTmuxVersion("tmux 3.3a")).toBe("3.3a");
+    expect(tmuxSupportsEnv("3.2")).toBe(true);
+    expect(tmuxSupportsEnv("3.1c")).toBe(false);
+    expect(tmuxSupportsEnv("2.9")).toBe(false);
+    expect(tmuxSupportsEnv("4.0")).toBe(true);
+    expect(tmuxSupportsEnv(null)).toBe(false);
+    expect(tmuxSessionName("01JABCDEFGHJKMNP")).toBe("rp-fghjkmnp");
+  });
+  it("detect honours the version gate; windows never has tmux", async () => {
+    const ok = new TmuxBackend({ run: fakeRun({ "tmux -V": () => ({ stdout: "tmux 3.4\n" }) }).run, platform: "linux", herdrSession: null });
+    expect(await ok.detect()).toBe("3.4");
+    const old = new TmuxBackend({ run: fakeRun({ "tmux -V": () => ({ stdout: "tmux 3.0\n" }) }).run, platform: "linux", herdrSession: null });
+    expect(await old.detect()).toBeNull();
+    expect(await new TmuxBackend({ run: fakeRun().run, platform: "win32", herdrSession: null }).detect()).toBeNull();
+  });
+  it("spawn: detached session with cwd and RP_SPAWN_ID; kill by session", async () => {
+    const f = fakeRun({ "tmux new-session": () => ({}), "tmux kill-session": () => ({}) });
+    const b = new TmuxBackend({ run: f.run, platform: "linux", herdrSession: null });
+    const rec = await b.spawn({ cwd: "/p", name: "n", launcherCommand: "gentle-shell", spawnId: "01JABCDEFGHJKMNPQRSTVWXYZ0" });
+    expect(f.calls[0]!.args).toEqual(["new-session", "-d", "-s", rec.tmuxSession!, "-c", "/p", "-e", "RP_SPAWN_ID=01JABCDEFGHJKMNPQRSTVWXYZ0", "gentle-shell"]);
+    expect(rec.tmuxSession).toMatch(/^rp-[a-z0-9]{8}$/);
+    await b.kill(rec);
+    expect(f.calls[1]!.args).toEqual(["kill-session", "-t", rec.tmuxSession]);
+    await expect(new TmuxBackend({ run: fakeRun({ "tmux new-session": () => ({ code: 1, stderr: "dup" }) }).run, platform: "linux", herdrSession: null }).spawn({ cwd: "/p", name: "n", launcherCommand: "pi", spawnId: "S12345678901" })).rejects.toThrow(/dup/);
+  });
+});
+
+describe("Windows backends (id travels as --rp-spawn-id because wt/cmd do not pass env)", () => {
+  const req = { cwd: "C:\\proyectos\\api", name: "api", launcherCommand: "gentle-shell --link", spawnId: "SPAWNID12345" };
+  it("wt.exe arguments", () => {
+    expect(wtArgs(req)).toEqual(["-w", "rp", "new-tab", "-d", "C:\\proyectos\\api", "--title", "api", "gentle-shell", "--link", "--rp-spawn-id", "SPAWNID12345"]);
+    expect(() => wtArgs({ ...req, cwd: "C:\\a;b" })).toThrow(/;/);
+  });
+  it("cmd /c start arguments", () => {
+    expect(consoleArgs(req)).toEqual(["/c", "start", "api", "/D", "C:\\proyectos\\api", "gentle-shell", "--link", "--rp-spawn-id", "SPAWNID12345"]);
+  });
+  it("kill script matches only this spawn id", () => {
+    expect(killScript("SPAWNID12345")).toContain("--rp-spawn-id SPAWNID12345*");
+  });
+  it("spawn/kill run wt.exe / cmd.exe / powershell without a shell string", async () => {
+    const f = fakeRun({ "wt.exe": () => ({}), "cmd.exe": () => ({}), "powershell.exe": () => ({}), "where wt.exe": () => ({}) });
+    const wt = new WindowsTerminalBackend({ run: f.run, platform: "win32", herdrSession: null });
+    expect(await wt.detect()).toBe(true);
+    const rec = await wt.spawn(req);
+    expect(rec.backend).toBe("wt");
+    await wt.kill(rec);
+    const con = new ConsoleBackend({ run: f.run, platform: "win32", herdrSession: null });
+    await con.spawn(req);
+    expect(f.calls.map((c) => c.cmd)).toEqual(["where", "wt.exe", "powershell.exe", "cmd.exe"]);
+    expect(await new WindowsTerminalBackend({ run: f.run, platform: "linux", herdrSession: null }).detect()).toBeNull();
+    expect(await new ConsoleBackend({ run: f.run, platform: "linux", herdrSession: null }).detect()).toBeNull();
+  });
+});
+
+describe("HostManager", () => {
+  function mk(platform: NodeJS.Platform, handlers: Record<string, any>, over: any = {}) {
+    const root = tmp();
+    fs.mkdirSync(path.join(root, "proj"));
+    const cfg = normalizeHostConfig({ roots: [root], launchers: { "gentle-shell": "gentle-shell", pi: "pi" }, ...over });
+    const f = fakeRun(handlers);
+    const mgr = new HostManager(cfg, { run: f.run, platform, storeFile: path.join(tmp(), "spawns.json") });
+    return { mgr, f, root };
+  }
+  const linuxTmux = { "tmux -V": () => ({ stdout: "tmux 3.4" }), "tmux new-session": () => ({}), "tmux kill-session": () => ({}) };
+  it("auto prefers herdr, then tmux (Linux)", async () => {
+    expect(await mk("linux", linuxTmux).mgr.resolveBackend()).toBe("tmux");
+    expect(await mk("linux", { ...linuxTmux, "herdr --version": () => ({ stdout: "herdr 0.9.3" }) }).mgr.resolveBackend()).toBe("herdr");
+  });
+  it("auto on Windows: herdr, then Windows Terminal, then console", async () => {
+    expect(await mk("win32", { "where wt.exe": () => ({}) }).mgr.resolveBackend()).toBe("wt");
+    expect(await mk("win32", {}).mgr.resolveBackend()).toBe("console");
+    expect(await mk("win32", { "herdr --version": () => ({ stdout: "herdr 0.9.3" }), "where wt.exe": () => ({}) }).mgr.resolveBackend()).toBe("herdr");
+  });
+  it("no backend available is a clear error; an unavailable explicit backend too", async () => {
+    await expect(mk("linux", {}).mgr.resolveBackend()).rejects.toThrow(/no backend available/);
+    await expect(mk("linux", linuxTmux).mgr.resolveBackend("wt")).rejects.toThrow(/not available/);
+  });
+  it("host.json backend pins the choice", async () => {
+    expect(await mk("linux", { ...linuxTmux, "herdr --version": () => ({ stdout: "herdr 0.9.3" }) }, { backend: "tmux" }).mgr.resolveBackend()).toBe("tmux");
+  });
+  it("spawn validates cwd/launcher, records the spawn and can kill it (including after a restart)", async () => {
+    const { mgr, f, root } = mk("linux", linuxTmux);
+    await expect(mgr.spawn({ cwd: os.tmpdir() })).rejects.toThrow(/outside/);
+    await expect(mgr.spawn({ cwd: path.join(root, "proj"), launcher: "bash -c evil" })).rejects.toThrow(/unknown launcher/);
+    const rec = await mgr.spawn({ cwd: path.join(root, "proj"), name: "Mi; proyecto", launcher: "pi" });
+    expect(rec.backend).toBe("tmux");
+    expect(f.calls.find((c) => c.args[0] === "new-session")!.args.at(-1)).toBe("pi");
+    expect(mgr.list()).toHaveLength(1);
+    await expect(mgr.kill("A".repeat(26))).rejects.toThrow(/only agents created/);
+    await mgr.kill(rec.spawnId);
+    expect(mgr.list()).toHaveLength(0);
+    expect(f.calls.some((c) => c.args[0] === "kill-session")).toBe(true);
+  });
+  it("persists spawns so kill works after rp-host restarts", async () => {
+    const { mgr, root } = mk("linux", linuxTmux);
+    const rec = await mgr.spawn({ cwd: path.join(root, "proj") });
+    const store = (mgr as any).storeFile;
+    const cfg = (mgr as any).cfg;
+    const mgr2 = new HostManager(cfg, { run: fakeRun(linuxTmux).run, platform: "linux", storeFile: store });
+    expect(mgr2.list().map((r) => r.spawnId)).toEqual([rec.spawnId]);
+    await mgr2.kill(rec.spawnId);
+  });
+  it("herdrTarget requires the herdr backend", async () => {
+    const { mgr, root } = mk("linux", linuxTmux);
+    await expect(mgr.spawn({ cwd: path.join(root, "proj"), herdrTarget: { type: "workspace" } })).rejects.toThrow(/requires the herdr backend/);
+  });
+});
+
+describe("HostConnection protocol", () => {
+  let relay: FakeRelay;
+  let hc: HostConnection | undefined;
+  afterEach(async () => {
+    hc?.stop();
+    await relay?.stop();
+  });
+  it("host.hello, list_dirs, spawn → host.spawned, errors, kill", async () => {
+    relay = await new FakeRelay().start();
+    const root = tmp();
+    fs.mkdirSync(path.join(root, "alpha"));
+    const cfg = normalizeHostConfig({ roots: [root] });
+    const f = fakeRun({ "tmux -V": () => ({ stdout: "tmux 3.4" }), "tmux new-session": () => ({}), "tmux kill-session": () => ({}) });
+    const manager = new HostManager(cfg, { run: f.run, platform: "linux", storeFile: path.join(tmp(), "s.json") });
+    hc = new HostConnection({ relayUrl: relay.url, machineId: "MACH1", token: "tok", cfg, manager, backoff: () => 20 });
+    hc.start();
+    const hello = await waitUntil(() => relay.of("host.hello")[0]);
+    expect(relay.conns[0]!.path).toBe("/ws/host");
+    expect(relay.conns[0]!.headers.authorization).toBe("Bearer tok");
+    expect(hello.d).toMatchObject({ machineId: "MACH1", roots: [root], backends: { tmux: "3.4", herdr: null, wt: false, console: false }, defaultBackend: "tmux", launchers: ["gentle-shell", "pi"], defaultLauncher: "gentle-shell" });
+
+    const ask = async (t: string, d: any) => {
+      const before = relay.all.length;
+      const id = "REQ" + Math.random();
+      relay.conns[0]!.ws.send(JSON.stringify(envelope(t, d, { id })));
+      return waitUntil(() => relay.all.slice(before).find((e) => e.re === id), 3000, `reply to ${t}`);
+    };
+    expect((await ask("host.list_dirs", { machineId: "MACH1", path: root })).d).toEqual({ path: fs.realpathSync(root), dirs: ["alpha"] });
+    const bad = await ask("host.list_dirs", { machineId: "MACH1", path: "/etc" });
+    expect(bad.t).toBe("error");
+    expect(bad.d.code).toBe("bad_request");
+    const sp = await ask("host.spawn", { machineId: "MACH1", cwd: path.join(root, "alpha"), name: "alpha", launcher: "pi", initialPrompt: "hola" });
+    expect(sp.t).toBe("host.spawned");
+    expect(sp.d).toMatchObject({ backend: "tmux", herdr: null });
+    expect(sp.d.tmuxSession).toMatch(/^rp-/);
+    expect((await ask("host.spawn", { machineId: "OTHER", cwd: root })).t).toBe("error");
+    expect((await ask("host.spawn", { machineId: "MACH1", cwd: root, launcher: "evil" })).d.message).toMatch(/unknown launcher/);
+    expect((await ask("host.kill", { machineId: "MACH1", spawnId: sp.d.spawnId })).t).toBe("ack");
+    expect((await ask("host.kill", { machineId: "MACH1", spawnId: sp.d.spawnId })).t).toBe("error");
+    expect((await ask("host.herdr_layout", { machineId: "MACH1" })).t).toBe("error"); // herdr absent
+  });
+  it("reconnects and does not reconnect after 4001", async () => {
+    relay = await new FakeRelay().start();
+    const cfg = normalizeHostConfig({ roots: [tmp()] });
+    const manager = new HostManager(cfg, { run: fakeRun({}).run, platform: "linux", storeFile: path.join(tmp(), "s.json") });
+    hc = new HostConnection({ relayUrl: relay.url, machineId: "M", token: "t", cfg, manager, backoff: () => 20 });
+    hc.start();
+    await waitUntil(() => relay.of("host.hello").length === 1);
+    relay.closeAll(1011);
+    await waitUntil(() => relay.of("host.hello").length === 2);
+    relay.closeAll(4001);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(relay.of("host.hello")).toHaveLength(2);
+  });
+  it("parseTarget validates herdrTarget", () => {
+    expect(parseTarget(undefined)).toBeUndefined();
+    expect(parseTarget({ type: "workspace" })).toEqual({ type: "workspace" });
+    expect(parseTarget({ type: "tab", workspaceId: "w" })).toEqual({ type: "tab", workspaceId: "w" });
+    expect(parseTarget({ type: "split", paneId: "p", direction: "down" })).toEqual({ type: "split", paneId: "p", direction: "down" });
+    expect(parseTarget({ type: "split", paneId: "p" })).toMatchObject({ direction: "right" });
+    expect(() => parseTarget({ type: "tab" })).toThrow();
+    expect(() => parseTarget({ type: "weird" })).toThrow();
+  });
+});
+
+describe("service installation", () => {
+  const spec = { nodePath: "/usr/bin/node", scriptPath: "/opt/rp/bin/rp-host.mjs", platform: "linux" as const };
+  it("systemd user unit", () => {
+    const u = systemdUnit(spec);
+    expect(u).toContain("ExecStart=/usr/bin/node /opt/rp/bin/rp-host.mjs run");
+    expect(u).toContain("Restart=always");
+    expect(u).toContain("WantedBy=default.target");
+    expect(systemdUnit({ ...spec, scriptPath: "/opt/my dir/rp.mjs" })).toContain('"/opt/my dir/rp.mjs"');
+  });
+  it("Task Scheduler at logon, without admin", () => {
+    const a = schtasksCreateArgs({ ...spec, platform: "win32", nodePath: "C:\\Program Files\\nodejs\\node.exe", scriptPath: "C:\\rp\\bin\\rp-host.mjs" });
+    expect(a).toEqual(["/Create", "/SC", "ONLOGON", "/TN", "rp-host", "/TR", '"C:\\Program Files\\nodejs\\node.exe" "C:\\rp\\bin\\rp-host.mjs" run', "/F"]);
+    expect(a).not.toContain("/RU");
+  });
+  it("launchd plist escapes XML", () => {
+    const p = launchdPlist({ ...spec, platform: "darwin", scriptPath: "/a&b/rp.mjs" });
+    expect(p).toContain("<string>/a&amp;b/rp.mjs</string>");
+    expect(p).toContain("<key>KeepAlive</key>");
+  });
+  it("install/uninstall run the right commands per OS", async () => {
+    const home = tmp();
+    const f = fakeRun({ systemctl: () => ({}), schtasks: () => ({}), launchctl: () => ({}) });
+    await installService({ ...spec, home }, f.run);
+    expect(fs.existsSync(path.join(home, ".config", "systemd", "user", "rp-host.service"))).toBe(true);
+    expect(f.calls.map((c) => c.args.join(" "))).toEqual(["--user daemon-reload", "--user enable --now rp-host"]);
+    await uninstallService("linux", f.run, home);
+    expect(fs.existsSync(path.join(home, ".config", "systemd", "user", "rp-host.service"))).toBe(false);
+    const w = fakeRun({ schtasks: () => ({}) });
+    await installService({ ...spec, platform: "win32", home }, w.run);
+    expect(w.calls[0]!.args.slice(0, 5)).toEqual(["/Create", "/SC", "ONLOGON", "/TN", "rp-host"]);
+    await uninstallService("win32", w.run, home);
+    expect(w.calls.some((c) => c.args[0] === "/Delete")).toBe(true);
+    const m = fakeRun({ launchctl: () => ({}) });
+    await installService({ ...spec, platform: "darwin", home }, m.run);
+    expect(fs.existsSync(path.join(home, "Library", "LaunchAgents", "dev.j3pf.rp-host.plist"))).toBe(true);
+    await expect(installService({ ...spec, platform: "linux", home }, fakeRun({ systemctl: () => ({ code: 1, stderr: "no bus" }) }).run)).rejects.toThrow(/no bus/);
+  });
+});

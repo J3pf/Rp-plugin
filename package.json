@@ -1,0 +1,37 @@
+{
+  "name": "@j3pf/pi-rp",
+  "version": "0.1.0",
+  "description": "Pi package: connects Pi sessions to the RP relay (mobile monitoring, questions, authorizations).",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/J3pf/Rp-plugin.git" },
+  "engines": { "node": ">=22.19" },
+  "pi": { "extensions": ["./src/extension/index.ts"] },
+  "bin": { "rp-host": "./bin/rp-host.mjs" },
+  "files": ["src", "bin", "docs", "README.md"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "proxy-agent": "^8.0.2",
+    "ulid": "^3.0.2",
+    "ws": "^8.22.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.2.0",
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.19.0",
+    "typebox": "*",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

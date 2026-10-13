@@ -1,0 +1,132 @@
+// Local mirror of the RP wire protocol v1 (rp-relay/docs/PROTOCOLO.md).
+// Kept dependency-free so the plugin works without @j3pf/rp-protocol being published.
+import { ulid } from "ulid";
+
+export const PROTOCOL_VERSION = 1;
+
+export interface Envelope<D = any> {
+  v: number;
+  t: string;
+  id?: string;
+  re?: string;
+  ts: number;
+  d: D;
+}
+
+export function newId(): string {
+  return ulid();
+}
+
+export function envelope<D>(t: string, d: D, opts: { id?: string; re?: string } = {}): Envelope<D> {
+  const e: Envelope<D> = { v: PROTOCOL_VERSION, t, ts: Date.now(), d };
+  if (opts.id) e.id = opts.id;
+  if (opts.re) e.re = opts.re;
+  return e;
+}
+
+export function parseEnvelope(raw: unknown): Envelope | null {
+  let o: any = raw;
+  if (typeof raw === "string") {
+    try {
+      o = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (!o || typeof o !== "object" || typeof o.t !== "string") return null;
+  if (typeof o.v !== "number") return null;
+  return { v: o.v, t: o.t, id: o.id, re: o.re, ts: typeof o.ts === "number" ? o.ts : Date.now(), d: o.d ?? {} };
+}
+
+export const CLOSE = {
+  SERVICE_RESTART: 1012,
+  INVALID_TOKEN: 4001,
+  INCOMPATIBLE: 4002,
+  REPLACED: 4003,
+  BAD_FRAME: 4008,
+} as const;
+
+export const MAX_FRAME_BYTES = 1024 * 1024;
+
+export type AgentStatus = "idle" | "working" | "waiting_input" | "compacting" | "error";
+export type GentleMode = "normal" | "auto" | "yolo" | "unknown";
+export type PromptKind = "confirm" | "select" | "input" | "questionnaire";
+export type PromptCategory = "permission" | "question" | "dialog";
+export type Danger = "low" | "medium" | "high";
+export type DeliveryMethod = "api" | "interactive" | "herdr";
+export type Disposition =
+  | "sent"
+  | "queued_steer"
+  | "queued_followup"
+  | "typed"
+  | "typed_after_dialog"
+  | "command"
+  | "duplicate"
+  | "rejected";
+export type DeliveryError = null | "agent_blocked" | "herdr_unavailable" | "interactive_unavailable";
+
+export interface PromptOption {
+  id: string;
+  label: string;
+  description?: string;
+  preview?: string;
+}
+
+export interface PromptQuestion {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  allowFreeText?: boolean;
+  options: PromptOption[];
+}
+
+export interface PromptOpen {
+  promptId: string;
+  agentId: string;
+  kind: PromptKind;
+  category: PromptCategory;
+  title: string;
+  message?: string;
+  options?: PromptOption[];
+  allowFreeText?: boolean;
+  placeholder?: string | null;
+  questions?: PromptQuestion[] | null;
+  source?: { extension?: string; tool?: string; subagent?: boolean };
+  tool?: { name: string; args: unknown };
+  danger: Danger;
+  expiresAt: number | null;
+}
+
+export type Answer =
+  | { optionIds: string[] }
+  | { confirmed: boolean }
+  | { text: string }
+  | { cancelled: true }
+  | { answers: Array<{ questionIndex: number; optionIds?: string[]; text?: string }> };
+
+export type ResolvedBy = "local" | "remote" | "timeout" | "cancelled";
+
+export interface UserMessageBody {
+  clientMsgId: string;
+  deviceId?: string;
+  text: string;
+  attachments?: Array<{ blobId: string; name: string; mime: string; size: number }>;
+  delivery?: "auto" | "steer" | "followUp";
+  method?: "auto" | "api" | "interactive" | "herdr";
+  asCommand?: boolean;
+}
+
+export interface WelcomeBody {
+  serverTime?: number;
+  lastSeq?: number | null;
+  pendingAnswers?: Array<{ promptId: string; answer: Answer; deviceId?: string }>;
+}
+
+/** Message types the plugin sends that must never be dropped from the outbound queue. */
+export const CRITICAL_TYPES = new Set([
+  "agent.hello",
+  "prompt.open",
+  "prompt.resolved",
+  "prompt.ack",
+  "user.message.ack",
+]);
