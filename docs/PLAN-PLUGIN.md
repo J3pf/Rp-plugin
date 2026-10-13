@@ -314,9 +314,19 @@ Igual que el plan v1: descarga `GET /v1/blobs/{id}` (token de máquina), verific
     "herdrSession": null }                                  // null = sesión por defecto de herdr
   ```
 - `host.spawn {cwd, name?, launcher?, initialPrompt?}`:
-  - **herdr** (COMPATIBILIDAD H4): `herdr workspace create --cwd <cwd> --label <name> --env RP_SPAWN_ID=<ulid> --no-focus`
-    → leer `.result.root_pane.pane_id` → `herdr pane run <pane> "<launcher>"`. El agente aparece en tu herdr (lo ves al
-    volver al PC) y en la app.
+  - **herdr** (COMPATIBILIDAD H4) — tres destinos, elegidos en la app (`herdrTarget`):
+    | Destino | Comando | Uso típico |
+    |---|---|---|
+    | **Nuevo workspace** (defecto) | `herdr workspace create --cwd <cwd> --label <name> --env RP_SPAWN_ID=<ulid> --no-focus` | proyecto nuevo |
+    | Nueva pestaña en un workspace existente | `herdr tab create --workspace <id> --cwd <cwd> --label <name> --env RP_SPAWN_ID=<ulid> --no-focus` | otro agente en el mismo proyecto |
+    | Dividir un panel existente | `herdr pane split <pane_id> --direction right|down --cwd <cwd> --env RP_SPAWN_ID=<ulid> --no-focus` | agente al lado de otro |
+    Los tres devuelven JSON con el panel nuevo (`.result.root_pane.pane_id` o el panel creado por el split) →
+    `herdr pane run <pane> "<launcher>"`. Nunca cambian el foco de tu pantalla (`--no-focus`).
+    El agente aparece en tu herdr (lo ves al volver al PC o con `herdr --remote`) y en la app.
+  - Si el servidor de herdr no está corriendo (`herdr status server` falla), rp-host lo inicia sin interfaz con
+    `herdr server` (proceso hijo supervisado); al abrir `herdr` en el PC te conectas a ese mismo servidor y ves el agente.
+  - `host.herdr_layout {machineId}` → rp-host responde con `herdr workspace list` + `herdr tab list` (ids, etiquetas,
+    cwd) para que la app muestre dónde crear el agente.
   - **tmux** (Linux): `tmux new-session -d -s rp-<short> -c <cwd> -e RP_SPAWN_ID=<ulid> "<launcher>"` (tmux ≥ 3.2).
   - **wt** (Windows Terminal): `wt.exe -w rp new-tab -d <cwd> --title <name> <launcher> --rp-spawn-id <ulid>`
     (Pi pasa flags desconocidos a las extensiones, `cli/args.ts:56-257`; gentle-shell los reenvía a Pi como passthrough).
