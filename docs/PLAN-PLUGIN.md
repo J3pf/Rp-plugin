@@ -395,3 +395,44 @@ CI: matriz Pi `1.2.0`/`latest` × gentle-pi `4.1.0`/`latest`.
 | P10 | Adjuntos | 3 | 1 d |
 | P11 | rp-host (herdr, tmux, Windows Terminal, consola; servicio systemd/schtasks) | 3 | 3 d |
 | P12 | Tests de integración gentle-pi/herdr, publicación npm | 1–3 | 3 d |
+
+## 15. Estado de implementación
+
+Todo lo descrito arriba está implementado en este repositorio. Resumen por tarea y diferencias respecto al plan.
+
+| # | Tarea | Estado |
+|---|---|---|
+| P0 | Spike S1 (espejo + cierre con `signal`) | ✅ [S1](spikes/S1-ui-mirror.md) |
+| P0b | Spike S4 (gentle-shell) | ✅ casi completo, ver [S4](spikes/S4-gentle-shell.md) |
+| P0c | Spike S5 (herdr) | ⚠️ sin herdr real ([S5](spikes/S5-herdr.md)) |
+| P0d | Spike S6 (Windows empresa) | ⏳ procedimiento en [S6](spikes/S6-windows-empresa.md) |
+| P0e | Spike S7 (entrega interactiva) | ✅ Linux; ⏳ Windows/Vim/Auto real ([S7](spikes/S7-entrega-interactiva.md)) |
+| P1 | Esqueleto, config XDG, entorno, `/rp`, compat | ✅ `config.ts`, `environment.ts`, `commands.ts`, `compat.ts` |
+| P2 | Conexión WS + proxy + hello/snapshot/reconexión/cola | ✅ `connection.ts` |
+| P3 | Forwarder + statuses + redacción | ✅ `forwarder.ts`, `snapshot.ts`, `status.ts` |
+| P4 | Entrada `api`, comando, abort, ack | ✅ `delivery/api.ts`, `inbound.ts` |
+| P5 | Broker + mirror + clasificador + `herdr:blocked` | ✅ `prompts/`, `herdr.ts` |
+| P6 | Adaptadores gentle-pi + fixtures | ✅ `prompts/adapters/` (formas tomadas del código real de gentle-pi 4.1.0 y probadas contra él) |
+| P7 | Gate propio + `rp_ask_user` condicional | ✅ `prompts/gate.ts`, `prompts/askUser.ts` |
+| P8 | Entregas `interactive` y `herdr` + idempotencia | ✅ `delivery/` |
+| P9 | Long-poll de respaldo | ✅ `connection.ts` (`LongPollTransport`) |
+| P10 | Adjuntos | ✅ `attachments.ts` |
+| P11 | rp-host (herdr, tmux, wt, consola; systemd/schtasks/launchd) | ✅ `src/host/` (Windows y herdr sin ejecutar en máquina real) |
+| P12 | Tests de integración gentle-pi/herdr, publicación npm | ✅ tests y `.github/workflows/ci.yml`; la publicación (`npm publish`) la haces tú |
+
+### Decisiones y diferencias respecto al plan
+- **`@j3pf/rp-protocol`** aún no existe: los tipos están en `src/shared/protocol.ts` y los validadores del contrato en
+  `test/contract.ts` (escritos desde `PROTOCOLO.md`). Los fixtures JSON de `test/fixtures/protocol/` se pueden copiar a
+  `rp-relay`. Al publicar el paquete, sustituir ambos por la dependencia.
+- **Long-poll**: `PROTOCOLO.md` no dice cómo identifica el relay al agente en `/v1/agent/send|poll`. El plugin envía
+  `x-rp-agent-id` y `x-rp-instance` (cabeceras) y los mismos valores como query en `poll`. Ajustar si el relay usa otra cosa.
+- **Adjuntos**: el relay no define dónde viaja el `sha256`; el plugin lo comprueba si llega en la referencia o en la cabecera
+  `x-rp-sha256`/`x-content-sha256`, y siempre verifica el tamaño.
+- **Gate sin aprobador**: en sesiones sin UI la autorización espera hasta `gate.approverWaitMs` (5 s) a que el relay conecte
+  antes de bloquear por seguridad; así un agente lanzado por rp-host no falla en el arranque.
+- **Modo gentle desconocido**: gentle-pi publica `gentle:mode` a partir del primer turno. Mientras no se conoce, el plugin
+  asume que *podría* ser Auto y teclea (correcto en cualquier modo).
+- **Versión de gentle-pi**: se lee del `package.json` de nombre `gentle-pi` más cercano a la ruta de la herramienta; si no se
+  encuentra, los adaptadores siguen activos (cada uno valida la forma de los parámetros) y sólo se desactivan fuera de `>=4.0 <5`.
+- **SDK de Pi**: `session.dispose()` no emite `session_shutdown`; el socket está `unref()`-ado para no retener el proceso.
+- **Modo Vim**: la detección es heurística (estado de pie de página que contenga «vim»); pendiente de confirmar en S7.

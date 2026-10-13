@@ -1,0 +1,68 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    name: typecheck + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: node bin/rp-host.mjs --help
+      - run: npm pack --dry-run
+
+  matrix:
+    # unit + resilience + contract + Pi SDK integration + real TUI (tmux) + real gentle-shell
+    name: pi ${{ matrix.pi }} / gentle-pi ${{ matrix.gentle }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pi: ["1.2.0", "latest"]
+        gentle: ["4.1.0", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: npm ci
+      - name: Pin Pi and gentle-pi for this matrix cell
+        run: npm install --no-save @earendil-works/pi-coding-agent@${{ matrix.pi }} @earendil-works/pi-ai@${{ matrix.pi }} gentle-pi@${{ matrix.gentle }}
+      - run: npm run test:unit
+      - run: npm run test:e2e
+        env:
+          GENTLE_SHELL_NO_AUTO_SETUP: "1"
+
+  gentle-ai-sync:
+    name: regression - gentle-ai sync keeps the plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: actions/setup-go@v5
+        with: { go-version: stable }
+      - run: git clone --depth 1 https://github.com/Gentleman-Programming/gentle-ai "$RUNNER_TEMP/gentle-ai"
+      - run: cd "$RUNNER_TEMP/gentle-ai" && go build -o "$RUNNER_TEMP/gentle-ai-bin" ./cmd/gentle-ai
+      - run: npm ci
+      - run: npx vitest run test/gentle-ai-sync.test.ts
+        env:
+          GENTLE_AI_BIN: ${{ runner.temp }}/gentle-ai-bin
+
+  windows:
+    continue-on-error: true   # not yet run on a real Windows runner by the author; promote to required once green
+    # Windows paths, Task Scheduler arguments and wt/cmd argument building run on a real win32 Node.
+    name: windows (unit)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - run: npx vitest run test/unit-basic.test.ts test/forwarder.test.ts test/prompts.test.ts test/delivery.test.ts test/connection.test.ts test/commands.test.ts test/host.test.ts test/contract.test.ts

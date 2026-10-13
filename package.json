@@ -3,16 +3,40 @@
   "version": "0.1.0",
   "description": "Pi package: connects Pi sessions to the RP relay (mobile monitoring, questions, authorizations).",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/J3pf/Rp-plugin.git" },
-  "engines": { "node": ">=22.19" },
-  "pi": { "extensions": ["./src/extension/index.ts"] },
-  "bin": { "rp-host": "./bin/rp-host.mjs" },
-  "files": ["src", "bin", "docs", "README.md"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/J3pf/Rp-plugin.git"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension/index.ts"
+    ]
+  },
+  "bin": {
+    "rp-host": "./bin/rp-host.mjs"
+  },
+  "files": [
+    "src",
+    "dist",
+    "bin",
+    "docs",
+    "README.md"
+  ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:unit": "vitest run --exclude test/tui-e2e.test.ts --exclude test/gentle-shell-e2e.test.ts --exclude test/rpc-e2e.test.ts",
+    "test:e2e": "vitest run test/tui-e2e.test.ts test/gentle-shell-e2e.test.ts test/rpc-e2e.test.ts",
+    "fixtures": "UPDATE_FIXTURES=1 vitest run test/contract.test.ts",
+    "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
     "proxy-agent": "^8.0.2",
@@ -29,6 +53,7 @@
     "@earendil-works/pi-coding-agent": "1.2.0",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.18.1",
+    "gentle-pi": "^4.1.0",
     "tsx": "^4.19.0",
     "typebox": "*",
     "typescript": "^5.9.0",

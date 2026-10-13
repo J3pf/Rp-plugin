@@ -1,20 +1,81 @@
 # rp-plugin
 
-Pi package que conecta cada sesión de [Pi](https://github.com/earendil-works/pi) a tu relay **RP**: transmite la actividad del
-agente al móvil, recibe mensajes y adjuntos, y lleva **preguntas y autorizaciones** al teléfono (responde la terminal o el
-móvil, la primera respuesta gana). Funciona con `gentle-shell`/gentle-pi y dentro de herdr. Incluye `rp-host` para lanzar agentes nuevos desde el móvil (en herdr o tmux).
+Pi package (`@j3pf/pi-rp`) que conecta cada sesión de [Pi](https://github.com/earendil-works/pi) a tu relay **RP**: transmite la
+actividad del agente al móvil, recibe mensajes y adjuntos, y lleva **preguntas y autorizaciones** al teléfono (responde la
+terminal o el móvil, la primera respuesta gana). Funciona con `gentle-shell`/gentle-pi y dentro de herdr. Incluye `rp-host`
+para lanzar agentes nuevos desde el móvil (en herdr, tmux o Windows Terminal).
 
-Instalación prevista: `pi install npm:@j3pf/pi-rp` **y** `gentle-shell install npm:@j3pf/pi-rp` (ver plan).
+> Estado: **implementado** (extensión + `rp-host`). Verificado contra Pi 1.2.0 y gentle-pi 4.1.0 reales; ver
+> [docs/spikes](docs/spikes/README.md) para lo que queda por confirmar en tu hardware (Windows de la empresa, herdr real).
 
-> Estado: **planeación**. Todavía no hay código.
+## Instalación (por cada PC)
 
-| Documento | Contenido |
+```bash
+pi install npm:@j3pf/pi-rp                 # Pi "normal" (~/.pi/agent) — sobrevive a `gentle-ai sync`
+gentle-shell install npm:@j3pf/pi-rp       # gentle-shell usa su propio home (~/.gentle-shell/agent)
+pi                                         # o gentle-shell
+/rp pair https://relay.midominio.com ABCD2345 --name "PC Empresa" --context work
+/rp doctor                                 # comprueba red, proxy, CA, plugin declarado en ambos homes…
+```
+
+Nunca `pi install git:…`: el *takeover* de gentle-shell descarta los paquetes git. Requiere Node ≥ 22.19.
+
+## Qué hace
+
+| Función | Dónde |
 |---|---|
-| [docs/PLAN-PLUGIN.md](docs/PLAN-PLUGIN.md) | Plan detallado del plugin |
-| [docs/RESILIENCIA.md](docs/RESILIENCIA.md) | Escalabilidad, resiliencia e independencia total (push sin Google, entrega interactiva sin herdr, Linux/Windows) |
-| [docs/COMPATIBILIDAD.md](docs/COMPATIBILIDAD.md) | herdr, gentle-ai, gentle-shell/gentle-pi y separación por PC: hechos verificados y matriz requisito × entorno |
-| [docs/ARQUITECTURA.md](docs/ARQUITECTURA.md) | Visión global (copia; canónica en `rp-relay`) |
-| [`rp-relay/docs/PROTOCOLO.md`](https://github.com/j3pf/rp-relay/blob/main/docs/PROTOCOLO.md) | Contrato de red |
+| Conexión WS (con proxy) + respaldo HTTP long-poll, reconexión, cola acotada | `src/extension/connection.ts` |
+| Eventos de Pi → `agent.event` (coalescidos, truncados, `redactContent`) y snapshot | `forwarder.ts`, `snapshot.ts`, `status.ts` |
+| Espejo de diálogos (`select/confirm/input`) + carrera terminal ⇄ móvil | `prompts/mirror.ts`, `prompts/broker.ts` |
+| Adaptadores de `ask_user_choice` / `ask_user_question` de gentle-pi (`custom()`) | `prompts/adapters/` |
+| Autorizaciones propias (si no hay gentle-pi) y herramienta `rp_ask_user` condicional | `prompts/gate.ts`, `prompts/askUser.ts` |
+| Mensajes del móvil: `api`, **`interactive`** (teclea en la TUI → autoriza en modo Auto), `herdr`, comandos | `delivery/` |
+| Adjuntos (imágenes inline, resto en el inbox con ruta citada) | `attachments.ts` |
+| Comandos `/rp pair|status|doctor|on|off|gate|test|unpair` | `commands.ts` |
+| `rp-host`: crear agentes desde el móvil (herdr workspace/pestaña/panel, tmux, Windows Terminal, consola) + servicio | `src/host/` |
+
+Documentos: [PLAN-PLUGIN](docs/PLAN-PLUGIN.md) (plan + estado de implementación) · [RESILIENCIA](docs/RESILIENCIA.md) ·
+[COMPATIBILIDAD](docs/COMPATIBILIDAD.md) · [ARQUITECTURA](docs/ARQUITECTURA.md) · [QA manual](docs/QA.md) ·
+[Spikes](docs/spikes/README.md) · contrato de red: [`rp-relay/docs/PROTOCOLO.md`](https://github.com/j3pf/rp-relay/blob/main/docs/PROTOCOLO.md).
+
+## Configuración
+
+`~/.config/rp/config.json` (Windows: `%APPDATA%\rp\config.json`; respeta `XDG_CONFIG_HOME`; permisos 600). La escribe
+`/rp pair`; el resto es opcional (valores por defecto entre paréntesis):
+
+```jsonc
+{
+  "redactContent": false,                  // true: sólo estados/preguntas/respuestas, sin transcript
+  "gate": { "mode": "auto-detect",         // auto-detect|off|dangerous|writes|all (auto-detect: off con gentle-pi)
+            "dangerousPatterns": ["\\brm\\s+-[a-z]*r", "\\bsudo\\b"], "alwaysAllowTools": ["read","grep","find","ls"],
+            "useAnnotations": true, "approverWaitMs": 5000 },
+  "mirrorDialogs": true,
+  "delivery": { "method": "auto", "interactive": true },   // auto|api|interactive|herdr
+  "subagents": "skip",                     // skip|connect
+  "inboxDir": null
+}
+```
+Variables: `RP_RELAY_URL`, `RP_DISABLED=1`, `RP_CONFIG`, `RP_DEBUG=1`; flags de Pi `--rp-off` y `--rp-spawn-id`.
+`rp-host` usa `host.json` (mismo directorio): `roots`, `backend`, `launchers`, `defaultLauncher`, `herdrSession`.
+
+```bash
+rp-host init && rp-host install     # systemd --user (Linux) / tarea ONLOGON (Windows) / launchd (macOS)
+rp-host status
+```
+
+## Desarrollo
+
+```bash
+npm install
+npm run typecheck && npm run build
+npm run test:unit       # unidad, conexión/resiliencia, contrato, host, Pi real (SDK + proveedor simulado)
+npm run test:e2e        # TUI real en tmux + gentle-shell/gentle-pi reales (necesita tmux)
+GENTLE_AI_BIN=/ruta/gentle-ai npx vitest run test/gentle-ai-sync.test.ts   # regresión A1 (binario Go de gentle-ai)
+npm run fixtures        # regenera test/fixtures/protocol/*.json (compartidos con rp-relay / rp-app)
+```
+
+El protocolo (v1) está replicado en `src/shared/protocol.ts` y validado por `test/contract.ts` contra `PROTOCOLO.md`
+mientras `@j3pf/rp-protocol` no esté publicado.
 
 ## Referencias investigadas
 

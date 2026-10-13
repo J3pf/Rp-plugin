@@ -337,6 +337,32 @@ describe("questions & authorizations", () => {
     relay.conns.at(-1)!.ws.send(JSON.stringify({ v: 1, t: "agent.welcome", ts: 1, d: { pendingAnswers: [{ promptId: id, answer: { optionIds: ["1"] } }] } }));
     await expect(p).resolves.toBe("no");
   });
+  it("two devices answering the same prompt at once: exactly one wins, the other gets accepted:false", async () => {
+    const t = await boot();
+    await waitUntil(() => relay.of("agent.hello").length === 1);
+    const p = t.ctx.ui.select("Race?", ["a", "b"]);
+    const o = await waitUntil(() => relay.of("prompt.open")[0]);
+    relay.push("prompt.answer", { promptId: o.d.promptId, answer: { optionIds: ["0"] }, deviceId: "phone-1" });
+    relay.push("prompt.answer", { promptId: o.d.promptId, answer: { optionIds: ["1"] }, deviceId: "phone-2" });
+    await expect(p).resolves.toBe("a");
+    await waitUntil(() => relay.of("prompt.ack").length === 2);
+    expect(relay.of("prompt.ack").map((a) => a.d.accepted).sort()).toEqual([false, true]);
+  });
+  it("relay killed with a question open: the dialog keeps working, the question is re-announced and answered once the relay is back", async () => {
+    const port = relay.port;
+    const t = await boot();
+    await waitUntil(() => relay.of("agent.hello").length === 1);
+    const p = t.ctx.ui.select("Survives the outage?", ["yes", "no"]);
+    const o = await waitUntil(() => relay.of("prompt.open")[0]);
+    await relay.stop(); // relay process dies abruptly
+    await new Promise((r) => setTimeout(r, 300));
+    relay = await new FakeRelay().start(port);
+    const hello = await waitUntil(() => relay.of("agent.hello")[0], 10000, "hello on the new relay");
+    expect(hello.d.openPrompts.map((x: any) => x.promptId)).toEqual([o.d.promptId]);
+    await waitUntil(() => relay.of("agent.snapshot").length === 1);
+    relay.push("prompt.answer", { promptId: o.d.promptId, answer: { optionIds: ["1"] } });
+    await expect(p).resolves.toBe("no");
+  });
   it("late/unknown prompt.answer gets prompt.ack{accepted:false}", async () => {
     await boot();
     await waitUntil(() => relay.of("agent.hello").length === 1);
@@ -508,6 +534,48 @@ describe("messages from the phone", () => {
     await waitUntil(() => relay.of("user.message.ack").length === 1, 6000);
     expect(relay.of("user.message.ack")[0]!.d).toMatchObject({ disposition: "sent", method: "api" });
     expect(t.ctx.ui.mocks.notify).toHaveBeenCalledWith(expect.stringMatching(/modo Auto/), "warning");
+  });
+});
+
+describe("/rp commands with a live runtime", () => {
+  it("/rp status describes the connection; /rp test round-trips a question through the phone", async () => {
+    const t = await boot();
+    await waitUntil(() => relay.of("agent.hello").length === 1);
+    await waitUntil(() => relay.of("agent.snapshot").length === 1);
+    const cmd = t.commands.get("rp");
+    await cmd.handler("status", t.ctx);
+    const text = t.ctx.ui.mocks.notify.mock.calls.at(-1)[0] as string;
+    expect(text).toContain("Conexión: conectado");
+    expect(text).toContain("agentId: MACHINE1:sess1");
+    expect(text).toContain("Funciones:");
+    const run = cmd.handler("test", t.ctx);
+    const o = await waitUntil(() => relay.of("prompt.open")[0]);
+    expect(o.d).toMatchObject({ category: "question", options: [{ label: "Sí, llegó" }, { label: "No llegó" }] });
+    relay.push("prompt.answer", { promptId: o.d.promptId, answer: { optionIds: ["0"] } });
+    await run;
+    expect(t.ctx.ui.mocks.notify.mock.calls.at(-1)[0]).toMatch(/RP test: "Sí, llegó"/);
+  });
+  it("/rp off stops the runtime (socket closes); /rp on starts it again", async () => {
+    const t = await boot();
+    await waitUntil(() => relay.of("agent.hello").length === 1);
+    await t.commands.get("rp").handler("off", t.ctx);
+    await waitUntil(() => relay.conns[0]!.ws.readyState === 3);
+    await t.commands.get("rp").handler("on", t.ctx);
+    await waitUntil(() => relay.of("agent.hello").length === 2, 5000, "second hello after /rp on");
+  });
+  it("/rp pair inside a running session reconnects with the new credentials", async () => {
+    writeCfg({ machineToken: null, machineId: null });
+    const f = makePi();
+    rpExtension(f.pi);
+    const ctx = makeCtx();
+    await f.fire("session_start", { reason: "startup" }, ctx);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(relay.conns).toHaveLength(0); // unpaired → inert
+    relay.httpResponses.set("/v1/pair/machine", () => ({ status: 200, body: { machineId: "NEWM", machineToken: "newtok" } }));
+    await f.commands.get("rp").handler(`pair ${relay.url} ABCD2345 --name PC --context work`, ctx);
+    await waitUntil(() => relay.of("agent.hello").length === 1, 5000, "hello after pairing");
+    expect(relay.of("agent.hello")[0]!.d.agentId).toBe("NEWM:sess1");
+    expect(relay.conns[0]!.headers.authorization).toBe("Bearer newtok");
   });
 });
 

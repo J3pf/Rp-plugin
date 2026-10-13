@@ -194,6 +194,24 @@ describe("Deliverer", () => {
     expect(m2.acks[0]).toMatchObject({ disposition: "sent", method: "api" });
     expect(m2.notes.join()).toMatch(/modo Auto/);
   });
+  it("gentle-pi present but mode not published yet → still types (it may be AUTO)", async () => {
+    const typed: string[] = [];
+    const { pi, sent } = makePi();
+    const ctx = makeCtx({ mode: "tui" });
+    const acks: any[] = [];
+    const d = new Deliverer({
+      pi, ctx: () => ctx, cfg: () => baseConfig("http://x"), herdr: null, gentleMode: () => null, gentlePresent: () => true,
+      fetchBlob: null, inboxDir: () => os.tmpdir(), sessionId: () => "s", sendAck: (a) => acks.push(a), notify: () => {},
+      interactive: () => ({ ctx: () => ctx, enabled: () => true, stdin: () => ({ emit: (_e: string, x: string) => (typed.push(x), true) }), dialogOpen: () => false, waitNoDialog: async () => true, waitSettled: async () => {}, expectInput: async () => true, statuses: () => ({}) }) as any,
+    });
+    await d.handle({ clientMsgId: "u1", text: "go" });
+    expect(acks[0]).toMatchObject({ disposition: "typed", method: "interactive" });
+    expect(sent).toHaveLength(0);
+    acks.length = 0;
+    const d2 = new Deliverer({ ...(d as any).d, gentleMode: () => "normal" });
+    await d2.handle({ clientMsgId: "u2", text: "go" });
+    expect(acks[0]).toMatchObject({ disposition: "sent", method: "api" }); // known NORMAL → plain API
+  });
   it("typed_after_dialog when a dialog was open", async () => {
     const m = mk({ gentle: "auto", interactive: { ctx: () => makeCtx({ mode: "tui" }), enabled: () => true, stdin: () => ({ emit: () => true }), dialogOpen: () => true, waitNoDialog: async () => true, waitSettled: async () => {}, expectInput: async () => true, statuses: () => ({}) } });
     await m.d.handle({ clientMsgId: "t3", text: "go" });

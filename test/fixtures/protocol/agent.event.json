@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "t": "agent.event",
+  "ts": 1791872317659,
+  "d": {
+    "epoch": "01M4SYKE4RTQG22XHAXZ85XQ1E",
+    "seq": 1,
+    "e": {
+      "type": "agent_start"
+    }
+  }
+}

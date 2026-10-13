@@ -1,0 +1,56 @@
+{
+  "v": 1,
+  "t": "agent.hello",
+  "id": "01M4SYKE6E18QBJEHJT65CQ8F9",
+  "ts": 1791872317646,
+  "d": {
+    "agentId": "MACHINE1:sess1",
+    "kind": "pi",
+    "instance": "01M4SYKE4PYV8SD4DVY13XSKYW",
+    "epoch": "01M4SYKE4RTQG22XHAXZ85XQ1E",
+    "pi": {
+      "version": "unknown",
+      "mode": "tui"
+    },
+    "plugin": {
+      "version": "0.1.0",
+      "features": [
+        "attachments",
+        "statuses",
+        "mirror_ui",
+        "gate",
+        "rp_ask_user",
+        "deliver_terminal"
+      ]
+    },
+    "session": {
+      "id": "sess1",
+      "file": "/home/dev/.pi/agent/sessions/session.jsonl",
+      "name": "test session"
+    },
+    "host": {
+      "hostname": "devbox",
+      "user": "dev",
+      "pid": 4242,
+      "os": "linux"
+    },
+    "launcher": "pi",
+    "herdr": null,
+    "gentle": null,
+    "transport": "ws",
+    "redacted": false,
+    "cwd": "/home/dev/proyectos/api",
+    "spawnId": null,
+    "git": {
+      "branch": "main",
+      "dirty": true
+    },
+    "model": {
+      "provider": "fake",
+      "id": "fake-1"
+    },
+    "thinking": "off",
+    "status": "idle",
+    "openPrompts": []
+  }
+}

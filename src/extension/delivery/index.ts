@@ -22,6 +22,8 @@ export interface DelivererDeps {
   cfg: () => RpConfig;
   herdr: HerdrLocation | null;
   gentleMode: () => string | null;
+  /** gentle-pi detected (tools or footer status). Its mode is only published from the first turn on. */
+  gentlePresent?: () => boolean;
   fetchBlob: FetchBlob | null;
   inboxDir: () => string;
   sessionId: () => string;
@@ -84,7 +86,9 @@ export class Deliverer {
     const ctx = this.d.ctx();
     const cfg = this.d.cfg();
     const asCommand = !!msg.asCommand;
-    const gentleAuto = this.d.gentleMode() === "auto";
+    const mode = this.d.gentleMode();
+    // Until gentle-pi publishes its mode (first turn) assume it could be AUTO: typing is correct in every mode.
+    const gentleAuto = mode === "auto" || (!!this.d.gentlePresent?.() && (mode === null || mode === "unknown"));
     const chain = methodChain(msg.method, cfg.delivery.method, {
       gentleAuto,
       interactiveEnabled: cfg.delivery.interactive,
@@ -117,7 +121,7 @@ export class Deliverer {
             asCommand,
             idle: ctx.isIdle(),
           });
-          if (gentleAuto && !asCommand) {
+          if (mode === "auto" && !asCommand) {
             this.d.notify("RP: mensaje del móvil entregado por la API; en modo Auto de gentle-pi no autoriza acciones.", "warning");
           }
           this.record(msg, "api");

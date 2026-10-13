@@ -136,6 +136,7 @@ export class Runtime {
       cfg: () => this.cfg,
       herdr: env.herdr,
       gentleMode: () => this.statuses.gentleMode,
+      gentlePresent: () => !!this.gentleInfo(),
       fetchBlob: cfg.relayUrl && cfg.machineToken ? relayBlobFetcher(cfg.relayUrl, cfg.machineToken) : null,
       inboxDir: () => resolveInboxDir(cfg),
       sessionId: () => this.sessionId,

@@ -1,0 +1,134 @@
+// Validators written straight from rp-relay/docs/PROTOCOLO.md (v1). They stand in for @j3pf/rp-protocol until it is published.
+const isStr = (v: unknown) => typeof v === "string" && v.length > 0;
+const isNum = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+const isBool = (v: unknown) => typeof v === "boolean";
+const isObj = (v: unknown): v is Record<string, any> => !!v && typeof v === "object" && !Array.isArray(v);
+const oneOf = (...vals: unknown[]) => (v: unknown) => vals.includes(v);
+const nullable = (f: (v: unknown) => boolean) => (v: unknown) => v === null || f(v);
+const arrayOf = (f: (v: unknown) => boolean) => (v: unknown) => Array.isArray(v) && v.every(f);
+
+type Rule = (v: unknown) => boolean;
+type Shape = Record<string, Rule | undefined>;
+
+export function check(value: unknown, shape: Shape, where: string, optional: string[] = []): string[] {
+  const errs: string[] = [];
+  if (!isObj(value)) return [`${where}: not an object`];
+  for (const [k, rule] of Object.entries(shape)) {
+    if (rule === undefined) continue;
+    if (!(k in value)) {
+      if (!optional.includes(k)) errs.push(`${where}.${k}: missing`);
+      continue;
+    }
+    if (!rule(value[k])) errs.push(`${where}.${k}: invalid (${JSON.stringify(value[k])?.slice(0, 80)})`);
+  }
+  return errs;
+}
+
+const status = oneOf("idle", "working", "waiting_input", "compacting", "error");
+const promptKind = oneOf("confirm", "select", "input", "questionnaire");
+const category = oneOf("permission", "question", "dialog");
+const danger = oneOf("low", "medium", "high");
+
+export const promptOpenShape: Shape = {
+  promptId: isStr,
+  agentId: (v) => isStr(v) && String(v).includes(":"),
+  kind: promptKind,
+  category,
+  title: isStr,
+  message: (v) => typeof v === "string",
+  options: arrayOf((o) => isObj(o) && isStr(o.id) && typeof o.label === "string"),
+  allowFreeText: isBool,
+  placeholder: nullable((v) => typeof v === "string"),
+  questions: nullable(arrayOf((q) => isObj(q) && isStr(q.question) && Array.isArray(q.options) && q.options.every((o: any) => isStr(o.id) && isStr(o.label)))),
+  source: (v) => isObj(v),
+  tool: (v) => isObj(v) && isStr(v.name),
+  danger,
+  expiresAt: nullable(isNum),
+};
+
+const answerOk = (v: unknown) =>
+  isObj(v) && (Array.isArray(v.optionIds) || isBool(v.confirmed) || typeof v.text === "string" || v.cancelled === true || Array.isArray(v.answers));
+
+export const validators: Record<string, (d: any) => string[]> = {
+  "agent.hello": (d) => [
+    ...check(
+      d,
+      {
+        agentId: (v) => isStr(v) && String(v).includes(":"),
+        kind: oneOf("pi"),
+        instance: isStr,
+        epoch: isStr,
+        pi: (v) => isObj(v) && isStr(v.version) && oneOf("tui", "rpc", "json", "print")(v.mode),
+        plugin: (v) => isObj(v) && isStr(v.version) && arrayOf(isStr)(v.features),
+        session: (v) => isObj(v) && isStr(v.id) && nullable((x) => typeof x === "string")(v.file ?? null) && nullable((x) => typeof x === "string")(v.name ?? null),
+        host: (v) => isObj(v) && isStr(v.hostname) && typeof v.user === "string" && isNum(v.pid) && isStr(v.os),
+        launcher: oneOf("pi", "gentle-shell"),
+        herdr: nullable((v) => isObj(v) && isStr(v.paneId)),
+        gentle: nullable((v) => isObj(v) && oneOf("normal", "auto", "yolo", "unknown")(v.mode)),
+        transport: oneOf("ws", "longpoll"),
+        redacted: isBool,
+        cwd: isStr,
+        spawnId: nullable(isStr),
+        git: (v) => isObj(v) && isBool(v.dirty) && nullable((x) => typeof x === "string")(v.branch),
+        model: nullable((v) => isObj(v) && isStr(v.provider) && isStr(v.id)),
+        thinking: nullable(isStr),
+        status,
+        openPrompts: arrayOf((p) => check(p, promptOpenShape, "openPrompts[]", ["message", "tool", "source", "options", "placeholder", "questions"]).length === 0),
+      },
+      "hello",
+    ),
+  ],
+  "agent.snapshot": (d) =>
+    check(
+      d,
+      {
+        epoch: isStr,
+        seq: (v) => isNum(v) && (v as number) >= 0,
+        entries: arrayOf((e: any) => isObj(e) && isStr(e.eid) && oneOf("user", "assistant", "tool_result", "bash", "custom", "compaction", "branch_summary", "model_change")(e.kind) && isNum(e.at) && "msg" in e),
+        truncated: isBool,
+      },
+      "snapshot",
+    ),
+  "agent.event": (d) =>
+    check(d, { epoch: isStr, seq: (v) => Number.isInteger(v) && (v as number) >= 1, e: (v) => isObj(v) && isStr(v.type) }, "event"),
+  "agent.status": (d) => check(d, { status, detail: (v) => typeof v === "string" }, "status", ["detail"]),
+  "agent.statuses": (d) => check(d, { items: (v) => isObj(v) && Object.values(v).every((x) => typeof x === "string") }, "statuses"),
+  "prompt.open": (d) => check(d, promptOpenShape, "prompt.open", ["message", "tool", "source", "options", "placeholder", "questions"]),
+  "prompt.resolved": (d) => check(d, { promptId: isStr, by: oneOf("local", "remote", "timeout", "cancelled"), answer: nullable(answerOk) }, "prompt.resolved"),
+  "prompt.ack": (d) => check(d, { promptId: isStr, accepted: isBool }, "prompt.ack"),
+  "user.message.ack": (d) =>
+    check(
+      d,
+      {
+        clientMsgId: isStr,
+        disposition: oneOf("sent", "queued_steer", "queued_followup", "typed", "typed_after_dialog", "command", "duplicate", "rejected"),
+        method: oneOf("api", "interactive", "herdr"),
+        error: nullable(oneOf("agent_blocked", "herdr_unavailable", "interactive_unavailable")),
+      },
+      "user.message.ack",
+    ),
+  "host.hello": (d) =>
+    check(
+      d,
+      {
+        machineId: isStr,
+        hostname: isStr,
+        roots: arrayOf(isStr),
+        backends: (v) => isObj(v) && "herdr" in v && "tmux" in v && isBool(v.wt) && isBool(v.console),
+        defaultBackend: nullable(oneOf("herdr", "tmux", "wt", "console")),
+        launchers: arrayOf(isStr),
+        defaultLauncher: isStr,
+      },
+      "host.hello",
+    ),
+  "host.dirs": (d) => check(d, { path: (v) => typeof v === "string", dirs: arrayOf(isStr) }, "host.dirs"),
+  "host.spawned": (d) =>
+    check(d, { spawnId: isStr, backend: oneOf("herdr", "tmux", "wt", "console"), herdr: nullable((v) => isObj(v) && isStr(v.paneId)), tmuxSession: nullable(isStr) }, "host.spawned"),
+};
+
+export function validateEnvelope(e: any): string[] {
+  const errs = check(e, { v: (v) => v === 1, t: isStr, ts: isNum, d: isObj }, "envelope", []);
+  if (errs.length) return errs;
+  const v = validators[e.t];
+  return v ? v(e.d) : [];
+}

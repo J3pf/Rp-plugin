@@ -1,0 +1,46 @@
+{
+  "v": 1,
+  "t": "prompt.open",
+  "ts": 1791872317663,
+  "d": {
+    "promptId": "01M4SYKE6ZWC4ZZCSCWATEXK93",
+    "agentId": "MACHINE1:sess1",
+    "kind": "select",
+    "category": "permission",
+    "title": "⚠ bash: rm -rf x",
+    "message": "rm -rf x",
+    "options": [
+      {
+        "id": "0",
+        "label": "Permitir"
+      },
+      {
+        "id": "1",
+        "label": "Permitir siempre en esta sesión"
+      },
+      {
+        "id": "2",
+        "label": "Denegar"
+      },
+      {
+        "id": "3",
+        "label": "Denegar con motivo…"
+      }
+    ],
+    "allowFreeText": false,
+    "placeholder": null,
+    "questions": null,
+    "source": {
+      "extension": "rp",
+      "tool": "gate"
+    },
+    "tool": {
+      "name": "bash",
+      "args": {
+        "command": "rm -rf x"
+      }
+    },
+    "danger": "high",
+    "expiresAt": null
+  }
+}
