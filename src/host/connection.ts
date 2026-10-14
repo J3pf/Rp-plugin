@@ -115,6 +115,7 @@ export class HostConnection {
             launcher: typeof d.launcher === "string" ? d.launcher : undefined,
             backend: ["herdr", "tmux", "wt", "console"].includes(d.backend) ? d.backend : undefined,
             herdrTarget: parseTarget(d.herdrTarget),
+            sessionId: typeof d.sessionId === "string" && d.sessionId.trim() ? d.sessionId.trim() : undefined,
           });
           return reply("host.spawned", {
             spawnId: rec.spawnId,

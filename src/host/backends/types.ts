@@ -9,6 +9,7 @@ export interface SpawnRequest {
   launcherCommand: string;
   spawnId: string;
   herdrTarget?: HerdrTarget;
+  sessionId?: string;
 }
 
 export interface SpawnRecord {

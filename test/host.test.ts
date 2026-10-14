@@ -298,6 +298,13 @@ describe("HostManager", () => {
     const { mgr, root } = mk("linux", linuxTmux);
     await expect(mgr.spawn({ cwd: path.join(root, "proj"), herdrTarget: { type: "workspace" } })).rejects.toThrow(/requires the herdr backend/);
   });
+  it("supports sessionId to resume a session (pi --session <id>)", async () => {
+    const { mgr, f, root } = mk("linux", linuxTmux);
+    const rec = await mgr.spawn({ cwd: path.join(root, "proj"), sessionId: "01JABCDEFGHJKMNPQRSTVWXYZ0" });
+    expect(f.calls.find((c) => c.args[0] === "new-session")!.args.at(-1)).toBe("gentle-shell --session 01JABCDEFGHJKMNPQRSTVWXYZ0");
+    await expect(mgr.spawn({ cwd: path.join(root, "proj"), sessionId: "bad; rm -rf /" })).rejects.toThrow(/invalid sessionId/);
+    await mgr.kill(rec.spawnId);
+  });
 });
 
 describe("HostConnection protocol", () => {
@@ -331,7 +338,7 @@ describe("HostConnection protocol", () => {
     const bad = await ask("host.list_dirs", { machineId: "MACH1", path: "/etc" });
     expect(bad.t).toBe("error");
     expect(bad.d.code).toBe("bad_request");
-    const sp = await ask("host.spawn", { machineId: "MACH1", cwd: path.join(root, "alpha"), name: "alpha", launcher: "pi", initialPrompt: "hola" });
+    const sp = await ask("host.spawn", { machineId: "MACH1", cwd: path.join(root, "alpha"), name: "alpha", launcher: "pi", sessionId: "sess-resumed", initialPrompt: "hola" });
     expect(sp.t).toBe("host.spawned");
     expect(sp.d).toMatchObject({ backend: "tmux", herdr: null });
     expect(sp.d.tmuxSession).toMatch(/^rp-/);

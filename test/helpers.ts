@@ -234,6 +234,7 @@ export function makeCtx(o: FakeCtxOptions = {}) {
     thinkingLevel: "off",
     isIdle: () => idle,
     abort: vi.fn(),
+    shutdown: vi.fn(),
     setIdle: (v: boolean) => (idle = v),
   };
   return ctx;

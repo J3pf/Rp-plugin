@@ -9,7 +9,7 @@ import { HerdrBackend } from "./backends/herdr.ts";
 import { TmuxBackend } from "./backends/tmux.ts";
 import { ConsoleBackend, WindowsTerminalBackend } from "./backends/windows.ts";
 import { run as realRun, type Runner } from "./runner.ts";
-import { HostError, resolveLauncher, resolveWithinRoots, sanitizeLabel, validateSpawnId } from "./validate.ts";
+import { HostError, resolveLauncher, resolveWithinRoots, sanitizeLabel, validateSessionId, validateSpawnId } from "./validate.ts";
 
 export interface BackendReport {
   herdr: string | null;
@@ -24,6 +24,7 @@ export interface SpawnParams {
   launcher?: string;
   backend?: BackendName;
   herdrTarget?: HerdrTarget;
+  sessionId?: string;
 }
 
 export class HostManager {
@@ -110,7 +111,9 @@ export class HostManager {
     const backendName = await this.resolveBackend(p.backend);
     if (p.herdrTarget && backendName !== "herdr") throw new HostError("bad_request", "herdrTarget requires the herdr backend");
     const spawnId = newId();
-    const rec = await this.backends[backendName].spawn({ cwd, name, launcherCommand: launcher.command, spawnId, herdrTarget: p.herdrTarget });
+    const sessionId = p.sessionId ? validateSessionId(p.sessionId) : undefined;
+    const launcherCommand = sessionId ? `${launcher.command} --session ${sessionId}` : launcher.command;
+    const rec = await this.backends[backendName].spawn({ cwd, name, launcherCommand, spawnId, herdrTarget: p.herdrTarget, sessionId });
     this.records.set(spawnId, rec);
     this.save();
     return rec;

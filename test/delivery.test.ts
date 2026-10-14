@@ -236,6 +236,18 @@ describe("Deliverer", () => {
     expect(m.sent[0]).toEqual({ content: "/gentle:mode normal", opts: { expandPromptTemplates: true } });
     expect(m.acks[0]).toMatchObject({ disposition: "command", method: "api" });
   });
+  it("intercepts /quit or /exit and calls ctx.shutdown()", async () => {
+    const m = mk({ gentle: "auto" });
+    await m.d.handle({ clientMsgId: "q1", text: "/quit" });
+    expect(m.sent).toHaveLength(0);
+    expect(m.acks[0]).toMatchObject({ clientMsgId: "q1", disposition: "command", method: "api" });
+    expect(m.ctx.shutdown).toHaveBeenCalledTimes(1);
+
+    await m.d.handle({ clientMsgId: "q2", text: "  /exit  " });
+    expect(m.sent).toHaveLength(0);
+    expect(m.acks[1]).toMatchObject({ clientMsgId: "q2", disposition: "command", method: "api" });
+    expect(m.ctx.shutdown).toHaveBeenCalledTimes(2);
+  });
   it("deliveries are serialized in arrival order", async () => {
     const order: string[] = [];
     let release!: () => void;

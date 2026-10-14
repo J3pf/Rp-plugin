@@ -83,3 +83,8 @@ export function validateSpawnId(id: unknown): string {
   if (typeof id !== "string" || !/^[0-9A-Za-z]{10,40}$/.test(id)) throw new HostError("bad_request", "invalid spawnId");
   return id;
 }
+
+export function validateSessionId(id: unknown): string {
+  if (typeof id !== "string" || !/^[0-9A-Za-z_-]{1,128}$/.test(id)) throw new HostError("bad_request", "invalid sessionId");
+  return id;
+}

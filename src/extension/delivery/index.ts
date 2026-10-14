@@ -84,6 +84,14 @@ export class Deliverer {
     }
     this.seen.add(id);
     const ctx = this.d.ctx();
+    const textTrimmed = msg.text.trim();
+    if (textTrimmed === "/quit" || textTrimmed === "/exit") {
+      this.record(msg, "api");
+      this.d.sendAck({ clientMsgId: id, disposition: "command", method: "api", error: null });
+      const shutdown = (ctx as { shutdown?: () => void }).shutdown;
+      if (typeof shutdown === "function") shutdown();
+      return;
+    }
     const cfg = this.d.cfg();
     const asCommand = !!msg.asCommand;
     const mode = this.d.gentleMode();
@@ -151,7 +159,9 @@ export class Deliverer {
           return;
         }
       } catch {
-        lastError = method === "herdr" ? "herdr_unavailable" : method === "interactive" ? "interactive_unavailable" : null;
+        if (method === "herdr") lastError = "herdr_unavailable";
+        else if (method === "interactive") lastError = "interactive_unavailable";
+        else lastError = null;
       }
     }
     this.d.sendAck({ clientMsgId: id, disposition: "rejected", method: chain[chain.length - 1] ?? "api", error: lastError });
