@@ -51,6 +51,7 @@ export class WsTransport implements Transport {
   private opened = false;
   private closed = false;
   private watchdog: NodeJS.Timeout | null = null;
+  private pingTimer: NodeJS.Timeout | null = null;
 
   constructor(private url: string, private token: string, private h: TransportHandlers) {}
 
@@ -79,9 +80,11 @@ export class WsTransport implements Transport {
       // RP must never keep Pi alive: an open socket alone does not hold the event loop
       (ws as any)._socket?.unref?.();
       this.arm();
+      this.startHeartbeat();
       this.h.onOpen();
     });
     ws.on("ping", () => this.arm());
+    ws.on("pong", () => this.arm());
     ws.on("message", (data) => {
       this.arm();
       const env = parseEnvelope(data.toString("utf8"));
@@ -91,6 +94,7 @@ export class WsTransport implements Transport {
       /* 'close' always follows */
     });
     ws.on("close", (code, reason) => {
+      this.stopHeartbeat();
       this.clearWatchdog();
       if (this.closed && !this.opened) return;
       this.closed = true;
@@ -111,10 +115,29 @@ export class WsTransport implements Transport {
     });
   }
 
-  /** The relay pings every 25 s; silence beyond 70 s means a dead socket. */
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.pingTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.ping();
+        } catch {
+          this.ws.terminate();
+        }
+      }
+    }, 20_000);
+    this.pingTimer.unref?.();
+  }
+
+  private stopHeartbeat(): void {
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = null;
+  }
+
+  /** The relay pings every 25 s, client pings every 20 s; silence beyond 45 s means a dead socket. */
   private arm(): void {
     this.clearWatchdog();
-    this.watchdog = setTimeout(() => this.ws?.terminate(), 70_000);
+    this.watchdog = setTimeout(() => this.ws?.terminate(), 45_000);
     this.watchdog.unref?.();
   }
   private clearWatchdog(): void {
@@ -136,6 +159,7 @@ export class WsTransport implements Transport {
 
   close(): void {
     this.closed = true;
+    this.stopHeartbeat();
     this.clearWatchdog();
     try {
       this.ws?.close(1000);
@@ -173,7 +197,9 @@ export class LongPollTransport implements Transport {
     queueMicrotask(() => {
       if (this.closed) return;
       this.h.onOpen();
-      void this.pollLoop();
+      void this.flush().then(() => {
+        if (!this.closed) void this.pollLoop();
+      });
     });
   }
 
@@ -419,15 +445,20 @@ export class Connection {
       } else if (this.wsFailures >= (this.o.wsFailuresBeforeLongPoll ?? 3)) {
         this.forceLongPoll = true;
         this.log("falling back to long-poll transport");
+        this.scheduleWsRetry();
       }
+    } else {
+      // Long-poll failed or closed: reset forceLongPoll so next reconnect cycle retries WebSocket
+      this.forceLongPoll = false;
+      this.probingWs = false;
     }
     this.setState("connecting", "reconnecting");
     const delay = code === CLOSE.SERVICE_RESTART ? 0 : (this.o.backoff ?? backoffDelay)(this.attempt++);
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => this.open(), delay);
-    this.reconnectTimer.unref?.();
   }
 
-  /** While on long-poll, retry WebSocket every 10 minutes. */
+  /** While on long-poll, retry WebSocket periodically (default 15s instead of 10 min). */
   private scheduleWsRetry(): void {
     if (this.wsRetryTimer) return;
     this.wsRetryTimer = setTimeout(() => {
@@ -439,8 +470,7 @@ export class Connection {
       this.t = null;
       this.welcomed = false;
       this.open();
-    }, this.o.wsRetryMs ?? 10 * 60_000);
-    this.wsRetryTimer.unref?.();
+    }, this.o.wsRetryMs ?? 15_000);
   }
 
   /** Send now if connected, otherwise queue (bounded). */
