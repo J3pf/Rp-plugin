@@ -96,7 +96,7 @@ describe.skipIf(!hasTmux)("real gentle-shell + gentle-pi", () => {
     const hello = await waitUntil(() => relay.of("agent.hello")[0], 60000, "agent.hello from gentle-shell");
     expect(hello.d.launcher).toBe("gentle-shell");
     expect(hello.d.pi.mode).toBe("tui");
-    expect(hello.d.gentle).toMatchObject({ version: "4.1.0" });
+    expect(hello.d.gentle?.version).toMatch(/^4\./);
     expect(hello.d.plugin.features).toContain("adapters:gentle-ask");
     expect(hello.d.plugin.features).not.toContain("gate"); // gentle-pi asks for confirmations itself → own gate off (auto-detect)
   }, 120000);

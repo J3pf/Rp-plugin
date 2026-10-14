@@ -67,7 +67,11 @@ export function resolveLauncher(cfg: HostConfig, key: string | undefined): { key
 
 /** Labels end up in CLI args and terminal titles: strip control chars and `;` (wt command separator). */
 export function sanitizeLabel(name: string | undefined, fallback: string): string {
-  const cleaned = (name ?? "").replace(/[\u0000-\u001f\u007f;"`$\\]/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
+  const cleaned = (name ?? "")
+    .replace(/[\u0000-\u001f\u007f;"`$\\&|^%<>()]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 60);
   return cleaned || fallback;
 }
 

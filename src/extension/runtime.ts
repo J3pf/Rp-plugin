@@ -131,7 +131,7 @@ export class Runtime {
         const w = this.settledWaiters.splice(0);
         for (const x of w) x.resolve();
       },
-      onToolStart: (name, args) => this.statuses.working(`${name}${toolDetail(name, args)}`),
+      onToolStart: (name, args) => this.statuses.working(`${name}${this.cfg.redactContent ? "" : toolDetail(name, args)}`),
     });
 
     this.gate = new Gate({

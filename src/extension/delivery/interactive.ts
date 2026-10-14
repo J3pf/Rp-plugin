@@ -28,7 +28,11 @@ export interface InteractiveDeps {
 }
 
 export function normalizeText(s: string): string {
-  return s.replace(/\r\n?/g, "\n").trim();
+  return s
+    .replace(/\r\n?/g, "\n")
+    .replace(/\x1b\[[0-9;]*[a-zA-Z~]/g, "")
+    .replace(/\x1b/g, "")
+    .trim();
 }
 
 /**

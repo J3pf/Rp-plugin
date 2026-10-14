@@ -55,10 +55,16 @@ export function summarize(toolName: string, input: any): string {
   return truncateBytes(s, 300).text;
 }
 
-/** Session allow key: tool name, or "bash:<first token>" for shells so one approved `ls` never allows `rm`. */
+/** Session allow key: tool name, or "bash:<first token>" for shells so one approved `ls` never allows `rm`.
+ * When a command contains chaining or compound operators (;, &&, ||, |, \n), the whole command is keyed.
+ */
 export function allowKey(toolName: string, input: any): string {
   if (SHELL_TOOLS.has(toolName) && typeof input?.command === "string") {
-    const first = input.command.trim().split(/\s+/)[0] ?? "";
+    const cmd = input.command.trim();
+    if (/([;&|]|\n)/.test(cmd)) {
+      return `${toolName}:${cmd}`;
+    }
+    const first = cmd.split(/\s+/)[0] ?? "";
     return `${toolName}:${first}`;
   }
   return toolName;

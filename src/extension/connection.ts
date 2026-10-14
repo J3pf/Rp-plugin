@@ -393,8 +393,9 @@ export class Connection {
       onClose: (info) => {
         if (this.t !== t) return;
         this.t = null;
+        const wasWelcomed = this.welcomed;
         this.welcomed = false;
-        this.onTransportClosed(info, probe);
+        this.onTransportClosed(info, probe, wasWelcomed);
       },
     };
     const t = this.makeTransport(name, handlers);
@@ -423,7 +424,7 @@ export class Connection {
     this.o.onMessage(env);
   }
 
-  private onTransportClosed(info: { code: number; reason: string; opened: boolean; unsent: Envelope[] }, probe: boolean): void {
+  private onTransportClosed(info: { code: number; reason: string; opened: boolean; unsent: Envelope[] }, probe: boolean, wasWelcomed = false): void {
     // keep critical messages that never made it out
     for (const e of info.unsent) if (CRITICAL_TYPES.has(e.t) && e.t !== "agent.hello") this.enqueue(e, true, true);
     if (this.stopped) return;
@@ -436,7 +437,7 @@ export class Connection {
     }
     this.log(`transport ${this.transportName} closed: ${code} ${info.reason}`);
     if (this.transportName === "ws") {
-      if (!info.opened) this.wsFailures++;
+      if (!info.opened || !wasWelcomed) this.wsFailures++;
       if (probe) {
         // WS probe from long-poll failed: go back to long-poll without waiting for 3 more failures
         this.probingWs = false;

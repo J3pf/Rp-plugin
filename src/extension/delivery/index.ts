@@ -106,19 +106,53 @@ export class Deliverer {
     });
 
     let lastError: DeliveryError = null;
+    const blobCache = new Map<string, Promise<{ status: number; body: Buffer; headers: Record<string, any> }>>();
+    const cachedFetchBlob: FetchBlob | null = this.d.fetchBlob
+      ? (id) => {
+          let p = blobCache.get(id);
+          if (!p) {
+            p = this.d.fetchBlob!(id);
+            blobCache.set(id, p);
+          }
+          return p;
+        }
+      : null;
+
+    let resolvedTextNonInline: string | null = null;
+    let resolvedApi: { text: string; images: Array<{ type: "image"; data: string; mimeType: string }> } | null = null;
+
     for (const method of chain) {
       const inline = method === "api";
       let text = msg.text;
       let images: Array<{ type: "image"; data: string; mimeType: string }> = [];
-      if (msg.attachments?.length && this.d.fetchBlob) {
-        const r = await resolveAttachments(msg.attachments as any, {
-          fetchBlob: this.d.fetchBlob,
-          inboxDir: this.d.inboxDir(),
-          sessionId: this.d.sessionId(),
-          inlineImages: inline,
-        });
-        images = r.images;
-        if (r.lines.length) text = text ? `${text}\n\n${r.lines.join("\n")}` : r.lines.join("\n");
+      if (msg.attachments?.length && cachedFetchBlob) {
+        if (inline) {
+          if (!resolvedApi) {
+            const r = await resolveAttachments(msg.attachments as any, {
+              fetchBlob: cachedFetchBlob,
+              inboxDir: this.d.inboxDir(),
+              sessionId: this.d.sessionId(),
+              inlineImages: true,
+            });
+            resolvedApi = {
+              text: r.lines.length ? (text ? `${text}\n\n${r.lines.join("\n")}` : r.lines.join("\n")) : text,
+              images: r.images,
+            };
+          }
+          text = resolvedApi.text;
+          images = resolvedApi.images;
+        } else {
+          if (resolvedTextNonInline === null) {
+            const r = await resolveAttachments(msg.attachments as any, {
+              fetchBlob: cachedFetchBlob,
+              inboxDir: this.d.inboxDir(),
+              sessionId: this.d.sessionId(),
+              inlineImages: false,
+            });
+            resolvedTextNonInline = r.lines.length ? (text ? `${text}\n\n${r.lines.join("\n")}` : r.lines.join("\n")) : text;
+          }
+          text = resolvedTextNonInline;
+        }
       }
       try {
         if (method === "api") {

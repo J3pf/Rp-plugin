@@ -52,8 +52,13 @@ export class AdapterRegistry implements CustomInterceptor {
   async race<T>(factory: (...a: any[]) => any, _options: unknown, runOrig: (factory: (...a: any[]) => any) => Promise<T>): Promise<T> {
     const cur = this.current!;
     let doneRef: ((v: unknown) => void) | undefined;
+    let pendingResult: unknown = undefined;
+    let hasPendingResult = false;
     const wrapped = (tui: unknown, theme: unknown, kb: unknown, done: (v: unknown) => void) => {
       doneRef = done;
+      if (hasPendingResult) {
+        done(pendingResult);
+      }
       return factory(tui, theme, kb, done);
     };
     const p: OpenPrompt = this.broker.openSpec(cur.adapter.toPrompt(cur.args));
@@ -61,7 +66,13 @@ export class AdapterRegistry implements CustomInterceptor {
     void p.remoteAnswer.then((a) => {
       if (p.closed) return;
       answeredRemotely = true;
-      doneRef?.(cur.adapter.toResult(cur.args, a));
+      const res = cur.adapter.toResult(cur.args, a);
+      if (doneRef) {
+        doneRef(res);
+      } else {
+        hasPendingResult = true;
+        pendingResult = res;
+      }
       this.broker.ack(p.id, true);
     });
     try {

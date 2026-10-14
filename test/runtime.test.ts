@@ -18,6 +18,9 @@ beforeEach(async () => {
   delete process.env.RP_RELAY_URL;
   delete process.env.GENTLE_PI_AGENTS_CHILD;
   delete process.env.RP_SPAWN_ID;
+  for (const k of Object.keys(process.env)) {
+    if (k.startsWith("HERDR_") || k === "TMUX" || k === "GENTLE_SHELL") delete process.env[k];
+  }
 });
 afterEach(async () => {
   for (const k of Object.keys(process.env)) if (!(k in envBackup)) delete process.env[k];
