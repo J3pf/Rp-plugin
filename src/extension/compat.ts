@@ -1,6 +1,7 @@
 // Every access to non-public Pi internals or to the shape of gentle-pi goes through this module (risk R1/R5/R6).
 import fs from "node:fs";
 import { createRequire } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { GENTLE_ASK_TOOLS } from "./environment.ts";
@@ -132,3 +133,56 @@ export function writeEditorText(ctx: ExtensionContext, text: string): void {
     /* ignore */
   }
 }
+
+export interface DetectThemeOptions {
+  argv?: string[];
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+}
+
+/** Resolve the active theme name from argv, environment, or settings.json (Pi / gentle-shell). */
+export function detectActiveTheme(opts: DetectThemeOptions = {}): string | null {
+  const argv = opts.argv ?? process.argv;
+  const env = opts.env ?? process.env;
+  const home = opts.home ?? os.homedir();
+
+  // 1. Explicit CLI argument --use-theme <name>
+  if (Array.isArray(argv)) {
+    const idx = argv.indexOf("--use-theme");
+    if (idx >= 0 && idx + 1 < argv.length && typeof argv[idx + 1] === "string") {
+      const val = argv[idx + 1].trim();
+      if (val) return val;
+    }
+  }
+
+  // 2. Explicit environment variable PI_THEME
+  if (typeof env.PI_THEME === "string" && env.PI_THEME.trim()) {
+    return env.PI_THEME.trim();
+  }
+
+  // 3. Settings files in candidate directories
+  const candidates: string[] = [
+    env.PI_CODING_AGENT_DIR && path.join(env.PI_CODING_AGENT_DIR, "settings.json"),
+    env.GENTLE_SHELL_USER_PI_HOME && path.join(env.GENTLE_SHELL_USER_PI_HOME, "settings.json"),
+    path.join(home, ".pi", "agent", "settings.json"),
+    path.join(home, ".gentle-shell", "agent", "settings.json"),
+    path.join(home, ".config", "pi", "settings.json"),
+  ].filter(Boolean) as string[];
+
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) {
+        const raw = fs.readFileSync(c, "utf8");
+        const json = JSON.parse(raw);
+        if (typeof json?.theme === "string" && json.theme.trim()) {
+          return json.theme.trim();
+        }
+      }
+    } catch {
+      /* ignore invalid JSON / ENOENT */
+    }
+  }
+
+  return null;
+}
+

@@ -2,12 +2,12 @@
 import os from "node:os";
 import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { newId, type AgentStatus, type Envelope, type WelcomeBody } from "../shared/protocol.ts";
+import { newId, type AgentHelloBody, type AgentStatus, type Envelope, type WelcomeBody } from "../shared/protocol.ts";
 import { errMsg, preview } from "../shared/util.ts";
 import type { RpConfig } from "./config.ts";
 import { resolveInboxDir } from "./config.ts";
-import type { StaticEnv } from "./environment.ts";
-import { detectPiVersion, detectGentleVersion, gentleVersionSupported, hasGentleAskTools, terminalStdin, toolNames, warnOnce } from "./compat.ts";
+import type { StaticEnv, HerdrLocation } from "./environment.ts";
+import { detectPiVersion, detectGentleVersion, detectActiveTheme, gentleVersionSupported, hasGentleAskTools, terminalStdin, toolNames, warnOnce } from "./compat.ts";
 import { Connection, type ConnState, type TransportName } from "./connection.ts";
 import { Forwarder, type ForwardedEvent } from "./forwarder.ts";
 import { buildSnapshotEntries } from "./snapshot.ts";
@@ -29,9 +29,28 @@ interface Waiter<T> {
   resolve: (v: T) => void;
 }
 
+export interface RuntimeDescription {
+  agentId: string;
+  instance: string;
+  epoch: string;
+  connected: boolean;
+  state: ConnState;
+  transport: TransportName;
+  queued: number;
+  openPrompts: number;
+  launcher: string;
+  herdr: HerdrLocation | null;
+  gentle: { version: string | null; mode: string } | null;
+  features: string[];
+  gateMode: EffectiveGateMode;
+  fatal: { code: number; reason: string } | null;
+  preview: string;
+}
+
 export interface RuntimeOptions {
   /** Test seam: replace the connection. */
   connectionFactory?: (o: ConstructorParameters<typeof Connection>[0]) => Connection;
+  detectTheme?: () => string | null;
 }
 
 export class Runtime {
@@ -66,6 +85,7 @@ export class Runtime {
   private herdrBlocker: HerdrBlocker;
   private everConnected = false;
   private lastCtx: ExtensionContext;
+  private detectTheme: () => string | null;
   /** Static facts copied from ctx: reading a stale ctx (after reload/dispose) throws in Pi. */
   private info: { mode: string; cwd: string; hasUI: boolean; sessionFile: string | null; sessionName: string | null };
 
@@ -84,6 +104,7 @@ export class Runtime {
     this.agentId = `${cfg.machineId}:${this.sessionId}`;
     this.allowed = allowedFromBranch(this.safeBranch());
     this.herdrBlocker = new HerdrBlocker(pi.events as any, !!env.herdr);
+    this.detectTheme = opts.detectTheme ?? (() => detectActiveTheme());
 
     this.statuses = new StatusTracker(
       (status, detail) => this.conn.send("agent.status", { status, ...(detail ? { detail } : {}) }),
@@ -169,6 +190,8 @@ export class Runtime {
     this.maybeRegisterAskUser();
     this.model = ctx.model ? { provider: (ctx.model as any).provider, id: (ctx.model as any).id } : null;
     this.thinking = ctx.thinkingLevel ?? null;
+    const theme = this.detectTheme();
+    if (theme) this.statuses.observe("pi:theme", theme);
     void this.refreshGit();
     this.conn.start();
   }
@@ -345,7 +368,7 @@ export class Runtime {
     return f;
   }
 
-  makeHello(): unknown {
+  makeHello(): AgentHelloBody {
     const { mode, cwd, sessionFile, sessionName } = this.info;
     const gentle = this.gentleInfo();
     return {
@@ -534,7 +557,7 @@ export class Runtime {
 
   // ---------- introspection for /rp status ----------
 
-  describe() {
+  describe(): RuntimeDescription {
     return {
       agentId: this.agentId,
       instance: this.instance,
@@ -555,7 +578,7 @@ export class Runtime {
   }
 }
 
-function toolDetail(name: string, args: any): string {
+function toolDetail(_name: string, args: any): string {
   if (!args || typeof args !== "object") return "";
   const v = typeof args.command === "string" ? args.command : typeof args.path === "string" ? args.path : "";
   return v ? `: ${preview(v, 60)}` : "";

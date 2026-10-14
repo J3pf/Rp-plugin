@@ -210,6 +210,18 @@ describe("agent.hello / snapshot / events", () => {
     expect(lastHello().gentle).toMatchObject({ mode: "auto" });
     expect(lastHello().plugin.features).not.toContain("gate"); // gentle-pi present → auto-detect gate is off
   });
+  it("emits pi:theme in agent.statuses on startup", async () => {
+    const prev = process.env.PI_THEME;
+    process.env.PI_THEME = "Gentleman-Cute";
+    try {
+      await boot();
+      await waitUntil(() => relay.of("agent.hello").length === 1);
+      await waitUntil(() => relay.of("agent.statuses").some((e) => e.d.items["pi:theme"] === "Gentleman-Cute"), 4000, "statuses with pi:theme");
+    } finally {
+      if (prev === undefined) delete process.env.PI_THEME;
+      else process.env.PI_THEME = prev;
+    }
+  });
 });
 
 describe("questions & authorizations", () => {

@@ -7,7 +7,7 @@ import { configDir, configPath, defaultInboxDir, hostConfigPath, expandHome } fr
 import { envelope, parseEnvelope } from "../src/shared/protocol.ts";
 import { normalizeConfig, saveConfig, loadConfig, updateConfigFile, DEFAULT_CONFIG } from "../src/extension/config.ts";
 import { detectStaticEnv, parseGentleMode, isAskLikeTool } from "../src/extension/environment.ts";
-import { gentleVersionSupported, parseVersion } from "../src/extension/compat.ts";
+import { detectActiveTheme, gentleVersionSupported, parseVersion } from "../src/extension/compat.ts";
 
 describe("util", () => {
   it("truncates by UTF-8 bytes without splitting code points", () => {
@@ -25,7 +25,7 @@ describe("util", () => {
     expect(sanitizeFileName("   ")).toBe("file");
     expect(sanitizeFileName("CON.txt")).toBe("_CON.txt");
     expect(sanitizeFileName(".hidden")).toBe("_hidden");
-    expect(sanitizeFileName("x".repeat(300) + ".pdf").length).toBeLessThanOrEqual(120);
+    expect(sanitizeFileName(`${"x".repeat(300)}.pdf`).length).toBeLessThanOrEqual(120);
   });
   it("backoff grows 1s→30s with ±20% jitter", () => {
     expect(backoffDelay(0, () => 0.5)).toBe(1000);
@@ -36,7 +36,7 @@ describe("util", () => {
   });
   it("LruSet keeps the most recent N", () => {
     const s = new LruSet(3);
-    ["a", "b", "c", "d"].forEach((k) => s.add(k));
+    for (const k of ["a", "b", "c", "d"]) s.add(k);
     expect(s.has("a")).toBe(false);
     expect(s.has("d")).toBe(true);
     s.add("b");
@@ -99,7 +99,9 @@ describe("config", () => {
     const l = loadConfig({ RP_CONFIG: p, RP_RELAY_URL: "https://override", RP_DISABLED: "1" });
     expect(l.cfg.relayUrl).toBe("https://override");
     expect(l.cfg.enabled).toBe(false);
-    updateConfigFile(p, (c) => void (c.redactContent = true));
+    updateConfigFile(p, (c) => {
+      c.redactContent = true;
+    });
     const raw = JSON.parse(fs.readFileSync(p, "utf8"));
     expect(raw.relayUrl).toBe("https://r");
     expect(raw.enabled).toBe(true);
@@ -158,3 +160,42 @@ describe("gentle version range", () => {
     expect(gentleVersionSupported("nonsense")).toBe(false);
   });
 });
+
+describe("detectActiveTheme", () => {
+  it("prefers --use-theme from argv", () => {
+    expect(detectActiveTheme({ argv: ["node", "pi", "--use-theme", "Gentleman-Cute"] })).toBe("Gentleman-Cute");
+    expect(detectActiveTheme({ argv: ["node", "pi", "--use-theme", "  dark  "] })).toBe("dark");
+  });
+
+  it("prefers PI_THEME when --use-theme is absent", () => {
+    expect(detectActiveTheme({ argv: [], env: { PI_THEME: "omarchy-system" } })).toBe("omarchy-system");
+  });
+
+  it("reads theme from candidate settings.json files", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rp-theme-test-"));
+    try {
+      const piAgent = path.join(tmp, ".pi", "agent");
+      fs.mkdirSync(piAgent, { recursive: true });
+      fs.writeFileSync(path.join(piAgent, "settings.json"), JSON.stringify({ theme: "Gentleman-Sexy" }));
+      expect(detectActiveTheme({ argv: [], env: {}, home: tmp })).toBe("Gentleman-Sexy");
+
+      // PI_CODING_AGENT_DIR takes precedence over ~/.pi/agent
+      const customDir = path.join(tmp, "custom-agent");
+      fs.mkdirSync(customDir, { recursive: true });
+      fs.writeFileSync(path.join(customDir, "settings.json"), JSON.stringify({ theme: "Gentleman-Cute" }));
+      expect(detectActiveTheme({ argv: [], env: { PI_CODING_AGENT_DIR: customDir }, home: tmp })).toBe("Gentleman-Cute");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("returns null when no theme is configured", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rp-theme-none-"));
+    try {
+      expect(detectActiveTheme({ argv: [], env: {}, home: tmp })).toBeNull();
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+

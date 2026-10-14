@@ -116,6 +116,29 @@ export interface UserMessageBody {
   asCommand?: boolean;
 }
 
+export interface AgentHelloBody {
+  agentId: string;
+  kind: string;
+  instance: string;
+  epoch: string;
+  pi: { version: string; mode: string };
+  plugin: { version: string; features: string[] };
+  session: { id: string; file: string | null; name: string | null };
+  host: { hostname: string; user: string; pid: number; os: string };
+  launcher: string;
+  herdr: unknown;
+  gentle: { version: string | null; mode: string } | null;
+  transport: string;
+  redacted: boolean;
+  cwd: string;
+  spawnId: string | null;
+  git: { branch: string | null; dirty: boolean };
+  model: { provider: string; id: string } | null;
+  thinking: string | null;
+  status: AgentStatus;
+  openPrompts: unknown[];
+}
+
 export interface WelcomeBody {
   serverTime?: number;
   lastSeq?: number | null;
