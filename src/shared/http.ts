@@ -8,7 +8,7 @@ export async function getProxyAgent(): Promise<Agent | undefined> {
   if (sharedAgent) return sharedAgent;
   try {
     const mod: any = await import("proxy-agent");
-    sharedAgent = new mod.ProxyAgent() as Agent;
+    sharedAgent = new mod.ProxyAgent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 16 } as any) as Agent;
   } catch {
     sharedAgent = undefined;
   }

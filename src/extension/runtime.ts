@@ -246,7 +246,11 @@ export class Runtime {
 
   forward(name: ForwardedEvent, ev: any, ctx: ExtensionContext): void {
     if (this.disposed) return;
-    this.touch(ctx);
+    if ((name === "message_update" || name === "tool_execution_update") && this.info) {
+      this.lastCtx = ctx;
+    } else {
+      this.touch(ctx);
+    }
     if (name === "model_select" && ev?.model) this.model = { provider: ev.model.provider, id: ev.model.id };
     if (name === "thinking_level_select") this.thinking = ev?.level ?? null;
     if (name === "session_compact") this.statuses.setCompacting(false);

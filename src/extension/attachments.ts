@@ -57,12 +57,24 @@ export async function resolveAttachments(
   opts: { fetchBlob: FetchBlob; inboxDir: string; sessionId: string; inlineImages: boolean; now?: Date; writtenFiles?: Map<string, string> },
 ): Promise<ResolvedAttachments> {
   const out: ResolvedAttachments = { images: [], lines: [], failures: [] };
+  if (refs.length === 0) return out;
   const dir = path.join(opts.inboxDir, sessionDirName(opts.sessionId));
+  let dirCreated = false;
+  const fetched = await Promise.all(
+    refs.map((ref) =>
+      opts.fetchBlob(ref.blobId).then(
+        (res) => ({ ok: true as const, res }),
+        (err) => ({ ok: false as const, err }),
+      ),
+    ),
+  );
   for (let idx = 0; idx < refs.length; idx++) {
     const ref = refs[idx]!;
     const cacheKey = `${idx}:${ref.blobId}:${ref.name}`;
     try {
-      const res = await opts.fetchBlob(ref.blobId);
+      const item = fetched[idx]!;
+      if (!item.ok) throw item.err;
+      const res = item.res;
       if (res.status !== 200) throw new Error(`http ${res.status}`);
       const buf = res.body;
       if (buf.length > MAX_BLOB) throw new Error("too large");
@@ -75,11 +87,24 @@ export async function resolveAttachments(
       }
       let target = opts.writtenFiles?.get(cacheKey);
       if (!target) {
-        fs.mkdirSync(dir, { recursive: true });
+        if (!dirCreated) {
+          await fs.promises.mkdir(dir, { recursive: true });
+          dirCreated = true;
+        }
         const file = path.join(dir, `${timestampName(opts.now)}-${sanitizeFileName(ref.name)}`);
         target = file;
-        for (let i = 1; fs.existsSync(target); i++) target = file.replace(/(\.[^./\\]+)?$/, `-${i}$1`);
-        fs.writeFileSync(target, buf, { mode: 0o600 });
+        for (let i = 1; ; i++) {
+          try {
+            await fs.promises.writeFile(target, buf, { mode: 0o600, flag: "wx" });
+            break;
+          } catch (err: any) {
+            if (err?.code === "EEXIST") {
+              target = file.replace(/(\.[^./\\]+)?$/, `-${i}$1`);
+              continue;
+            }
+            throw err;
+          }
+        }
         opts.writtenFiles?.set(cacheKey, target);
       }
       out.lines.push(`[Archivo adjunto desde el móvil: ${target} (${ref.mime}, ${formatSize(buf.length)})]`);
@@ -90,3 +115,4 @@ export async function resolveAttachments(
   }
   return out;
 }
+

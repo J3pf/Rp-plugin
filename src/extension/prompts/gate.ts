@@ -78,24 +78,24 @@ export function decide(
   input: any,
   info?: GateToolInfo,
 ): GateDecision {
-  const summary = summarize(toolName, input);
   const key = allowKey(toolName, input);
-  const no: GateDecision = { ask: false, danger: "low", summary, key };
-  if (mode === "off") return no;
-  if (cfg.alwaysAllowTools.includes(toolName)) return no;
+  const no = (): GateDecision => ({ ask: false, danger: "low", summary: "", key });
+  if (mode === "off") return no();
+  if (cfg.alwaysAllowTools.includes(toolName)) return no();
   const dangerousCmd = SHELL_TOOLS.has(toolName) && typeof input?.command === "string" && patterns.some((r) => r.test(input.command));
   const annotatedDestructive = cfg.useAnnotations && info?.annotations?.destructiveHint === true && info?.annotations?.readOnlyHint !== true;
   const highDangerKey = SHELL_TOOLS.has(toolName) && typeof input?.command === "string" ? `${toolName}:${input.command.trim()}` : key;
-  if (dangerousCmd) return { ask: true, danger: "high", summary, key: highDangerKey };
-  if (annotatedDestructive) return { ask: true, danger: "high", summary, key: highDangerKey };
-  if (mode === "dangerous") return no;
+  if (dangerousCmd) return { ask: true, danger: "high", summary: summarize(toolName, input), key: highDangerKey };
+  if (annotatedDestructive) return { ask: true, danger: "high", summary: summarize(toolName, input), key: highDangerKey };
+  if (mode === "dangerous") return no();
   const readOnly = cfg.useAnnotations && info?.annotations?.readOnlyHint === true;
   if (mode === "writes") {
-    if (SHELL_TOOLS.has(toolName) || WRITE_TOOLS.has(toolName)) return { ask: true, danger: "medium", summary, key };
-    if (cfg.useAnnotations && info?.annotations?.readOnlyHint === false) return { ask: true, danger: "medium", summary, key };
-    return no;
+    if (SHELL_TOOLS.has(toolName) || WRITE_TOOLS.has(toolName)) return { ask: true, danger: "medium", summary: summarize(toolName, input), key };
+    if (cfg.useAnnotations && info?.annotations?.readOnlyHint === false) return { ask: true, danger: "medium", summary: summarize(toolName, input), key };
+    return no();
   }
   // mode === "all"
+  const summary = summarize(toolName, input);
   if (readOnly) return { ask: true, danger: "low", summary, key };
   return { ask: true, danger: SHELL_TOOLS.has(toolName) || WRITE_TOOLS.has(toolName) ? "medium" : "low", summary, key };
 }
@@ -114,15 +114,20 @@ export interface GateDeps {
 
 export class Gate {
   private patterns: RegExp[] | null = null;
-  private patternSrc = "";
+  private patternList: readonly string[] | null = null;
 
   constructor(private d: GateDeps) {}
 
   private getPatterns(): RegExp[] {
-    const src = JSON.stringify(this.d.cfg().dangerousPatterns);
-    if (!this.patterns || src !== this.patternSrc) {
-      this.patterns = compilePatterns(this.d.cfg().dangerousPatterns);
-      this.patternSrc = src;
+    const list = this.d.cfg().dangerousPatterns;
+    if (
+      !this.patterns ||
+      !this.patternList ||
+      list.length !== this.patternList.length ||
+      (list !== this.patternList && list.some((p, i) => p !== this.patternList![i]))
+    ) {
+      this.patterns = compilePatterns(list);
+      this.patternList = list.slice();
     }
     return this.patterns;
   }

@@ -178,6 +178,7 @@ export class LongPollTransport implements Transport {
   private outbox: Envelope[] = [];
   private inFlight: Envelope[] = [];
   private flushing = false;
+  private flushScheduled = false;
   private ac = new AbortController();
 
   constructor(
@@ -253,7 +254,13 @@ export class LongPollTransport implements Transport {
   send(env: Envelope): boolean {
     if (this.closed) return false;
     this.outbox.push(env);
-    setImmediate(() => void this.flush());
+    if (!this.flushScheduled && !this.flushing) {
+      this.flushScheduled = true;
+      setImmediate(() => {
+        this.flushScheduled = false;
+        void this.flush();
+      });
+    }
     return true;
   }
 

@@ -53,8 +53,12 @@ export function hasGentleAskTools(pi: ExtensionAPI): boolean {
   return GENTLE_ASK_TOOLS.some((n) => names.includes(n));
 }
 
+const pkgCache = new Map<string, { dir: string; json: any } | null>();
+
 /** Walk upwards from a path to find the owning package.json (used to read the gentle-pi version). */
 export function findPackageJson(startPath: string, name?: string): { dir: string; json: any } | null {
+  const cacheKey = `${startPath}\0${name ?? ""}`;
+  if (pkgCache.has(cacheKey)) return pkgCache.get(cacheKey)!;
   let dir = startPath;
   try {
     if (fs.existsSync(dir) && fs.statSync(dir).isFile()) dir = path.dirname(dir);
@@ -65,7 +69,11 @@ export function findPackageJson(startPath: string, name?: string): { dir: string
     const f = path.join(dir, "package.json");
     try {
       const json = JSON.parse(fs.readFileSync(f, "utf8"));
-      if (!name || json.name === name) return { dir, json };
+      if (!name || json.name === name) {
+        const res = { dir, json };
+        pkgCache.set(cacheKey, res);
+        return res;
+      }
     } catch {
       /* keep walking */
     }
@@ -73,6 +81,7 @@ export function findPackageJson(startPath: string, name?: string): { dir: string
     if (parent === dir) break;
     dir = parent;
   }
+  pkgCache.set(cacheKey, null);
   return null;
 }
 
@@ -91,12 +100,19 @@ export function detectGentleVersion(pi: ExtensionAPI): string | null {
   }
 }
 
+let cachedPiVersion: string | null = null;
+
 export function detectPiVersion(): string {
+  if (cachedPiVersion) return cachedPiVersion;
   try {
     const req = createRequire(import.meta.url);
     const main = req.resolve("@earendil-works/pi-coding-agent");
     const pkg = findPackageJson(main, "@earendil-works/pi-coding-agent");
-    if (typeof pkg?.json?.version === "string") return pkg.json.version;
+    if (typeof pkg?.json?.version === "string") {
+      const v: string = pkg.json.version;
+      cachedPiVersion = v;
+      return v;
+    }
   } catch {
     /* fall through */
   }

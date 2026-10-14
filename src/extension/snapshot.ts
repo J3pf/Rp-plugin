@@ -56,11 +56,19 @@ export function toSnapshotEntry(entry: any, redact: boolean): SnapshotEntry | nu
 }
 
 export function buildSnapshotEntries(branch: any[], redact: boolean): { entries: SnapshotEntry[]; truncated: boolean } {
-  const all: SnapshotEntry[] = [];
-  for (const e of branch) {
-    const s = toSnapshotEntry(e, redact);
-    if (s) all.push(s);
+  const picked: SnapshotEntry[] = [];
+  let truncated = false;
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const s = toSnapshotEntry(branch[i], redact);
+    if (!s) continue;
+    if (picked.length < SNAPSHOT_LIMIT) {
+      picked.push(s);
+    } else {
+      truncated = true;
+      break;
+    }
   }
-  const truncated = all.length > SNAPSHOT_LIMIT;
-  return { entries: truncated ? all.slice(all.length - SNAPSHOT_LIMIT) : all, truncated };
+  picked.reverse();
+  return { entries: picked, truncated };
 }
+

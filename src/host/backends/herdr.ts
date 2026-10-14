@@ -150,28 +150,41 @@ export class HerdrBackend implements Backend {
 
   /** workspace list + tab list for the app's "where to create the agent" picker. */
   async layout(): Promise<{ workspaces: Array<{ id: string; label: string; cwd: string | null; tabs: Array<{ id: string; label: string; panes: Array<{ id: string; agent?: string }> }> }> }> {
-    const ws = parseJson((await this.herdr(["workspace", "list"])).stdout);
-    const tabs = parseJson((await this.herdr(["tab", "list"])).stdout);
+    const [wsRes, tabsRes] = await Promise.all([this.herdr(["workspace", "list"]), this.herdr(["tab", "list"])]);
+    const ws = parseJson(wsRes.stdout);
+    const tabs = parseJson(tabsRes.stdout);
     const wsList: any[] = firstArray(ws, ["result.workspaces", "workspaces", "result"]);
     const tabList: any[] = firstArray(tabs, ["result.tabs", "tabs", "result"]);
+    const tabsByWs = new Map<string, any[]>();
+    for (const t of tabList) {
+      const wid = pick(t, ["workspace_id", "workspace"]) ?? "";
+      let group = tabsByWs.get(wid);
+      if (!group) {
+        group = [];
+        tabsByWs.set(wid, group);
+      }
+      group.push(t);
+    }
     return {
       workspaces: wsList.map((w) => {
         const id = pick(w, ["workspace_id", "id"]) ?? "";
+        const wTabs = tabsByWs.get(id) ?? [];
         return {
           id,
           label: pick(w, ["label", "name"]) ?? id,
           cwd: pick(w, ["cwd", "root_cwd"]),
-          tabs: tabList
-            .filter((t) => (pick(t, ["workspace_id", "workspace"]) ?? "") === id)
-            .map((t) => {
-              const tid = pick(t, ["tab_id", "id"]) ?? "";
-              const panes: any[] = Array.isArray(t?.panes) ? t.panes : [];
-              return {
-                id: tid,
-                label: pick(t, ["label", "name"]) ?? tid,
-                panes: panes.map((p) => ({ id: pick(p, ["pane_id", "id"]) ?? "", ...(pick(p, ["agent", "agent_name"]) ? { agent: pick(p, ["agent", "agent_name"])! } : {}) })),
-              };
-            }),
+          tabs: wTabs.map((t) => {
+            const tid = pick(t, ["tab_id", "id"]) ?? "";
+            const panes: any[] = Array.isArray(t?.panes) ? t.panes : [];
+            return {
+              id: tid,
+              label: pick(t, ["label", "name"]) ?? tid,
+              panes: panes.map((p) => {
+                const agent = pick(p, ["agent", "agent_name"]);
+                return { id: pick(p, ["pane_id", "id"]) ?? "", ...(agent ? { agent } : {}) };
+              }),
+            };
+          }),
         };
       }),
     };

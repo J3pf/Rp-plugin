@@ -52,10 +52,18 @@ export class HostManager {
   }
   private platform: NodeJS.Platform;
 
+  private trimRecords(): void {
+    while (this.records.size > 200) {
+      const oldest = this.records.keys().next().value;
+      if (oldest === undefined) break;
+      this.records.delete(oldest);
+    }
+  }
   private load(): void {
     try {
       const arr: SpawnRecord[] = JSON.parse(fs.readFileSync(this.storeFile, "utf8"));
       for (const r of arr) if (r?.spawnId) this.records.set(r.spawnId, r);
+      this.trimRecords();
     } catch {
       /* first run */
     }
@@ -115,6 +123,7 @@ export class HostManager {
     const launcherCommand = sessionId ? `${launcher.command} --session ${sessionId}` : launcher.command;
     const rec = await this.backends[backendName].spawn({ cwd, name, launcherCommand, spawnId, herdrTarget: p.herdrTarget, sessionId });
     this.records.set(spawnId, rec);
+    this.trimRecords();
     this.save();
     return rec;
   }

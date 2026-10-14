@@ -6,8 +6,10 @@ export function sha256(buf: Buffer | string): string {
 
 /** Truncate a string to at most `max` UTF-8 bytes without splitting a code point. */
 export function truncateBytes(s: string, max: number): { text: string; truncated: boolean } {
-  if (Buffer.byteLength(s, "utf8") <= max) return { text: s, truncated: false };
-  let buf = Buffer.from(s, "utf8").subarray(0, max);
+  if (s.length <= Math.floor(max / 4)) return { text: s, truncated: false };
+  if (s.length <= max && Buffer.byteLength(s, "utf8") <= max) return { text: s, truncated: false };
+  const head = s.length > max + 1 ? s.slice(0, max + 1) : s;
+  let buf = Buffer.from(head, "utf8").subarray(0, max);
   // drop a possibly split trailing code point
   let end = buf.length;
   while (end > 0 && (buf[end - 1]! & 0xc0) === 0x80) end--;
