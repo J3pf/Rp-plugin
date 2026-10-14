@@ -47,6 +47,13 @@ export async function httpRequest(url: string, opts: HttpOptions = {}): Promise<
     headers["content-length"] = String(payload.length);
   }
   return new Promise<HttpResult>((resolve, reject) => {
+    let onAbort: (() => void) | undefined;
+    const cleanup = () => {
+      if (onAbort && opts.signal) {
+        opts.signal.removeEventListener("abort", onAbort);
+        onAbort = undefined;
+      }
+    };
     const req = lib.request(
       u,
       { method: opts.method ?? (payload ? "POST" : "GET"), headers, agent, timeout: opts.timeoutMs ?? 30_000 },
@@ -62,6 +69,7 @@ export async function httpRequest(url: string, opts: HttpOptions = {}): Promise<
           chunks.push(c);
         });
         res.on("end", () => {
+          cleanup();
           const body = Buffer.concat(chunks);
           let json: any;
           if ((res.headers["content-type"] ?? "").includes("json") && body.length) {
@@ -73,14 +81,23 @@ export async function httpRequest(url: string, opts: HttpOptions = {}): Promise<
           }
           resolve({ status: res.statusCode ?? 0, headers: res.headers, body, json });
         });
-        res.on("error", reject);
+        res.on("error", (err) => {
+          cleanup();
+          reject(err);
+        });
       },
     );
     req.on("timeout", () => req.destroy(new Error("request timeout")));
-    req.on("error", reject);
+    req.on("error", (err) => {
+      cleanup();
+      reject(err);
+    });
     if (opts.signal) {
       if (opts.signal.aborted) req.destroy(new Error("aborted"));
-      else opts.signal.addEventListener("abort", () => req.destroy(new Error("aborted")), { once: true });
+      else {
+        onAbort = () => req.destroy(new Error("aborted"));
+        opts.signal.addEventListener("abort", onAbort, { once: true });
+      }
     }
     if (payload) req.write(payload);
     req.end();

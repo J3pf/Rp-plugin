@@ -207,11 +207,20 @@ async function probeWs(url: string, token: string): Promise<{ ok: boolean; detai
       resolve({ ok, detail });
     };
     const t0 = Date.now();
-    const ws = new WebSocket(toWsUrl(url, "/ws/agent"), { headers: { Authorization: `Bearer ${token}` }, agent, handshakeTimeout: 8000 });
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(toWsUrl(url, "/ws/agent"), { headers: { Authorization: `Bearer ${token}` }, agent, handshakeTimeout: 8000 });
+    } catch (e) {
+      resolve({ ok: false, detail: errMsg(e) });
+      return;
+    }
     ws.on("open", () => finish(true, `${Date.now() - t0} ms`));
-    ws.on("unexpected-response", (_r, res) => finish(res.statusCode === 401, `http ${res.statusCode}`));
+    ws.on("unexpected-response", (_r, res) => {
+      res.resume();
+      finish(false, res.statusCode === 401 || res.statusCode === 403 ? `token rechazado (http ${res.statusCode})` : `http ${res.statusCode}`);
+    });
     ws.on("error", (e) => finish(false, errMsg(e)));
-    ws.on("close", (code) => finish(code === 4001, `cerrado ${code}`));
+    ws.on("close", (code) => finish(false, code === 4001 ? "token rechazado (4001)" : `cerrado ${code}`));
     setTimeout(() => finish(false, "timeout"), 10_000).unref?.();
   });
 }
@@ -221,31 +230,43 @@ export async function runDoctor(pi: ExtensionAPI | null, cfg: RpConfig, env = pr
   if (!cfg.relayUrl) {
     checks.push({ level: "fail", label: "Relay no configurado", detail: "usa /rp pair <url> <código>" });
   } else {
-    const url = new URL(cfg.relayUrl);
+    let url: URL | null = null;
     try {
-      const r = await dns.lookup(url.hostname);
-      checks.push({ level: "ok", label: "DNS", detail: `${url.hostname} → ${r.address}` });
+      url = new URL(cfg.relayUrl);
     } catch (e) {
-      checks.push({ level: "fail", label: "DNS", detail: errMsg(e) });
+      checks.push({ level: "fail", label: "URL del relay inválida", detail: `${cfg.relayUrl} (${errMsg(e)})` });
     }
-    const t0 = Date.now();
-    try {
-      const r = await httpRequest(toHttpUrl(cfg.relayUrl, "/healthz"), { timeoutMs: 10_000 });
-      const ms = Date.now() - t0;
-      if (r.status === 200) checks.push({ level: "ok", label: `${url.protocol === "https:" ? "TLS/HTTP" : "HTTP"} /healthz`, detail: `${ms} ms · relay ${r.json?.version ?? "?"}` });
-      else checks.push({ level: "fail", label: "HTTP /healthz", detail: `http ${r.status}` });
-      const date = r.headers.date ? Date.parse(String(r.headers.date)) : NaN;
-      if (!Number.isNaN(date)) {
-        const skew = Math.abs(Date.now() - date);
-        checks.push({ level: skew > 30_000 ? "warn" : "ok", label: "Reloj", detail: `desfase ${Math.round(skew / 1000)} s respecto al relay` });
+    if (url) {
+      try {
+        const r = await dns.lookup(url.hostname);
+        checks.push({ level: "ok", label: "DNS", detail: `${url.hostname} → ${r.address}` });
+      } catch (e) {
+        checks.push({ level: "fail", label: "DNS", detail: errMsg(e) });
       }
-    } catch (e) {
-      checks.push({ level: "fail", label: "TLS/HTTP", detail: errMsg(e) });
+      const t0 = Date.now();
+      try {
+        const r = await httpRequest(toHttpUrl(cfg.relayUrl, "/healthz"), { timeoutMs: 10_000 });
+        const ms = Date.now() - t0;
+        if (r.status === 200) checks.push({ level: "ok", label: `${url.protocol === "https:" ? "TLS/HTTP" : "HTTP"} /healthz`, detail: `${ms} ms · relay ${r.json?.version ?? "?"}` });
+        else checks.push({ level: "fail", label: "HTTP /healthz", detail: `http ${r.status}` });
+        const date = r.headers.date ? Date.parse(String(r.headers.date)) : NaN;
+        if (!Number.isNaN(date)) {
+          const skew = Math.abs(Date.now() - date);
+          checks.push({ level: skew > 30_000 ? "warn" : "ok", label: "Reloj", detail: `desfase ${Math.round(skew / 1000)} s respecto al relay` });
+        }
+      } catch (e) {
+        checks.push({ level: "fail", label: "TLS/HTTP", detail: errMsg(e) });
+      }
+      if (cfg.machineToken) {
+        const w = await probeWs(cfg.relayUrl, cfg.machineToken);
+        const rejected = w.detail.startsWith("token rechazado");
+        checks.push({
+          level: w.ok ? "ok" : rejected ? "fail" : "warn",
+          label: "WebSocket",
+          detail: w.ok ? w.detail : rejected ? `${w.detail} → vuelve a emparejar con /rp pair` : `${w.detail} → se usará long-poll si persiste`,
+        });
+      } else checks.push({ level: "warn", label: "WebSocket", detail: "PC sin emparejar" });
     }
-    if (cfg.machineToken) {
-      const w = await probeWs(cfg.relayUrl, cfg.machineToken);
-      checks.push({ level: w.ok ? "ok" : "warn", label: "WebSocket", detail: w.ok ? w.detail : `${w.detail} → se usará long-poll si persiste` });
-    } else checks.push({ level: "warn", label: "WebSocket", detail: "PC sin emparejar" });
   }
   const proxy = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy;
   checks.push({

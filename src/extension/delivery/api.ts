@@ -14,7 +14,7 @@ export function deliverApi(pi: ExtensionAPI, input: ApiDeliveryInput): { disposi
   const content: string | Array<any> =
     input.images.length > 0 ? [{ type: "text", text: input.text }, ...input.images] : input.text;
   if (input.asCommand) {
-    pi.sendUserMessage(input.text, input.idle ? { expandPromptTemplates: true } : { deliverAs: input.delivery === "steer" ? "steer" : "followUp", expandPromptTemplates: true });
+    pi.sendUserMessage(content as any, input.idle ? { expandPromptTemplates: true } : { deliverAs: input.delivery === "steer" ? "steer" : "followUp", expandPromptTemplates: true });
     return { disposition: "command" };
   }
   if (input.idle) {

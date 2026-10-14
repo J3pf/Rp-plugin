@@ -64,7 +64,7 @@ export class AdapterRegistry implements CustomInterceptor {
     const p: OpenPrompt = this.broker.openSpec(cur.adapter.toPrompt(cur.args));
     let answeredRemotely = false;
     void p.remoteAnswer.then((a) => {
-      if (p.closed) return;
+      if (p.closed && !p.cancelledBySystem) return;
       answeredRemotely = true;
       const res = cur.adapter.toResult(cur.args, a);
       if (doneRef) {
@@ -73,7 +73,7 @@ export class AdapterRegistry implements CustomInterceptor {
         hasPendingResult = true;
         pendingResult = res;
       }
-      this.broker.ack(p.id, true);
+      if (!p.cancelledBySystem) this.broker.ack(p.id, true);
     });
     try {
       const v = await runOrig(wrapped as any);

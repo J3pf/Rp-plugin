@@ -194,4 +194,31 @@ describe("Connection fallback to HTTP long-poll", () => {
     await waitUntil(() => log.fatal.length === 1, 8000);
     expect(log.fatal[0][0]).toBe(4001);
   });
+  it("preserves FIFO order of unsent critical messages when transport closes mid-send", async () => {
+    relay = await new FakeRelay().start();
+    let failFirstSend = true;
+    relay.httpResponses.set("/v1/agent/send", (_req, body) => {
+      const arr = Array.isArray(body) ? body : [];
+      if (failFirstSend && arr.some((e: any) => e.t === "prompt.open")) {
+        failFirstSend = false;
+        relay.pollWaiters.length = 0;
+        return { status: 502, body: { error: "bad_gateway" } };
+      }
+      for (const env of arr) {
+        relay.all.push(env);
+        if (env.t === "agent.hello" && relay.autoWelcome) relay.pollQueue.push({ v: 1, id: "w", t: "agent.welcome", ts: Date.now(), re: env.id, d: relay.welcomeBody });
+      }
+      (relay as any).flushPoll();
+      return { status: 200, body: {} };
+    });
+    relay.rejectUpgrade = 503;
+    mk({ wsFailuresBeforeLongPoll: 1, wsRetryMs: 60_000 });
+    conn!.start();
+    await waitUntil(() => conn!.transportName === "longpoll" && conn!.connected, 8000);
+    conn!.send("prompt.open", { promptId: "P1" });
+    conn!.send("prompt.resolved", { promptId: "P1", by: "local", answer: null });
+    await waitUntil(() => relay.of("prompt.resolved").length === 1, 8000);
+    const critical = relay.all.filter((e) => e.t === "prompt.open" || e.t === "prompt.resolved").map((e) => e.t);
+    expect(critical).toEqual(["prompt.open", "prompt.resolved"]);
+  });
 });

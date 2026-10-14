@@ -9,7 +9,8 @@ export function wtArgs(req: SpawnRequest): string[] {
 }
 
 export function consoleArgs(req: SpawnRequest): string[] {
-  return ["/c", "start", req.name, "/D", req.cwd, ...splitCommand(req.launcherCommand), "--rp-spawn-id", req.spawnId];
+  const title = `"${req.name.replace(/"/g, "")}"`;
+  return ["/c", "start", title, "/D", req.cwd, ...splitCommand(req.launcherCommand), "--rp-spawn-id", req.spawnId];
 }
 
 /** PowerShell that stops the processes whose command line carries the spawn id (ids are alphanumeric → injection-safe). */

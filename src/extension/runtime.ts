@@ -508,7 +508,7 @@ export class Runtime {
           this.inputWaiters.push({ text: norm, resolve, timer });
         }),
       statuses: () => this.statuses.snapshot(),
-      enabled: () => this.cfg.delivery.interactive,
+      enabled: () => !this.disposed && this.cfg.delivery.interactive,
     };
   }
 

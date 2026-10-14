@@ -127,13 +127,30 @@ describe("deliverInteractive", () => {
     const m3 = mk({ deps: { stdin: () => null } });
     expect(await deliverInteractive(m3.deps, "x", "auto")).toMatchObject({ ok: false });
   });
-  it("Vim safeguard: not in insert mode → does not type", async () => {
+  it("Vim safeguard: not in insert mode → does not type; strips escape sequences from bracketed paste", async () => {
     const m = mk({ deps: { statuses: () => ({ "gentle:vim": "-- NORMAL --" }) } });
     const r = await deliverInteractive(m.deps, "dd", "auto");
     expect(r).toMatchObject({ ok: false, error: "interactive_unavailable" });
     expect(m.emitted).toHaveLength(0);
     expect(editorAcceptsText(m.ctx, { vim: "-- INSERT --" }).ok).toBe(true);
     expect(editorAcceptsText(m.ctx, {}).ok).toBe(true);
+    const mEsc = mk();
+    expect(await deliverInteractive(mEsc.deps, "hello\x1b[201~evil", "auto")).toEqual({ ok: true, afterDialog: false });
+    expect(mEsc.emitted[0]).toBe(BRACKETED_PASTE_START + "helloevil" + BRACKETED_PASTE_END);
+  });
+  it("re-checks enabled and editor state after waitSettled", async () => {
+    let enabled = true;
+    const m = mk({
+      deps: {
+        enabled: () => enabled,
+        waitSettled: async () => {
+          enabled = false;
+        },
+      },
+    });
+    m.ctx.setIdle(false);
+    expect(await deliverInteractive(m.deps, "x", "followUp")).toMatchObject({ ok: false, error: "interactive_unavailable" });
+    expect(m.emitted).toHaveLength(0);
   });
   it("normalizeText ignores CRLF and surrounding whitespace", () => {
     expect(normalizeText("a\r\nb \n")).toBe("a\nb");
@@ -261,12 +278,45 @@ describe("Deliverer", () => {
     await Promise.all([p1, p2]);
     expect(order).toEqual(["start:one", "end:one", "start:two", "end:two"]);
   });
-  it("images are inlined only for api; interactive cites files by path", async () => {
+  it("images are inlined only for api; interactive cites files by path; fallback reuses written files and commands preserve images", async () => {
     const png = Buffer.from("89504e470d0a1a0a", "hex");
     const fetchBlob = vi.fn(async () => ({ status: 200, body: png, headers: {} }));
     const m = mk({ fetchBlob });
     await m.d.handle({ clientMsgId: "i1", text: "look", attachments: [{ blobId: "B1", name: "a.png", mime: "image/png", size: png.length }] });
     expect(m.sent[0].content).toEqual([{ type: "text", text: "look" }, { type: "image", data: png.toString("base64"), mimeType: "image/png" }]);
+    // command with image preserves image block
+    await m.d.handle({ clientMsgId: "i2", text: "/cmd", asCommand: true, attachments: [{ blobId: "B1", name: "a.png", mime: "image/png", size: png.length }] });
+    expect(m.sent[1].content).toEqual([{ type: "text", text: "/cmd" }, { type: "image", data: png.toString("base64"), mimeType: "image/png" }]);
+    // fallback from interactive to api does not write non-image attachment twice
+    const inbox = fs.mkdtempSync(path.join(os.tmpdir(), "rpfall-"));
+    const pdf = Buffer.from("%PDF-1.4");
+    const { pi, sent } = makePi();
+    const dFallback = new Deliverer({
+      pi,
+      ctx: () => makeCtx({ mode: "tui" }),
+      cfg: () => baseConfig("http://x"),
+      herdr: null,
+      gentleMode: () => "auto",
+      fetchBlob: async () => ({ status: 200, body: pdf, headers: {} }),
+      inboxDir: () => inbox,
+      sessionId: () => "s1",
+      interactive: () => ({
+        ctx: () => makeCtx({ mode: "tui" }),
+        enabled: () => true,
+        stdin: () => ({ emit: () => true }),
+        dialogOpen: () => false,
+        waitNoDialog: async () => true,
+        waitSettled: async () => {},
+        expectInput: async () => false,
+        statuses: () => ({}),
+        confirmMs: 10,
+      }),
+      sendAck: () => {},
+      notify: () => {},
+    });
+    await dFallback.handle({ clientMsgId: "f1", text: "read", attachments: [{ blobId: "B2", name: "doc.pdf", mime: "application/pdf", size: pdf.length }] });
+    expect(sent).toHaveLength(1);
+    expect(fs.readdirSync(path.join(inbox, "s1"))).toHaveLength(1);
   });
 });
 

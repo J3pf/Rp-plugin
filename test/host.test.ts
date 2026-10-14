@@ -160,7 +160,11 @@ describe("herdr backend", () => {
     const { b, calls } = mkH({ "herdr workspace close": () => ({}), "herdr pane close": () => ({}) });
     await b.kill({ spawnId: "s", backend: "herdr", herdr: { workspaceId: "w1", paneId: "p1" }, tmuxSession: null, createdAt: 0 });
     await b.kill({ spawnId: "s", backend: "herdr", herdr: { workspaceId: "w1", tabId: "t1", paneId: "p2" }, tmuxSession: null, createdAt: 0 });
-    expect(calls.map((c) => c.args.slice(0, 3).join(" "))).toEqual(["workspace close w1", "pane close p2"]);
+    // split/tab that returned workspaceId without tabId must NOT close workspace when ownsWorkspace is false
+    await b.kill({ spawnId: "s", backend: "herdr", herdr: { workspaceId: "w1", paneId: "p3", ownsWorkspace: false }, tmuxSession: null, createdAt: 0 });
+    // workspace target that also returned tabId MUST close workspace when ownsWorkspace is true
+    await b.kill({ spawnId: "s", backend: "herdr", herdr: { workspaceId: "w2", tabId: "t2", paneId: "p4", ownsWorkspace: true }, tmuxSession: null, createdAt: 0 });
+    expect(calls.map((c) => c.args.slice(0, 3).join(" "))).toEqual(["workspace close w1", "pane close p2", "pane close p3", "workspace close w2"]);
   });
   it("starts the herdr server headless when it is not running", async () => {
     let up = false;
@@ -226,7 +230,7 @@ describe("Windows backends (id travels as --rp-spawn-id because wt/cmd do not pa
     expect(() => wtArgs({ ...req, cwd: "C:\\a;b" })).toThrow(/;/);
   });
   it("cmd /c start arguments", () => {
-    expect(consoleArgs(req)).toEqual(["/c", "start", "api", "/D", "C:\\proyectos\\api", "gentle-shell", "--link", "--rp-spawn-id", "SPAWNID12345"]);
+    expect(consoleArgs(req)).toEqual(["/c", "start", '"api"', "/D", "C:\\proyectos\\api", "gentle-shell", "--link", "--rp-spawn-id", "SPAWNID12345"]);
   });
   it("kill script matches only this spawn id", () => {
     expect(killScript("SPAWNID12345")).toContain("--rp-spawn-id SPAWNID12345*");
@@ -348,7 +352,7 @@ describe("HostConnection protocol", () => {
     expect((await ask("host.kill", { machineId: "MACH1", spawnId: sp.d.spawnId })).t).toBe("error");
     expect((await ask("host.herdr_layout", { machineId: "MACH1" })).t).toBe("error"); // herdr absent
   });
-  it("reconnects and does not reconnect after 4001", async () => {
+  it("reconnects and does not reconnect after 4001 or HTTP 401", async () => {
     relay = await new FakeRelay().start();
     const cfg = normalizeHostConfig({ roots: [tmp()] });
     const manager = new HostManager(cfg, { run: fakeRun({}).run, platform: "linux", storeFile: path.join(tmp(), "s.json") });
@@ -360,6 +364,14 @@ describe("HostConnection protocol", () => {
     relay.closeAll(4001);
     await new Promise((r) => setTimeout(r, 200));
     expect(relay.of("host.hello")).toHaveLength(2);
+    hc.stop();
+    relay.rejectUpgrade = 401;
+    const logs: string[] = [];
+    hc = new HostConnection({ relayUrl: relay.url, machineId: "M", token: "t", cfg, manager, backoff: () => 20, onLog: (m) => logs.push(m) });
+    hc.start();
+    await waitUntil(() => logs.some((l) => l.includes("401")));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(logs.filter((l) => l.includes("401"))).toHaveLength(1);
   });
   it("parseTarget validates herdrTarget", () => {
     expect(parseTarget(undefined)).toBeUndefined();

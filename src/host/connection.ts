@@ -23,6 +23,7 @@ export class HostConnection {
   private stopped = false;
   private attempt = 0;
   private timer: NodeJS.Timeout | null = null;
+  private watchdog: NodeJS.Timeout | null = null;
 
   constructor(private o: HostConnectionOptions) {}
 
@@ -36,7 +37,9 @@ export class HostConnection {
 
   stop(): void {
     this.stopped = true;
+    this.clearWatchdog();
     if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
     try {
       this.ws?.close(1000);
     } catch {
@@ -44,36 +47,78 @@ export class HostConnection {
     }
   }
 
+  /** The relay pings every 25 s; silence beyond 70 s means a dead socket. */
+  private arm(): void {
+    this.clearWatchdog();
+    this.watchdog = setTimeout(() => this.ws?.terminate(), 70_000);
+    this.watchdog.unref?.();
+  }
+
+  private clearWatchdog(): void {
+    if (this.watchdog) clearTimeout(this.watchdog);
+    this.watchdog = null;
+  }
+
+  private scheduleReconnect(code?: number): void {
+    if (this.stopped) return;
+    if (code === CLOSE.INVALID_TOKEN || code === CLOSE.INCOMPATIBLE) {
+      this.log(`relay closed the connection with ${code}; not reconnecting`);
+      this.stopped = true;
+      return;
+    }
+    const delay = code === CLOSE.SERVICE_RESTART ? 0 : (this.o.backoff ?? backoffDelay)(this.attempt++);
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => void this.connect(), delay);
+    this.timer.unref?.();
+  }
+
   private async connect(): Promise<void> {
     if (this.stopped) return;
     const agent = await getProxyAgent();
-    const ws = new WebSocket(toWsUrl(this.o.relayUrl, "/ws/host"), {
-      headers: { Authorization: `Bearer ${this.o.token}` },
-      agent,
-      maxPayload: MAX_FRAME_BYTES,
-      handshakeTimeout: 10_000,
-    });
+    if (this.stopped) return;
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(toWsUrl(this.o.relayUrl, "/ws/host"), {
+        headers: { Authorization: `Bearer ${this.o.token}` },
+        agent,
+        maxPayload: MAX_FRAME_BYTES,
+        handshakeTimeout: 10_000,
+      });
+    } catch (e) {
+      this.log(`ws connect failed: ${errMsg(e)}`);
+      this.scheduleReconnect();
+      return;
+    }
     this.ws = ws;
     ws.on("open", () => {
       this.attempt = 0;
+      this.arm();
       void this.hello();
     });
+    ws.on("ping", () => this.arm());
     ws.on("message", (data) => {
+      this.arm();
       const env = parseEnvelope(data.toString("utf8"));
       if (env) void this.handle(env);
     });
     ws.on("error", () => {});
+    ws.on("unexpected-response", (_req, res) => {
+      res.resume();
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        this.log(`relay rejected auth with http ${res.statusCode}; not reconnecting`);
+        this.stopped = true;
+      }
+      try {
+        ws.terminate();
+      } catch {
+        /* ignore */
+      }
+    });
     ws.on("close", (code) => {
+      this.clearWatchdog();
       if (this.ws !== ws) return;
       this.ws = null;
-      if (this.stopped) return;
-      if (code === CLOSE.INVALID_TOKEN || code === CLOSE.INCOMPATIBLE) {
-        this.log(`relay closed the connection with ${code}; not reconnecting`);
-        this.stopped = true;
-        return;
-      }
-      const delay = code === CLOSE.SERVICE_RESTART ? 0 : (this.o.backoff ?? backoffDelay)(this.attempt++);
-      this.timer = setTimeout(() => void this.connect(), delay);
+      this.scheduleReconnect(code);
     });
   }
 

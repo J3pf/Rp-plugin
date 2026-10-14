@@ -56,12 +56,12 @@ export function summarize(toolName: string, input: any): string {
 }
 
 /** Session allow key: tool name, or "bash:<first token>" for shells so one approved `ls` never allows `rm`.
- * When a command contains chaining or compound operators (;, &&, ||, |, \n), the whole command is keyed.
+ * When a command contains chaining, redirection, or substitution operators (;, &&, ||, |, <, >, `, $, \n), the whole command is keyed.
  */
 export function allowKey(toolName: string, input: any): string {
   if (SHELL_TOOLS.has(toolName) && typeof input?.command === "string") {
     const cmd = input.command.trim();
-    if (/([;&|]|\n)/.test(cmd)) {
+    if (/([;&|<>`$]|\n)/.test(cmd)) {
       return `${toolName}:${cmd}`;
     }
     const first = cmd.split(/\s+/)[0] ?? "";
@@ -85,8 +85,9 @@ export function decide(
   if (cfg.alwaysAllowTools.includes(toolName)) return no;
   const dangerousCmd = SHELL_TOOLS.has(toolName) && typeof input?.command === "string" && patterns.some((r) => r.test(input.command));
   const annotatedDestructive = cfg.useAnnotations && info?.annotations?.destructiveHint === true && info?.annotations?.readOnlyHint !== true;
-  if (dangerousCmd) return { ask: true, danger: "high", summary, key };
-  if (annotatedDestructive) return { ask: true, danger: "high", summary, key };
+  const highDangerKey = SHELL_TOOLS.has(toolName) && typeof input?.command === "string" ? `${toolName}:${input.command.trim()}` : key;
+  if (dangerousCmd) return { ask: true, danger: "high", summary, key: highDangerKey };
+  if (annotatedDestructive) return { ask: true, danger: "high", summary, key: highDangerKey };
   if (mode === "dangerous") return no;
   const readOnly = cfg.useAnnotations && info?.annotations?.readOnlyHint === true;
   if (mode === "writes") {

@@ -61,7 +61,10 @@ describe("Broker.race", () => {
     expect(toLocalValue({ kind: "input", title: "t" }, { text: "hi" })).toBe("hi");
     expect(toLocalValue({ kind: "input", title: "t" }, { cancelled: true })).toBeUndefined();
     const sel: DialogRequest = { kind: "select", title: "t", options: ["a"] };
-    expect(toLocalValue(sel, { text: "custom" })).toBe("custom");
+    expect(toLocalValue({ ...sel, allowFreeText: true }, { text: "custom" })).toBe("custom");
+    expect(toLocalValue(sel, { text: "custom" })).toBeUndefined();
+    expect(toLocalValue({ ...sel, allowFreeText: false }, { text: "custom" })).toBeUndefined();
+    expect(toLocalValue(sel, { text: "a" })).toBe("a");
     expect(toLocalValue(sel, { optionIds: ["7"] })).toBeUndefined();
     expect(fromLocal(sel, "a")).toEqual({ optionIds: ["0"] });
     expect(fromLocal(sel, "zzz")).toEqual({ text: "zzz" });
@@ -98,11 +101,12 @@ describe("Broker.race", () => {
     await expect(p3).resolves.toBe(false);
     vi.useRealTimers();
   });
-  it("prompt.cancel from the relay resolves as cancelled", async () => {
+  it("prompt.cancel from the relay resolves as cancelled without sending prompt.ack", async () => {
     const { broker, of } = mkBroker();
     const p = broker.race({ kind: "confirm", title: "t", message: "m" }, () => new Promise<boolean>(() => {}));
     broker.handleCancel(of("prompt.open")[0].promptId);
     await expect(p).resolves.toBe(false);
+    expect(of("prompt.ack")).toHaveLength(0);
   });
   it("concurrent prompts are independent; openPrompts() feeds agent.hello", async () => {
     const { broker, of } = mkBroker();
@@ -116,12 +120,13 @@ describe("Broker.race", () => {
     broker.handleAnswer(pa.promptId, { cancelled: true });
     await expect(a).resolves.toBeUndefined();
   });
-  it("shutdown cancels open prompts", async () => {
+  it("shutdown cancels open prompts without sending prompt.ack", async () => {
     const { broker, of } = mkBroker();
     const p = broker.race({ kind: "confirm", title: "t", message: "m" }, () => new Promise<boolean>(() => {}));
     broker.shutdown();
     await p;
     expect(of("prompt.resolved")[0]).toMatchObject({ by: "cancelled" });
+    expect(of("prompt.ack")).toHaveLength(0);
   });
   it("withSignal merges the caller's signal", () => {
     const caller = new AbortController();
@@ -367,7 +372,7 @@ describe("mirror", () => {
 });
 
 describe("gate", () => {
-  const cfg = baseConfig("x").gate;
+  const cfg = { ...baseConfig("x").gate, dangerousPatterns: ["\\brm\\s+-[a-z]*r", "\\bsudo\\b", "\\bgit\\s+push\\b.*--force"] };
   const patterns = compilePatterns(cfg.dangerousPatterns);
   it("auto-detect: off with gentle-pi, dangerous without", () => {
     expect(effectiveMode("auto-detect", true)).toBe("off");
@@ -396,6 +401,10 @@ describe("gate", () => {
   it("powershell is treated like bash; keys and summaries", () => {
     expect(decide("dangerous", cfg, patterns, "powershell", { command: "sudo x" }).ask).toBe(true);
     expect(allowKey("bash", { command: "  git push --force" })).toBe("bash:git");
+    expect(allowKey("bash", { command: "echo $(rm -rf /)" })).toBe("bash:echo $(rm -rf /)");
+    expect(allowKey("bash", { command: "echo `id`" })).toBe("bash:echo `id`");
+    expect(allowKey("bash", { command: "echo hi > /etc/passwd" })).toBe("bash:echo hi > /etc/passwd");
+    expect(allowKey("bash", { command: "cat < /etc/shadow" })).toBe("bash:cat < /etc/shadow");
     expect(allowKey("write", { path: "x" })).toBe("write");
     expect(summarize("bash", { command: "ls" })).toBe("ls");
     expect(summarize("write", { path: "/a/b" })).toBe("/a/b");
@@ -431,12 +440,19 @@ describe("gate", () => {
     expect(asked[0].ctx).toMatchObject({ category: "permission", danger: "high", tool: { name: "bash" } });
     expect(asked[0].title).toContain("rm -rf dist");
   });
-  it("Permitir siempre en esta sesión persists and is not asked twice", async () => {
-    const { g, asked, persisted } = mkGate("dangerous", [ALLOW_SESSION]);
-    expect(await g.onToolCall({ toolName: "bash", input: { command: "sudo ls" } })).toBeUndefined();
-    expect(await g.onToolCall({ toolName: "bash", input: { command: "sudo reboot" } })).toBeUndefined();
+  it("Permitir siempre en esta sesión persists and does not let benign prefixes bypass high-danger commands", async () => {
+    const { g, asked, persisted } = mkGate("writes", [ALLOW_SESSION, DENY]);
+    expect(await g.onToolCall({ toolName: "bash", input: { command: "git status" } })).toBeUndefined();
+    expect(await g.onToolCall({ toolName: "bash", input: { command: "git diff" } })).toBeUndefined();
     expect(asked).toHaveLength(1);
-    expect(persisted).toEqual(["bash:sudo"]);
+    expect(persisted).toEqual(["bash:git"]);
+    expect(await g.onToolCall({ toolName: "bash", input: { command: "git push --force" } })).toEqual({ block: true, reason: "Denegado por el usuario" });
+    expect(asked).toHaveLength(2);
+    const dGate = mkGate("dangerous", [ALLOW_SESSION, DENY]);
+    expect(await dGate.g.onToolCall({ toolName: "bash", input: { command: "sudo ls" } })).toBeUndefined();
+    expect(await dGate.g.onToolCall({ toolName: "bash", input: { command: "sudo ls" } })).toBeUndefined();
+    expect(dGate.persisted).toEqual(["bash:sudo ls"]);
+    expect(await dGate.g.onToolCall({ toolName: "bash", input: { command: "sudo reboot" } })).toEqual({ block: true, reason: "Denegado por el usuario" });
   });
   it("Denegar / cancel / Denegar con motivo block", async () => {
     expect(await mkGate("dangerous", [DENY]).g.onToolCall({ toolName: "bash", input: { command: "rm -rf /" } })).toEqual({ block: true, reason: "Denegado por el usuario" });

@@ -54,11 +54,13 @@ export function relayBlobFetcher(relayUrl: string, token: string): FetchBlob {
  */
 export async function resolveAttachments(
   refs: AttachmentRef[],
-  opts: { fetchBlob: FetchBlob; inboxDir: string; sessionId: string; inlineImages: boolean; now?: Date },
+  opts: { fetchBlob: FetchBlob; inboxDir: string; sessionId: string; inlineImages: boolean; now?: Date; writtenFiles?: Map<string, string> },
 ): Promise<ResolvedAttachments> {
   const out: ResolvedAttachments = { images: [], lines: [], failures: [] };
   const dir = path.join(opts.inboxDir, sessionDirName(opts.sessionId));
-  for (const ref of refs) {
+  for (let idx = 0; idx < refs.length; idx++) {
+    const ref = refs[idx]!;
+    const cacheKey = `${idx}:${ref.blobId}:${ref.name}`;
     try {
       const res = await opts.fetchBlob(ref.blobId);
       if (res.status !== 200) throw new Error(`http ${res.status}`);
@@ -71,11 +73,15 @@ export async function resolveAttachments(
         out.images.push({ type: "image", data: buf.toString("base64"), mimeType: ref.mime });
         continue;
       }
-      fs.mkdirSync(dir, { recursive: true });
-      const file = path.join(dir, `${timestampName(opts.now)}-${sanitizeFileName(ref.name)}`);
-      let target = file;
-      for (let i = 1; fs.existsSync(target); i++) target = file.replace(/(\.[^./\\]+)?$/, `-${i}$1`);
-      fs.writeFileSync(target, buf, { mode: 0o600 });
+      let target = opts.writtenFiles?.get(cacheKey);
+      if (!target) {
+        fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(dir, `${timestampName(opts.now)}-${sanitizeFileName(ref.name)}`);
+        target = file;
+        for (let i = 1; fs.existsSync(target); i++) target = file.replace(/(\.[^./\\]+)?$/, `-${i}$1`);
+        fs.writeFileSync(target, buf, { mode: 0o600 });
+        opts.writtenFiles?.set(cacheKey, target);
+      }
       out.lines.push(`[Archivo adjunto desde el móvil: ${target} (${ref.mime}, ${formatSize(buf.length)})]`);
     } catch (e) {
       out.failures.push(`${ref.name}: ${e instanceof Error ? e.message : String(e)}`);

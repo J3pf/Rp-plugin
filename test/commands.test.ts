@@ -85,11 +85,16 @@ describe("doctor helpers", () => {
     const none = await runDoctor(null, normalizeConfig({}), {});
     expect(none[0]).toMatchObject({ level: "fail", label: "Relay no configurado" });
   });
-  it("WebSocket check warns when the relay rejects the upgrade", async () => {
+  it("WebSocket check warns when the relay rejects the upgrade with 503, fails on 401 or invalid URL", async () => {
     relay = await new FakeRelay().start();
     relay.rejectUpgrade = 503;
     const checks = await runDoctor(null, normalizeConfig({ relayUrl: relay.url, machineToken: "t" }), {});
     expect(checks.find((c) => c.label === "WebSocket")!.level).toBe("warn");
+    relay.rejectUpgrade = 401;
+    const checks401 = await runDoctor(null, normalizeConfig({ relayUrl: relay.url, machineToken: "t" }), {});
+    expect(checks401.find((c) => c.label === "WebSocket")!.level).toBe("fail");
+    const badUrl = await runDoctor(null, normalizeConfig({ relayUrl: "not-a-valid-url", machineToken: "t" }), {});
+    expect(badUrl[0]).toMatchObject({ level: "fail", label: "URL del relay inválida" });
   });
   it("formatStatus without a runtime", () => {
     const text = formatStatus({ cfg: normalizeConfig({ relayUrl: "https://r", machineToken: "t", machine: { name: "PC", context: "work" } }), cfgPath: "x", getRuntime: () => undefined, startRuntime() {}, stopRuntime: async () => {} }, undefined);

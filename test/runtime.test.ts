@@ -269,16 +269,16 @@ describe("questions & authorizations", () => {
     await waitUntil(() => relay.of("agent.hello").length === 1);
     t.ctx.ui.mocks.select.mockImplementationOnce(async () => "Permitir siempre en esta sesión");
     await t.fire("tool_call", { toolCallId: "1", toolName: "bash", input: { command: "sudo ls" } }, t.ctx);
-    expect(t.entries).toEqual([{ type: "custom", customType: "rp.allow", data: { key: "bash:sudo" } }]);
-    // second call: not asked
+    expect(t.entries).toEqual([{ type: "custom", customType: "rp.allow", data: { key: "bash:sudo ls" } }]);
+    // second call: same high-danger command is not asked again
     const n = (await waitUntil(() => relay.of("prompt.open").length, 3000, "first prompt.open"));
-    expect(await t.fire("tool_call", { toolCallId: "2", toolName: "bash", input: { command: "sudo whoami" } }, t.ctx)).toBeUndefined();
+    expect(await t.fire("tool_call", { toolCallId: "2", toolName: "bash", input: { command: "sudo ls" } }, t.ctx)).toBeUndefined();
     expect(relay.of("prompt.open")).toHaveLength(n);
     // reload with the entry in the branch
     const ctx2 = makeCtx({ branch: t.entries });
     await t.fire("session_start", { reason: "reload" }, ctx2);
     await waitUntil(() => relay.of("agent.hello").length === 2);
-    expect(await t.fire("tool_call", { toolCallId: "3", toolName: "bash", input: { command: "sudo id" } }, ctx2)).toBeUndefined();
+    expect(await t.fire("tool_call", { toolCallId: "3", toolName: "bash", input: { command: "sudo ls" } }, ctx2)).toBeUndefined();
     expect(relay.of("prompt.open")).toHaveLength(n);
   });
   it("gate is disabled when gentle-pi tools are present (auto-detect), enabled by explicit mode", async () => {

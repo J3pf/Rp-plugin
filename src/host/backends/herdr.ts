@@ -39,6 +39,7 @@ export const TAB_PATHS = ["result.tab.tab_id", "result.tab_id", "result.tab.id",
 export class HerdrBackend implements Backend {
   readonly name = "herdr" as const;
   private serverStarted = false;
+  private serverStarting: Promise<void> | null = null;
   constructor(private d: BackendDeps) {}
 
   private env(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
@@ -59,23 +60,40 @@ export class HerdrBackend implements Backend {
   async ensureServer(): Promise<void> {
     const st = await this.herdr(["status", "server"]);
     if (st.code === 0) return;
+    if (this.serverStarting) return this.serverStarting;
     if (this.serverStarted) throw new HostError("internal", "herdr server is not running");
-    this.serverStarted = true;
-    // supervised background process: detached so it outlives a single request
-    const { spawn } = await import("node:child_process");
-    const child = spawn("herdr", ["server"], { stdio: "ignore", detached: true, windowsHide: true, env: { ...process.env, ...this.env() } });
-    child.on("error", () => {
+    const p = (async () => {
+      // supervised background process: detached so it outlives a single request
+      const { spawn } = await import("node:child_process");
+      const child = spawn("herdr", ["server"], { stdio: "ignore", detached: true, windowsHide: true, env: { ...process.env, ...this.env() } });
+      child.on("error", () => {
+        this.serverStarted = false;
+      });
+      child.on("exit", () => {
+        this.serverStarted = false;
+      });
+      child.unref();
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setTimeout(r, 250));
+        if ((await this.herdr(["status", "server"])).code === 0) {
+          this.serverStarted = true;
+          return;
+        }
+      }
       this.serverStarted = false;
-    });
-    child.on("exit", () => {
-      this.serverStarted = false;
-    });
-    child.unref();
-    for (let i = 0; i < 20; i++) {
-      await new Promise((r) => setTimeout(r, 250));
-      if ((await this.herdr(["status", "server"])).code === 0) return;
+      try {
+        child.kill();
+      } catch {
+        /* ignore */
+      }
+      throw new HostError("internal", "herdr server did not start");
+    })();
+    this.serverStarting = p;
+    try {
+      await p;
+    } finally {
+      this.serverStarting = null;
     }
-    throw new HostError("internal", "herdr server did not start");
   }
 
   async spawn(req: SpawnRequest): Promise<SpawnRecord> {
@@ -98,15 +116,33 @@ export class HerdrBackend implements Backend {
     if (!paneId) throw new HostError("internal", "herdr did not return a pane id");
     const workspaceId = pick(json, WORKSPACE_PATHS) ?? (target.type === "tab" ? target.workspaceId : null);
     const tabId = pick(json, TAB_PATHS);
-    const run = await this.herdr(["pane", "run", paneId, req.launcherCommand]);
-    if (run.code !== 0) throw new HostError("internal", `herdr pane run failed: ${run.stderr.trim() || run.stdout.trim()}`);
-    return { spawnId: req.spawnId, backend: "herdr", herdr: { workspaceId, tabId, paneId }, tmuxSession: null, createdAt: Date.now(), name: req.name };
+    const ownsWorkspace = target.type === "workspace" && !!workspaceId;
+    const cleanupArgs = ownsWorkspace ? ["workspace", "close", workspaceId!] : ["pane", "close", paneId];
+    let run: Awaited<ReturnType<typeof this.herdr>>;
+    try {
+      run = await this.herdr(["pane", "run", paneId, req.launcherCommand]);
+    } catch (e) {
+      await this.herdr(cleanupArgs).catch(() => {});
+      throw e;
+    }
+    if (run.code !== 0) {
+      await this.herdr(cleanupArgs).catch(() => {});
+      throw new HostError("internal", `herdr pane run failed: ${run.stderr.trim() || run.stdout.trim()}`);
+    }
+    return {
+      spawnId: req.spawnId,
+      backend: "herdr",
+      herdr: { workspaceId, tabId, paneId, ownsWorkspace },
+      tmuxSession: null,
+      createdAt: Date.now(),
+      name: req.name,
+    };
   }
 
   async kill(rec: SpawnRecord): Promise<void> {
     if (!rec.herdr) return;
     // a workspace created for one agent is closed whole; tabs/splits close just their pane
-    const ownsWorkspace = !!rec.herdr.workspaceId && !rec.herdr.tabId;
+    const ownsWorkspace = (rec.herdr.ownsWorkspace ?? (!!rec.herdr.workspaceId && !rec.herdr.tabId)) && !!rec.herdr.workspaceId;
     const args = ownsWorkspace ? ["workspace", "close", rec.herdr.workspaceId!] : ["pane", "close", rec.herdr.paneId];
     const r = await this.herdr(args);
     if (r.code !== 0) throw new HostError("internal", `herdr ${args[0]} close failed: ${(r.stderr || r.stdout).trim()}`);

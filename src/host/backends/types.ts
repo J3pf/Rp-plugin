@@ -15,7 +15,7 @@ export interface SpawnRequest {
 export interface SpawnRecord {
   spawnId: string;
   backend: BackendName;
-  herdr: { workspaceId: string | null; tabId?: string | null; paneId: string } | null;
+  herdr: { workspaceId: string | null; tabId?: string | null; paneId: string; ownsWorkspace?: boolean } | null;
   tmuxSession: string | null;
   createdAt: number;
   name?: string;

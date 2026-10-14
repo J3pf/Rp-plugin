@@ -12,6 +12,7 @@ export interface Transport {
   start(): void;
   /** Returns false if the message could not be accepted (transport not open). */
   send(env: Envelope): boolean;
+  drainUnsent?(): Envelope[];
   close(): void;
 }
 
@@ -175,6 +176,7 @@ export class LongPollTransport implements Transport {
   readonly name = "longpoll" as const;
   private closed = false;
   private outbox: Envelope[] = [];
+  private inFlight: Envelope[] = [];
   private flushing = false;
   private ac = new AbortController();
 
@@ -203,6 +205,10 @@ export class LongPollTransport implements Transport {
     });
   }
 
+  drainUnsent(): Envelope[] {
+    return [...this.inFlight.splice(0), ...this.outbox.splice(0)];
+  }
+
   private fail(res: { status: number } | null, err?: unknown): boolean {
     if (this.closed) return true;
     this.closed = true;
@@ -211,7 +217,7 @@ export class LongPollTransport implements Transport {
     if (res?.status === 401 || res?.status === 403) code = CLOSE.INVALID_TOKEN;
     else if (res?.status === 426) code = CLOSE.INCOMPATIBLE;
     else if (res?.status === 409) code = CLOSE.REPLACED;
-    const unsent = this.outbox.splice(0);
+    const unsent = this.drainUnsent();
     this.h.onClose({ code, reason: res ? `http ${res.status}` : errMsg(err), opened: true, unsent });
     return true;
   }
@@ -257,6 +263,7 @@ export class LongPollTransport implements Transport {
     try {
       while (this.outbox.length && !this.closed) {
         const batch = this.outbox.splice(0, 50);
+        this.inFlight = [...batch];
         try {
           const res = await httpRequest(this.base + "/v1/agent/send", {
             method: "POST",
@@ -266,17 +273,23 @@ export class LongPollTransport implements Transport {
             signal: this.ac.signal,
           });
           if (res.status >= 400) {
-            this.outbox.unshift(...batch);
-            this.fail(res);
+            if (!this.closed) {
+              this.outbox.unshift(...this.inFlight.splice(0));
+              this.fail(res);
+            }
             return;
           }
+          this.inFlight = [];
         } catch (e) {
-          this.outbox.unshift(...batch);
-          this.fail(null, e);
+          if (!this.closed) {
+            this.outbox.unshift(...this.inFlight.splice(0));
+            this.fail(null, e);
+          }
           return;
         }
       }
     } finally {
+      this.inFlight = [];
       this.flushing = false;
     }
   }
@@ -424,9 +437,16 @@ export class Connection {
     this.o.onMessage(env);
   }
 
+  private rescueUnsent(unsent: Envelope[]): void {
+    for (let i = unsent.length - 1; i >= 0; i--) {
+      const e = unsent[i]!;
+      if (CRITICAL_TYPES.has(e.t) && e.t !== "agent.hello") this.enqueue(e, true, true);
+    }
+  }
+
   private onTransportClosed(info: { code: number; reason: string; opened: boolean; unsent: Envelope[] }, probe: boolean, wasWelcomed = false): void {
-    // keep critical messages that never made it out
-    for (const e of info.unsent) if (CRITICAL_TYPES.has(e.t) && e.t !== "agent.hello") this.enqueue(e, true, true);
+    // keep critical messages that never made it out (in original FIFO order)
+    this.rescueUnsent(info.unsent);
     if (this.stopped) return;
     const { code } = info;
     if (code === CLOSE.INVALID_TOKEN || code === CLOSE.INCOMPATIBLE || code === CLOSE.REPLACED) {
@@ -467,6 +487,7 @@ export class Connection {
       if (this.stopped || this.transportName !== "longpoll") return;
       this.forceLongPoll = false;
       this.probingWs = true;
+      if (this.t?.drainUnsent) this.rescueUnsent(this.t.drainUnsent());
       this.t?.close();
       this.t = null;
       this.welcomed = false;

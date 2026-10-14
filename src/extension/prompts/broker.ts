@@ -33,6 +33,8 @@ export interface OpenPrompt {
   closed: boolean;
   /** A phone answer was already accepted for this prompt. */
   answered: boolean;
+  /** Cancelled by relay prompt.cancel or local shutdown (not a phone answer, so no prompt.ack). */
+  cancelledBySystem?: boolean;
   remoteAnswer: Promise<Answer>;
   resolveRemote: (a: Answer) => void;
   openedAt: number;
@@ -177,6 +179,7 @@ export class Broker {
     const p = this.prompts.get(promptId);
     if (p && !p.answered) {
       p.answered = true;
+      p.cancelledBySystem = true;
       p.resolveRemote({ cancelled: true });
     }
   }
@@ -222,7 +225,7 @@ export class Broker {
 
     if (w.src === "remote") {
       ac.abort();
-      this.ack(p.id, true);
+      if (!p.cancelledBySystem) this.ack(p.id, true);
       this.close(p);
       return toLocalValue(req, w.a) as T;
     }
@@ -250,6 +253,8 @@ export class Broker {
   shutdown(): void {
     for (const p of [...this.prompts.values()]) {
       this.resolved(p, "cancelled", null);
+      p.answered = true;
+      p.cancelledBySystem = true;
       p.resolveRemote({ cancelled: true });
       this.close(p);
     }
@@ -269,7 +274,9 @@ export function toLocalValue(req: DialogRequest, a: Answer): unknown {
       const idx = Number(any.optionIds[0]);
       return Number.isInteger(idx) && idx >= 0 && idx < req.options.length ? req.options[idx] : undefined;
     }
-    if (typeof any.text === "string") return any.text;
+    if (typeof any.text === "string") {
+      return req.allowFreeText || req.options.includes(any.text) ? any.text : undefined;
+    }
     return undefined;
   }
   if (req.kind === "confirm") {

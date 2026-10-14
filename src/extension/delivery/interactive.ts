@@ -56,22 +56,35 @@ export function editorAcceptsText(ctx: ExtensionContext, statuses: Record<string
 
 export async function deliverInteractive(d: InteractiveDeps, text: string, mode: "steer" | "followUp" | "auto"): Promise<InteractiveOutcome> {
   const fail = (reason: string): InteractiveOutcome => ({ ok: false, error: "interactive_unavailable", reason });
-  if (!d.enabled()) return fail("interactive delivery disabled");
-  const ctx = d.ctx();
-  if (ctx.mode !== "tui") return fail(`mode ${ctx.mode} has no terminal UI`);
-  const stdin = d.stdin();
-  if (!stdin) return fail("stdin unavailable");
-
   let afterDialog = false;
-  if (d.dialogOpen()) {
-    afterDialog = true;
-    if (!(await d.waitNoDialog(d.maxDialogWaitMs ?? 10 * 60_000))) return fail("a dialog stayed open");
-  }
-  const safe = editorAcceptsText(ctx, d.statuses());
-  if (!safe.ok) return fail(safe.reason ?? "editor not ready");
+  const checkReady = async (): Promise<
+    { ok: true; ctx: ExtensionContext; stdin: { emit(event: string, ...args: any[]): boolean } } | { ok: false; outcome: InteractiveOutcome }
+  > => {
+    if (!d.enabled()) return { ok: false, outcome: fail("interactive delivery disabled") };
+    const ctx = d.ctx();
+    if (ctx.mode !== "tui") return { ok: false, outcome: fail(`mode ${ctx.mode} has no terminal UI`) };
+    const stdin = d.stdin();
+    if (!stdin) return { ok: false, outcome: fail("stdin unavailable") };
+    if (d.dialogOpen()) {
+      afterDialog = true;
+      if (!(await d.waitNoDialog(d.maxDialogWaitMs ?? 10 * 60_000))) return { ok: false, outcome: fail("a dialog stayed open") };
+      if (!d.enabled()) return { ok: false, outcome: fail("interactive delivery disabled") };
+    }
+    const safe = editorAcceptsText(ctx, d.statuses());
+    if (!safe.ok) return { ok: false, outcome: fail(safe.reason ?? "editor not ready") };
+    return { ok: true, ctx, stdin };
+  };
+
+  let ready = await checkReady();
+  if (!ready.ok) return ready.outcome;
 
   // follow-up while working: wait for the agent to settle (the follow-up key is configurable); steer: Enter while working = steer
-  if (!ctx.isIdle() && mode !== "steer") await d.waitSettled();
+  if (!ready.ctx.isIdle() && mode !== "steer") {
+    await d.waitSettled();
+    ready = await checkReady();
+    if (!ready.ok) return ready.outcome;
+  }
+  const { ctx, stdin } = ready;
 
   let draft = "";
   try {
@@ -88,8 +101,9 @@ export async function deliverInteractive(d: InteractiveDeps, text: string, mode:
     }
   };
 
-  const confirmed = d.expectInput(text, d.confirmMs ?? CONFIRM_TIMEOUT_MS);
-  stdin.emit("data", BRACKETED_PASTE_START + text + BRACKETED_PASTE_END);
+  const safeText = text.replace(/\x1b\[[0-9;]*[a-zA-Z~]/g, "").replace(/\x1b/g, "");
+  const confirmed = d.expectInput(safeText, d.confirmMs ?? CONFIRM_TIMEOUT_MS);
+  stdin.emit("data", BRACKETED_PASTE_START + safeText + BRACKETED_PASTE_END);
   stdin.emit("data", "\r");
   if (await confirmed) {
     restore();

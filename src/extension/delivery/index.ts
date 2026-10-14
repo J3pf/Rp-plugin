@@ -120,6 +120,7 @@ export class Deliverer {
 
     let resolvedTextNonInline: string | null = null;
     let resolvedApi: { text: string; images: Array<{ type: "image"; data: string; mimeType: string }> } | null = null;
+    const writtenFiles = new Map<string, string>();
 
     for (const method of chain) {
       const inline = method === "api";
@@ -133,6 +134,7 @@ export class Deliverer {
               inboxDir: this.d.inboxDir(),
               sessionId: this.d.sessionId(),
               inlineImages: true,
+              writtenFiles,
             });
             resolvedApi = {
               text: r.lines.length ? (text ? `${text}\n\n${r.lines.join("\n")}` : r.lines.join("\n")) : text,
@@ -148,6 +150,7 @@ export class Deliverer {
               inboxDir: this.d.inboxDir(),
               sessionId: this.d.sessionId(),
               inlineImages: false,
+              writtenFiles,
             });
             resolvedTextNonInline = r.lines.length ? (text ? `${text}\n\n${r.lines.join("\n")}` : r.lines.join("\n")) : text;
           }
