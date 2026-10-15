@@ -15,7 +15,7 @@ Branch: `feat/piquota-host-collection` | Status: completed
 - T2 (S2) [inline] Quota collector implementation in src/host/quota.ts and unit tests in test/host-quota.test.ts: done (8c1efb8)
 - T3 (S4) [inline] Connect quota collector to HostManager and HostConnection (host.hello + host.quotas): done (79acf83)
 - T4 (S5) [inline] Wire contract validation and integration tests in test/host.test.ts and test/contract.test.ts: done (0ae33bb)
-- T5 (S6) [inline] Documentation, build, package version bump to 0.1.4 and verification: done
+- T5 (S6) [inline] Documentation, build, package version bump to 0.1.4 and verification: done (8746513)
 
 ## Log
 - L1: "En Rp-app ya completamos y liberamos (v0.1.9) la visualización y persistencia de las cuotas. Para completar el flujo end-to-end hacia el usuario, es momento de que implementes en `rp-host` la recolección periódica de `piquota --json`, mapees la salida al array `MachineQuota[]` acordado y la envíes a `rp-relay` en el `host.hello` y/o mensaje de actualización. Por favor procede con la implementación en tu repositorio, ejecuta sus pruebas y genera su release correspondiente cuando esté listo."
