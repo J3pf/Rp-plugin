@@ -65,6 +65,47 @@ export type Disposition =
   | "rejected";
 export type DeliveryError = null | "agent_blocked" | "herdr_unavailable" | "interactive_unavailable";
 
+export type TodoStatus = "pending" | "in_progress" | "blocked" | "done" | "dropped";
+
+export interface TodoTask {
+  id: number;
+  title: string;
+  status: TodoStatus;
+  note?: string;
+}
+
+export interface TodoUpdateEvent {
+  type: "todo_update";
+  tasks: TodoTask[];
+}
+
+export interface SubagentToolCall {
+  toolCallId: string;
+  name: string;
+  status: string;
+  durationMs?: number;
+}
+
+export interface SubagentUpdateEvent {
+  type: "subagent_update";
+  taskId: string;
+  agent: string;
+  label: string;
+  status: string;
+  model?: string;
+  thinking?: string;
+  startedAt?: number;
+  endedAt?: number;
+  durationMs?: number;
+  turns?: number;
+  toolCalls?: number;
+  tokens?: number;
+  cost?: number;
+  error?: string;
+  result?: string;
+  tools?: SubagentToolCall[];
+}
+
 export interface PromptOption {
   id: string;
   label: string;
@@ -137,6 +178,8 @@ export interface AgentHelloBody {
   thinking: string | null;
   status: AgentStatus;
   openPrompts: unknown[];
+  todos?: { tasks: TodoTask[] } | null;
+  subagents?: SubagentUpdateEvent[];
 }
 
 export interface WelcomeBody {

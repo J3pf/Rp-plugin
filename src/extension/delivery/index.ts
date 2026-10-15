@@ -93,7 +93,7 @@ export class Deliverer {
       return;
     }
     const cfg = this.d.cfg();
-    const asCommand = !!msg.asCommand;
+    const asCommand = !!msg.asCommand || textTrimmed.startsWith("/");
     const mode = this.d.gentleMode();
     // Until gentle-pi publishes its mode (first turn) assume it could be AUTO: typing is correct in every mode.
     const gentleAuto = mode === "auto" || (!!this.d.gentlePresent?.() && (mode === null || mode === "unknown"));
@@ -106,7 +106,7 @@ export class Deliverer {
     });
 
     let lastError: DeliveryError = null;
-    const blobCache = new Map<string, Promise<{ status: number; body: Buffer; headers: Record<string, any> }>>();
+    const blobCache = new Map<string, Promise<{ status: number; body: Buffer; headers: Record<string, unknown> }>>();
     const cachedFetchBlob: FetchBlob | null = this.d.fetchBlob
       ? (id) => {
           let p = blobCache.get(id);
