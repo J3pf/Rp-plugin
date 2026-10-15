@@ -29,6 +29,28 @@ const promptKind = oneOf("confirm", "select", "input", "questionnaire");
 const category = oneOf("permission", "question", "dialog");
 const danger = oneOf("low", "medium", "high");
 
+export const isQuotaWindow = (w: unknown) =>
+  isObj(w) &&
+  isStr(w.id) &&
+  nullable((v) => typeof v === "string")(w.label) &&
+  isNum(w.usedPercent) &&
+  isNum(w.remainingPercent) &&
+  nullable((v) => typeof v === "string")(w.resetsAt) &&
+  nullable((v) => typeof v === "number")(w.resetsInSec) &&
+  nullable((v) => typeof v === "string")(w.note);
+
+export const isMachineQuota = (q: unknown) =>
+  isObj(q) &&
+  isStr(q.family) &&
+  isStr(q.label) &&
+  nullable((v) => typeof v === "string")(q.plan) &&
+  isBool(q.ok) &&
+  nullable((v) => typeof v === "string")(q.error) &&
+  nullable((v) => typeof v === "string")(q.primaryWindowId) &&
+  Array.isArray(q.windows) &&
+  q.windows.every(isQuotaWindow) &&
+  nullable((v) => typeof v === "string")(q.updatedAt);
+
 export const promptOpenShape: Shape = {
   promptId: isStr,
   agentId: (v) => isStr(v) && String(v).includes(":"),
@@ -118,8 +140,18 @@ export const validators: Record<string, (d: any) => string[]> = {
         defaultBackend: nullable(oneOf("herdr", "tmux", "wt", "console")),
         launchers: arrayOf(isStr),
         defaultLauncher: isStr,
+        quotas: arrayOf(isMachineQuota),
       },
       "host.hello",
+      ["quotas", "defaultBackend"],
+    ),
+  "host.quotas": (d) =>
+    check(
+      d,
+      {
+        quotas: arrayOf(isMachineQuota),
+      },
+      "host.quotas",
     ),
   "host.dirs": (d) => check(d, { path: (v) => typeof v === "string", dirs: arrayOf(isStr) }, "host.dirs"),
   "host.spawned": (d) =>

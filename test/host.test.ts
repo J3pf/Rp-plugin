@@ -13,6 +13,7 @@ import { launchdPlist, schtasksCreateArgs, systemdUnit, installService, uninstal
 import type { Runner } from "../src/host/runner.ts";
 import { FakeRelay, waitUntil } from "./helpers.ts";
 import { envelope } from "../src/shared/protocol.ts";
+import { validateEnvelope } from "./contract.ts";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "rphost-"));
 
@@ -388,6 +389,70 @@ describe("HostConnection protocol", () => {
     expect(parseTarget({ type: "split", paneId: "p" })).toMatchObject({ direction: "right" });
     expect(() => parseTarget({ type: "tab" })).toThrow();
     expect(() => parseTarget({ type: "weird" })).toThrow();
+  });
+  it("includes quotas in host.hello and emits host.quotas on poll", async () => {
+    relay = await new FakeRelay().start();
+    const sampleOutput = {
+      engine: "pi-quota",
+      schemaVersion: 1,
+      readOnly: true,
+      generatedAt: "2026-10-15T05:43:14.794Z",
+      providers: [
+        {
+          family: "antigravity",
+          label: "Antigravity (Pi)",
+          plan: null,
+          windows: [
+            {
+              id: "gemini-5h",
+              label: "Gemini · 5h",
+              usedPercent: 10,
+              remainingPercent: 90,
+              resetsAt: "2026-10-15T15:00:00.000Z",
+              resetsInSec: 3600,
+              note: null,
+            },
+          ],
+          error: null,
+          ok: true,
+          updatedAt: "2026-10-15T05:43:14.794Z",
+          primaryWindowId: "gemini-5h",
+        },
+      ],
+    };
+    const cfg = normalizeHostConfig({ roots: [tmp()], quotaEnabled: true, quotaIntervalSec: 60 });
+    const f = fakeRun({
+      "piquota --json": () => ({ stdout: JSON.stringify(sampleOutput) }),
+    });
+    const manager = new HostManager(cfg, { run: f.run, platform: "linux", storeFile: path.join(tmp(), "s.json") });
+    hc = new HostConnection({ relayUrl: relay.url, machineId: "MACH-Q", token: "tok", cfg, manager, backoff: () => 20 });
+    hc.start();
+
+    const hello = await waitUntil(() => relay.of("host.hello")[0]);
+    expect(hello.d.quotas).toBeDefined();
+    expect(hello.d.quotas).toHaveLength(1);
+    expect(hello.d.quotas[0].family).toBe("antigravity");
+    expect(validateEnvelope(hello)).toEqual([]);
+
+    await hc.pollQuotas();
+    const quotasEnv = await waitUntil(() => relay.of("host.quotas")[0]);
+    expect(quotasEnv.d.quotas).toHaveLength(1);
+    expect(quotasEnv.d.quotas[0].family).toBe("antigravity");
+    expect(validateEnvelope(quotasEnv)).toEqual([]);
+  });
+  it("omits quotas when quotaEnabled is false", async () => {
+    relay = await new FakeRelay().start();
+    const cfg = normalizeHostConfig({ roots: [tmp()], quotaEnabled: false });
+    const f = fakeRun({
+      "piquota --json": () => ({ stdout: "{}" }),
+    });
+    const manager = new HostManager(cfg, { run: f.run, platform: "linux", storeFile: path.join(tmp(), "s.json") });
+    hc = new HostConnection({ relayUrl: relay.url, machineId: "MACH-NO-Q", token: "tok", cfg, manager, backoff: () => 20 });
+    hc.start();
+
+    const hello = await waitUntil(() => relay.of("host.hello")[0]);
+    expect(hello.d.quotas).toBeUndefined();
+    expect(validateEnvelope(hello)).toEqual([]);
   });
 });
 

@@ -167,7 +167,7 @@ export class HostConnection {
       hostname: os.hostname(),
       roots: this.o.cfg.roots,
       backends: { herdr: rep.herdr, tmux: rep.tmux, wt: rep.wt, console: rep.console },
-      defaultBackend: def ?? undefined,
+      defaultBackend: def,
       launchers: Object.keys(this.o.cfg.launchers),
       defaultLauncher: this.o.cfg.defaultLauncher,
     };

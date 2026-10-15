@@ -177,7 +177,7 @@ export interface HostHelloBody {
     wt?: boolean;
     console?: boolean;
   };
-  defaultBackend?: string;
+  defaultBackend?: string | null;
   launchers: string[];
   defaultLauncher?: string;
   quotas?: MachineQuota[];
