@@ -48,6 +48,7 @@ Una vez instalado, abre Pi (`pi` o `gentle-shell`) y ejecuta:
 | Adjuntos (imágenes inline, resto en el inbox con ruta citada) | `attachments.ts` |
 | Comandos `/rp pair|status|doctor|on|off|gate|test|unpair` | `commands.ts` |
 | `rp-host`: crear agentes desde el móvil (herdr workspace/pestaña/panel, tmux, Windows Terminal, consola) + servicio | `src/host/` |
+| `rp-host`: recolección periódica de cuotas de IA (`piquota --json`) y reporte a `rp-relay` | `src/host/quota.ts` |
 
 Documentos: [INSTALACION](docs/INSTALACION.md) (instalación y troubleshooting) · [PLAN-PLUGIN](docs/PLAN-PLUGIN.md) (plan + estado de implementación) · [RESILIENCIA](docs/RESILIENCIA.md) ·
 [COMPATIBILIDAD](docs/COMPATIBILIDAD.md) · [ARQUITECTURA](docs/ARQUITECTURA.md) · [QA manual](docs/QA.md) ·
@@ -71,7 +72,7 @@ Documentos: [INSTALACION](docs/INSTALACION.md) (instalación y troubleshooting) 
 }
 ```
 Variables: `RP_RELAY_URL`, `RP_DISABLED=1`, `RP_CONFIG`, `RP_DEBUG=1`; flags de Pi `--rp-off` y `--rp-spawn-id`.
-`rp-host` usa `host.json` (mismo directorio): `roots`, `backend`, `launchers`, `defaultLauncher`, `herdrSession`.
+`rp-host` usa `host.json` (mismo directorio): `roots`, `backend`, `launchers`, `defaultLauncher`, `herdrSession`, `quotaEnabled`, `quotaCommand`, `quotaIntervalSec`.
 
 ```bash
 rp-host init && rp-host install     # systemd --user (Linux) / tarea ONLOGON (Windows) / launchd (macOS)
