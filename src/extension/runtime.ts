@@ -2,7 +2,8 @@
 import os from "node:os";
 import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { newId, type AgentHelloBody, type AgentStatus, type Envelope, type WelcomeBody } from "../shared/protocol.ts";
+import { newId, type AgentHelloBody, type AgentStatus, type Envelope, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
+import { parseTodoTasks, replayTodoBranch } from "./todos.ts";
 import { errMsg, preview } from "../shared/util.ts";
 import type { RpConfig } from "./config.ts";
 import { resolveInboxDir } from "./config.ts";
@@ -24,6 +25,7 @@ import { normalizeText, type InteractiveDeps } from "./delivery/interactive.ts";
 import { relayBlobFetcher } from "./attachments.ts";
 import { routeInbound, pendingAnswers } from "./inbound.ts";
 import { pluginVersion } from "./version.ts";
+import { SubagentTracker } from "./subagents.ts";
 
 interface Waiter<T> {
   resolve: (v: T) => void;
@@ -65,11 +67,13 @@ export class Runtime {
   readonly adapters: AdapterRegistry;
   readonly deliverer: Deliverer;
   readonly forwarder: Forwarder;
+  readonly subagents: SubagentTracker;
   readonly allowed: Set<string>;
 
   mirror: MirrorResult = { uninstall: () => {}, installed: false, dialogs: false };
   askUserRegistered = false;
   fatal: { code: number; reason: string } | null = null;
+  currentTodos: TodoTask[] = [];
 
   private seq = 0;
   private disposed = false;
@@ -103,6 +107,7 @@ export class Runtime {
     this.sessionId = ctx.sessionManager.getSessionId();
     this.agentId = `${cfg.machineId}:${this.sessionId}`;
     this.allowed = allowedFromBranch(this.safeBranch());
+    this.currentTodos = replayTodoBranch(this.safeBranch());
     this.herdrBlocker = new HerdrBlocker(pi.events as any, !!env.herdr);
     this.detectTheme = opts.detectTheme ?? (() => detectActiveTheme());
 
@@ -120,6 +125,10 @@ export class Runtime {
       onChange: () => this.updateWaiting(),
     });
     this.adapters = new AdapterRegistry(this.broker);
+    // SAFETY: SubagentUpdateEvent is a structured object payload conforming to agent.event wire shape.
+    this.subagents = new SubagentTracker({
+      emit: (event) => this.emitEvent(event as unknown as Record<string, unknown>),
+    });
 
     this.forwarder = new Forwarder({
       redact: cfg.redactContent,
@@ -131,7 +140,20 @@ export class Runtime {
         const w = this.settledWaiters.splice(0);
         for (const x of w) x.resolve();
       },
-      onToolStart: (name, args) => this.statuses.working(`${name}${this.cfg.redactContent ? "" : toolDetail(name, args)}`),
+      onToolStart: (name, args, toolCallId, parentToolCallId) => {
+        this.statuses.working(`${name}${this.cfg.redactContent ? "" : toolDetail(name, args)}`);
+        this.subagents.onToolStart(name, args, toolCallId, parentToolCallId);
+      },
+      onToolEnd: (name, result, isError, toolCallId, durationMs, parentToolCallId) => {
+        if (name === "todo" && !isError) {
+          const tasks = parseTodoTasks(result?.details ?? result);
+          if (tasks) {
+            this.currentTodos = tasks;
+            this.emitEvent({ type: "todo_update", tasks });
+          }
+        }
+        this.subagents.onToolEnd(name, result, isError, toolCallId, durationMs, parentToolCallId);
+      },
     });
 
     this.gate = new Gate({
@@ -396,6 +418,8 @@ export class Runtime {
       thinking: this.thinking,
       status: this.statuses.current as AgentStatus,
       openPrompts: this.broker.openPrompts(),
+      todos: this.currentTodos.length > 0 ? { tasks: this.currentTodos } : null,
+      subagents: this.subagents.getSnapshot().length > 0 ? this.subagents.getSnapshot() : undefined,
     };
   }
 

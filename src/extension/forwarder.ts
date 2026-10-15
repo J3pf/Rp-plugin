@@ -75,7 +75,8 @@ export interface ForwarderDeps {
   send: (e: Record<string, unknown>) => void;
   redact: boolean;
   /** Notified for status derivation (not part of the wire). */
-  onToolStart?: (toolName: string, args: any) => void;
+  onToolStart?: (toolName: string, args: any, toolCallId?: string, parentToolCallId?: string) => void;
+  onToolEnd?: (toolName: string, result: any, isError: boolean, toolCallId?: string, durationMs?: number, parentToolCallId?: string) => void;
   onAgentStart?: () => void;
   onAgentSettled?: () => void;
   timers?: { set: typeof setTimeout; clear: typeof clearTimeout };
@@ -92,7 +93,7 @@ export class Forwarder {
   private deltas = new Map<string, DeltaBuf>();
   private deltaTimer: NodeJS.Timeout | null = null;
   private lastUpdateAt = new Map<string, number>();
-  private pendingUpdate = new Map<string, { ev: any; timer: NodeJS.Timeout }>();
+  private pendingUpdate = new Map<string, { ev: any; timer: NodeJS.Timeout | null }>();
   private disposed = false;
   private set: typeof setTimeout;
   private clear: typeof clearTimeout;
@@ -131,7 +132,7 @@ export class Forwarder {
         this.flushDeltas();
         return this.d.send({ type: "message_end", message: normalizeMessage(ev?.message) });
       case "tool_execution_start":
-        this.d.onToolStart?.(ev?.toolName, ev?.args);
+        this.d.onToolStart?.(ev?.toolName, ev?.args, ev?.toolCallId, ev?.parentToolCallId);
         return this.d.send({
           type: "tool_execution_start",
           toolCallId: ev?.toolCallId,
@@ -212,7 +213,7 @@ export class Forwarder {
       pending.ev = ev;
       return;
     }
-    const entry = { ev, timer: null as unknown as NodeJS.Timeout };
+    const entry: { ev: any; timer: NodeJS.Timeout | null } = { ev, timer: null };
     entry.timer = this.set(() => {
       this.pendingUpdate.delete(id);
       if (!this.disposed) this.emitUpdate(entry.ev);
@@ -224,11 +225,12 @@ export class Forwarder {
   private onToolEnd(ev: any): void {
     const id = ev?.toolCallId as string;
     const p = this.pendingUpdate.get(id);
-    if (p) {
+    if (p?.timer) {
       this.clear(p.timer);
       this.pendingUpdate.delete(id);
     }
     this.lastUpdateAt.delete(id);
+    this.d.onToolEnd?.(ev?.toolName, ev?.result, !!ev?.isError, id, ev?.durationMs, ev?.parentToolCallId);
     const base = {
       type: "tool_execution_end",
       toolCallId: id,
@@ -245,7 +247,7 @@ export class Forwarder {
   dispose(): void {
     this.flushDeltas();
     this.disposed = true;
-    for (const p of this.pendingUpdate.values()) this.clear(p.timer);
+    for (const p of this.pendingUpdate.values()) if (p.timer) this.clear(p.timer);
     this.pendingUpdate.clear();
   }
 }

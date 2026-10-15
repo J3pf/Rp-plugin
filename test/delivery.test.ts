@@ -47,6 +47,9 @@ describe("deliverApi", () => {
     expect(sent[4]).toEqual({ content: "/gentle:mode normal", opts: { expandPromptTemplates: true } });
     deliverApi(pi, { text: "/x", images: [], delivery: "auto", asCommand: true, idle: false });
     expect(sent[5].opts).toEqual({ deliverAs: "followUp", expandPromptTemplates: true });
+    // auto-detect slash commands even without asCommand: true
+    expect(deliverApi(pi, { text: "/sdd-status", images: [], delivery: "auto", asCommand: false, idle: true })).toEqual({ disposition: "command" });
+    expect(sent[6]).toEqual({ content: "/sdd-status", opts: { expandPromptTemplates: true } });
   });
 });
 
@@ -251,6 +254,12 @@ describe("Deliverer", () => {
     const m = mk({ gentle: "auto" });
     await m.d.handle({ clientMsgId: "k1", text: "/gentle:mode normal", asCommand: true });
     expect(m.sent[0]).toEqual({ content: "/gentle:mode normal", opts: { expandPromptTemplates: true } });
+    expect(m.acks[0]).toMatchObject({ disposition: "command", method: "api" });
+  });
+  it("slash command auto-detected without asCommand flag", async () => {
+    const m = mk({ gentle: "auto" });
+    await m.d.handle({ clientMsgId: "k2", text: "/sdd-status" });
+    expect(m.sent[0]).toEqual({ content: "/sdd-status", opts: { expandPromptTemplates: true } });
     expect(m.acks[0]).toMatchObject({ disposition: "command", method: "api" });
   });
   it("intercepts /quit or /exit and calls ctx.shutdown()", async () => {
