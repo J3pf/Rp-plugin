@@ -42,7 +42,7 @@ Una vez instalado, abre Pi (`pi` o `gentle-shell`) y ejecuta:
 | Conexión WS (con proxy) + respaldo HTTP long-poll, reconexión, cola acotada | `src/extension/connection.ts` |
 | Eventos de Pi → `agent.event` (coalescidos, truncados, `redactContent`) y snapshot | `forwarder.ts`, `snapshot.ts`, `status.ts` |
 | Espejo de diálogos (`select/confirm/input`) + carrera terminal ⇄ móvil | `prompts/mirror.ts`, `prompts/broker.ts` |
-| Adaptadores de `ask_user_choice` / `ask_user_question` de gentle-pi (`custom()`) | `prompts/adapters/` |
+| Adaptadores de `ask_user` (@eko24ive/pi-ask) y `ask_user_choice` / `ask_user_question` (gentle-pi) (`custom()`) | `prompts/adapters/` |
 | Autorizaciones propias (si no hay gentle-pi) y herramienta `rp_ask_user` condicional | `prompts/gate.ts`, `prompts/askUser.ts` |
 | Mensajes del móvil: `api`, **`interactive`** (teclea en la TUI → autoriza en modo Auto), `herdr`, comandos | `delivery/` |
 | Adjuntos (imágenes inline, resto en el inbox con ruta citada) | `attachments.ts` |
