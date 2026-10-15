@@ -39,7 +39,14 @@ describe("host config", () => {
     const d = normalizeHostConfig(null);
     expect(d.launchers).toEqual(DEFAULT_HOST_CONFIG.launchers);
     expect(d.backend).toBe("auto");
+    expect(d.quotaEnabled).toBe(true);
+    expect(d.quotaCommand).toBe("piquota --json");
+    expect(d.quotaIntervalSec).toBe(300);
     expect(normalizeHostConfig({ backend: "zzz" }).backend).toBe("auto");
+    const customQuota = normalizeHostConfig({ quotaEnabled: false, quotaCommand: "custom-quota", quotaIntervalSec: 60 });
+    expect(customQuota.quotaEnabled).toBe(false);
+    expect(customQuota.quotaCommand).toBe("custom-quota");
+    expect(customQuota.quotaIntervalSec).toBe(60);
   });
   it("writeDefaultHostConfig creates a 0600 file", () => {
     const p = path.join(tmp(), "x", "host.json");

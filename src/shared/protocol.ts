@@ -145,6 +145,48 @@ export interface WelcomeBody {
   pendingAnswers?: Array<{ promptId: string; answer: Answer; deviceId?: string }>;
 }
 
+export interface QuotaWindow {
+  id: string;
+  label: string | null;
+  usedPercent: number;
+  remainingPercent: number;
+  resetsAt: string | null;
+  resetsInSec: number | null;
+  note: string | null;
+}
+
+export interface MachineQuota {
+  family: string;
+  label: string;
+  plan: string | null;
+  ok: boolean;
+  notConfigured?: boolean;
+  error: string | null;
+  primaryWindowId: string | null;
+  windows: QuotaWindow[];
+  updatedAt: string | null;
+}
+
+export interface HostHelloBody {
+  machineId: string;
+  hostname: string;
+  roots: string[];
+  backends: {
+    herdr: string | null;
+    tmux: string | null;
+    wt?: boolean;
+    console?: boolean;
+  };
+  defaultBackend?: string;
+  launchers: string[];
+  defaultLauncher?: string;
+  quotas?: MachineQuota[];
+}
+
+export interface HostQuotasBody {
+  quotas: MachineQuota[];
+}
+
 /** Message types the plugin sends that must never be dropped from the outbound queue. */
 export const CRITICAL_TYPES = new Set([
   "agent.hello",

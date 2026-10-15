@@ -11,6 +11,9 @@ export interface HostConfig {
   launchers: Record<string, string>;
   defaultLauncher: string;
   herdrSession: string | null;
+  quotaEnabled: boolean;
+  quotaCommand: string;
+  quotaIntervalSec: number;
 }
 
 export const DEFAULT_HOST_CONFIG: HostConfig = {
@@ -19,6 +22,9 @@ export const DEFAULT_HOST_CONFIG: HostConfig = {
   launchers: { "gentle-shell": "gentle-shell", pi: "pi" },
   defaultLauncher: "gentle-shell",
   herdrSession: null,
+  quotaEnabled: true,
+  quotaCommand: "piquota --json",
+  quotaIntervalSec: 300,
 };
 
 const BACKENDS: BackendSetting[] = ["auto", "herdr", "tmux", "wt", "console"];
@@ -32,12 +38,18 @@ export function normalizeHostConfig(raw: any, home?: string): HostConfig {
   if (!Object.keys(launchers).length) Object.assign(launchers, d.launchers);
   const defaultLauncher = typeof r.defaultLauncher === "string" && launchers[r.defaultLauncher] ? r.defaultLauncher : (launchers[d.defaultLauncher] ? d.defaultLauncher : Object.keys(launchers)[0]!);
   const rootsIn: string[] = Array.isArray(r.roots) && r.roots.every((x: unknown) => typeof x === "string") && r.roots.length ? r.roots : d.roots;
+  const quotaEnabled = typeof r.quotaEnabled === "boolean" ? r.quotaEnabled : d.quotaEnabled;
+  const quotaCommand = typeof r.quotaCommand === "string" && r.quotaCommand.trim() ? r.quotaCommand.trim() : d.quotaCommand;
+  const quotaIntervalSec = typeof r.quotaIntervalSec === "number" && Number.isFinite(r.quotaIntervalSec) ? Math.max(0, Math.floor(r.quotaIntervalSec)) : d.quotaIntervalSec;
   return {
     roots: rootsIn.map((p) => path.resolve(expandHome(p, home))),
     backend: BACKENDS.includes(r.backend) ? r.backend : d.backend,
     launchers,
     defaultLauncher,
     herdrSession: typeof r.herdrSession === "string" && r.herdrSession ? r.herdrSession : null,
+    quotaEnabled,
+    quotaCommand,
+    quotaIntervalSec,
   };
 }
 
@@ -52,6 +64,15 @@ export function loadHostConfig(env: NodeJS.ProcessEnv = process.env): { cfg: Hos
 
 export function writeDefaultHostConfig(p: string): void {
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  const body = { roots: DEFAULT_HOST_CONFIG.roots, backend: "auto", launchers: DEFAULT_HOST_CONFIG.launchers, defaultLauncher: DEFAULT_HOST_CONFIG.defaultLauncher, herdrSession: null };
+  const body = {
+    roots: DEFAULT_HOST_CONFIG.roots,
+    backend: "auto",
+    launchers: DEFAULT_HOST_CONFIG.launchers,
+    defaultLauncher: DEFAULT_HOST_CONFIG.defaultLauncher,
+    herdrSession: null,
+    quotaEnabled: DEFAULT_HOST_CONFIG.quotaEnabled,
+    quotaCommand: DEFAULT_HOST_CONFIG.quotaCommand,
+    quotaIntervalSec: DEFAULT_HOST_CONFIG.quotaIntervalSec,
+  };
   fs.writeFileSync(p, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
 }
