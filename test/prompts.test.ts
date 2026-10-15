@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { Broker, fromLocal, toLocalValue, withSignal, type DialogRequest } from "../src/extension/prompts/broker.ts";
 import { Classifier, promptContext } from "../src/extension/prompts/classify.ts";
-import { AdapterRegistry, gentleAskUserChoice, gentleAskUserQuestion } from "../src/extension/prompts/adapters/index.ts";
+import { AdapterRegistry, gentleAskUserChoice, gentleAskUserQuestion, piAskUser } from "../src/extension/prompts/adapters/index.ts";
 import { Gate, ALLOW, ALLOW_SESSION, DENY, DENY_REASON, allowKey, allowedFromBranch, decide, effectiveMode, compilePatterns, summarize } from "../src/extension/prompts/gate.ts";
 import { shouldRegisterAskUser, runAskUser, askUserToolDefinition } from "../src/extension/prompts/askUser.ts";
 import { installMirror } from "../src/extension/prompts/mirror.ts";
@@ -248,6 +248,178 @@ describe("gentle-pi 4.1.0 adapters (fixtures taken from the real tool source)", 
     expect(gentleAskUserQuestion.fromResult(qArgs, undefined)).toEqual({ cancelled: true });
   });
 
+  const askUserArgs = {
+    title: "Configuración inicial",
+    questions: [
+      {
+        id: "target",
+        prompt: "¿Cuál es el entorno destino?",
+        label: "Entorno",
+        type: "single" as const,
+        options: [
+          { label: "Producción", value: "prod", description: "Servidores en vivo" },
+          { label: "Staging", value: "stage", description: "Ambiente de pruebas" },
+        ],
+      },
+      {
+        id: "modules",
+        prompt: "Selecciona módulos a desplegar",
+        label: "Módulos",
+        type: "multi" as const,
+        options: [
+          { label: "API Gateway", value: "gateway", preview: "gw-config" },
+          { label: "Workers", value: "workers" },
+          { label: "Frontend", value: "fe" },
+        ],
+      },
+    ],
+  };
+
+  it("piAskUser: accepts validates questions 1..4 with prompt and options", () => {
+    expect(piAskUser.accepts(askUserArgs)).toBe(true);
+    expect(piAskUser.accepts({ questions: [] })).toBe(false);
+    expect(piAskUser.accepts({ questions: [1, 2, 3, 4, 5] })).toBe(false);
+    expect(piAskUser.accepts({ questions: [{ prompt: "no options" }] })).toBe(false);
+    expect(piAskUser.accepts(null)).toBe(false);
+  });
+
+  it("piAskUser: toPrompt produces questionnaire spec with source @eko24ive/pi-ask and title fallbacks", () => {
+    const p = piAskUser.toPrompt(askUserArgs);
+    expect(p.kind).toBe("questionnaire");
+    expect(p.title).toBe("Configuración inicial");
+    expect(p.category).toBe("question");
+    expect(p.danger).toBe("low");
+    expect(p.source).toEqual({ extension: "@eko24ive/pi-ask", tool: "ask_user", subagent: false });
+    expect(p.questions).toHaveLength(2);
+    expect(p.questions![0]).toEqual({
+      question: "¿Cuál es el entorno destino?",
+      header: "Entorno",
+      multiSelect: false,
+      allowFreeText: true,
+      options: [
+        { id: "0", label: "Producción", description: "Servidores en vivo" },
+        { id: "1", label: "Staging", description: "Ambiente de pruebas" },
+      ],
+    });
+    expect(p.questions![1]).toEqual({
+      question: "Selecciona módulos a desplegar",
+      header: "Módulos",
+      multiSelect: true,
+      allowFreeText: true,
+      options: [
+        { id: "0", label: "API Gateway", preview: "gw-config" },
+        { id: "1", label: "Workers" },
+        { id: "2", label: "Frontend" },
+      ],
+    });
+
+    // Title fallbacks and header fallback to id
+    const singleNoTitle = {
+      questions: [{ id: "solo", prompt: "¿Continuar?", options: [{ label: "Sí", value: "y" }] }],
+    };
+    expect(piAskUser.toPrompt(singleNoTitle).title).toBe("¿Continuar?");
+    expect(piAskUser.toPrompt(singleNoTitle).questions![0].header).toBe("solo");
+
+    const multiNoTitle = {
+      questions: [
+        { id: "q1", prompt: "Q1", options: [{ label: "A", value: "a" }] },
+        { id: "q2", prompt: "Q2", options: [{ label: "B", value: "b" }] },
+      ],
+    };
+    expect(piAskUser.toPrompt(multiNoTitle).title).toBe("2 preguntas");
+  });
+
+  it("piAskUser: toResult formats AskResult answers with values, labels, 1-based indices, and customText", () => {
+    const phoneAnswer = {
+      answers: [
+        { questionIndex: 0, optionIds: ["1"] },
+        { questionIndex: 1, optionIds: ["0", "2"], text: "Docs" },
+      ],
+    };
+    const res: any = piAskUser.toResult(askUserArgs, phoneAnswer);
+    expect(res.cancelled).toBe(false);
+    expect(res.mode).toBe("submit");
+    expect(res.title).toBe("Configuración inicial");
+    expect(res.questions).toEqual([
+      { id: "target", label: "Entorno", prompt: "¿Cuál es el entorno destino?", type: "single" },
+      { id: "modules", label: "Módulos", prompt: "Selecciona módulos a desplegar", type: "multi" },
+    ]);
+    expect(res.answers.target).toEqual({
+      values: ["stage"],
+      labels: ["Staging"],
+      indices: [2],
+    });
+    expect(res.answers.modules).toEqual({
+      values: ["gateway", "fe", "Docs"],
+      labels: ["API Gateway", "Frontend", "Docs"],
+      indices: [1, 3],
+      customText: "Docs",
+    });
+
+    // Single select with custom free-text
+    const customSingle = piAskUser.toResult(askUserArgs, {
+      answers: [
+        { questionIndex: 0, text: "local-dev" },
+        { questionIndex: 1, optionIds: ["1"] },
+      ],
+    });
+    expect((customSingle as any).answers.target).toEqual({
+      values: ["local-dev"],
+      labels: ["local-dev"],
+      indices: [],
+      customText: "local-dev",
+    });
+  });
+
+  it("piAskUser: partial or cancelled answers yield cancelled AskResult", () => {
+    expect(piAskUser.toResult(askUserArgs, { cancelled: true })).toEqual({
+      cancelled: true,
+      mode: "submit",
+      title: "Configuración inicial",
+      questions: [
+        { id: "target", label: "Entorno", prompt: "¿Cuál es el entorno destino?", type: "single" },
+        { id: "modules", label: "Módulos", prompt: "Selecciona módulos a desplegar", type: "multi" },
+      ],
+      answers: {},
+    });
+
+    // Incomplete questionnaire (missing questionIndex 1)
+    expect(piAskUser.toResult(askUserArgs, { answers: [{ questionIndex: 0, optionIds: ["0"] }] })).toEqual({
+      cancelled: true,
+      mode: "submit",
+      title: "Configuración inicial",
+      questions: [
+        { id: "target", label: "Entorno", prompt: "¿Cuál es el entorno destino?", type: "single" },
+        { id: "modules", label: "Módulos", prompt: "Selecciona módulos a desplegar", type: "multi" },
+      ],
+      answers: {},
+    });
+  });
+
+  it("piAskUser: fromResult translates local AskResult to remote Answer for prompt.resolved", () => {
+    const localResult = {
+      cancelled: false,
+      mode: "submit" as const,
+      questions: [
+        { id: "target", label: "Entorno", prompt: "¿Cuál es el entorno destino?", type: "single" as const },
+        { id: "modules", label: "Módulos", prompt: "Selecciona módulos a desplegar", type: "multi" as const },
+      ],
+      answers: {
+        target: { values: ["stage"], labels: ["Staging"], indices: [2] },
+        modules: { values: ["gateway", "fe", "Docs"], labels: ["API Gateway", "Frontend", "Docs"], indices: [1, 3], customText: "Docs" },
+      },
+    };
+    expect(piAskUser.fromResult(askUserArgs, localResult)).toEqual({
+      answers: [
+        { questionIndex: 0, optionIds: ["1"] },
+        { questionIndex: 1, optionIds: ["0", "2"], text: "Docs" },
+      ],
+    });
+
+    expect(piAskUser.fromResult(askUserArgs, { cancelled: true })).toEqual({ cancelled: true });
+    expect(piAskUser.fromResult(askUserArgs, undefined)).toEqual({ cancelled: true });
+  });
+
   async function runRegistry(args: any, tool: string, phoneAnswer: any | null, localValue?: any) {
     const { broker, of } = mkBroker();
     const reg = new AdapterRegistry(broker);
@@ -283,6 +455,24 @@ describe("gentle-pi 4.1.0 adapters (fixtures taken from the real tool source)", 
     const r: any = await runRegistry(qArgs, "ask_user_question", { answers: [{ questionIndex: 0, optionIds: ["1"] }, { questionIndex: 1, optionIds: ["0"] }] });
     expect(r.v.cancelled).toBe(false);
     expect(r.v.answers.map((a: any) => a.kind)).toEqual(["option", "multi"]);
+  });
+  it("registry: ask_user from the phone yields typed AskResult", async () => {
+    const r: any = await runRegistry(askUserArgs, "ask_user", {
+      answers: [
+        { questionIndex: 0, optionIds: ["0"] },
+        { questionIndex: 1, optionIds: ["1"] },
+      ],
+    });
+    expect(r.v.cancelled).toBe(false);
+    expect(r.v.mode).toBe("submit");
+    expect(r.v.answers.target.values).toEqual(["prod"]);
+    expect(r.v.answers.modules.values).toEqual(["workers"]);
+    expect(r.open).toMatchObject({
+      kind: "questionnaire",
+      category: "question",
+      source: { extension: "@eko24ive/pi-ask", tool: "ask_user" },
+    });
+    expect(r.of("prompt.ack")).toEqual([{ promptId: r.open.promptId, accepted: true }]);
   });
   it("registry ignores unknown tools, bad shapes, and disabled mode", () => {
     const { broker } = mkBroker();

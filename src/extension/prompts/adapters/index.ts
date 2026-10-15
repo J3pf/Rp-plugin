@@ -3,12 +3,13 @@ import type { Broker, OpenPrompt } from "../broker.ts";
 import type { CustomDialogAdapter } from "./types.ts";
 import { gentleAskUserChoice } from "./gentle-ask-user-choice.ts";
 import { gentleAskUserQuestion } from "./gentle-ask-user-question.ts";
+import { piAskUser } from "./pi-ask-user.ts";
 import type { CustomInterceptor } from "../mirror.ts";
 
 export type { CustomDialogAdapter } from "./types.ts";
-export { gentleAskUserChoice, gentleAskUserQuestion };
+export { gentleAskUserChoice, gentleAskUserQuestion, piAskUser };
 
-export const BUILTIN_ADAPTERS: CustomDialogAdapter[] = [gentleAskUserChoice, gentleAskUserQuestion];
+export const BUILTIN_ADAPTERS: CustomDialogAdapter[] = [gentleAskUserChoice, gentleAskUserQuestion, piAskUser];
 
 interface Current {
   toolCallId: string;
