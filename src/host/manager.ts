@@ -1,7 +1,7 @@
 // Spawns and tracks agents created from the phone; picks the backend (herdr > tmux/wt > console).
 import fs from "node:fs";
 import path from "node:path";
-import { newId } from "../shared/protocol.ts";
+import { newId, type MachineQuota } from "../shared/protocol.ts";
 import { configDir } from "../shared/platform.ts";
 import type { BackendName, HostConfig } from "./config.ts";
 import type { Backend, HerdrTarget, SpawnRecord } from "./backends/types.ts";
@@ -10,6 +10,7 @@ import { TmuxBackend } from "./backends/tmux.ts";
 import { ConsoleBackend, WindowsTerminalBackend } from "./backends/windows.ts";
 import { run as realRun, type Runner } from "./runner.ts";
 import { HostError, resolveLauncher, resolveWithinRoots, sanitizeLabel, validateSessionId, validateSpawnId } from "./validate.ts";
+import { QuotaCollector } from "./quota.ts";
 
 export interface BackendReport {
   herdr: string | null;
@@ -32,10 +33,11 @@ export class HostManager {
   private records = new Map<string, SpawnRecord>();
   private report: BackendReport | null = null;
   private storeFile: string;
+  private quotaCollector: QuotaCollector;
 
   constructor(
     private cfg: HostConfig,
-    opts: { run?: Runner; platform?: NodeJS.Platform; storeFile?: string } = {},
+    opts: { run?: Runner; platform?: NodeJS.Platform; storeFile?: string; quotaCollector?: QuotaCollector; onLog?: (m: string) => void } = {},
   ) {
     const run = opts.run ?? realRun;
     const platform = opts.platform ?? process.platform;
@@ -48,6 +50,11 @@ export class HostManager {
       console: new ConsoleBackend(deps),
     };
     this.storeFile = opts.storeFile ?? path.join(configDir(), "host-spawns.json");
+    this.quotaCollector = opts.quotaCollector ?? new QuotaCollector({
+      runner: run,
+      command: cfg.quotaCommand,
+      onLog: opts.onLog,
+    });
     this.load();
   }
   private platform: NodeJS.Platform;
@@ -146,5 +153,15 @@ export class HostManager {
 
   list(): SpawnRecord[] {
     return [...this.records.values()];
+  }
+
+  async collectQuotas(): Promise<MachineQuota[] | null> {
+    if (!this.cfg.quotaEnabled) return null;
+    return this.quotaCollector.collect();
+  }
+
+  getLastQuotas(): MachineQuota[] | null {
+    if (!this.cfg.quotaEnabled) return null;
+    return this.quotaCollector.getLastQuotas();
   }
 }

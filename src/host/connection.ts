@@ -1,7 +1,7 @@
 // rp-host ⇄ relay: wss://<relay>/ws/host (PROTOCOLO §9).
 import os from "node:os";
 import WebSocket from "ws";
-import { MAX_FRAME_BYTES, CLOSE, envelope, parseEnvelope, type Envelope } from "../shared/protocol.ts";
+import { MAX_FRAME_BYTES, CLOSE, envelope, parseEnvelope, type Envelope, type HostHelloBody, type HostQuotasBody } from "../shared/protocol.ts";
 import { getProxyAgent, toWsUrl } from "../shared/http.ts";
 import { backoffDelay, errMsg } from "../shared/util.ts";
 import type { HostConfig } from "./config.ts";
@@ -24,6 +24,7 @@ export class HostConnection {
   private attempt = 0;
   private timer: NodeJS.Timeout | null = null;
   private watchdog: NodeJS.Timeout | null = null;
+  private quotaTimer: NodeJS.Timeout | null = null;
 
   constructor(private o: HostConnectionOptions) {}
 
@@ -38,6 +39,7 @@ export class HostConnection {
   stop(): void {
     this.stopped = true;
     this.clearWatchdog();
+    this.stopQuotaTimer();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     try {
@@ -93,6 +95,7 @@ export class HostConnection {
     ws.on("open", () => {
       this.attempt = 0;
       this.arm();
+      this.startQuotaTimer();
       void this.hello();
     });
     ws.on("ping", () => this.arm());
@@ -116,6 +119,7 @@ export class HostConnection {
     });
     ws.on("close", (code) => {
       this.clearWatchdog();
+      this.stopQuotaTimer();
       if (this.ws !== ws) return;
       this.ws = null;
       this.scheduleReconnect(code);
@@ -126,20 +130,51 @@ export class HostConnection {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(e));
   }
 
+  private startQuotaTimer(): void {
+    this.stopQuotaTimer();
+    const sec = this.o.cfg.quotaIntervalSec;
+    if (!this.o.cfg.quotaEnabled || !sec || sec <= 0) return;
+    this.quotaTimer = setInterval(() => void this.pollQuotas(), sec * 1000);
+    this.quotaTimer.unref?.();
+  }
+
+  private stopQuotaTimer(): void {
+    if (this.quotaTimer) {
+      clearInterval(this.quotaTimer);
+      this.quotaTimer = null;
+    }
+  }
+
+  async pollQuotas(): Promise<void> {
+    if (this.stopped || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      const quotas = await this.o.manager.collectQuotas();
+      if (quotas && this.ws?.readyState === WebSocket.OPEN) {
+        const body: HostQuotasBody = { quotas };
+        this.sendEnv(envelope("host.quotas", body));
+      }
+    } catch (e) {
+      this.log(`error polling quotas: ${(e as Error).message}`);
+    }
+  }
+
   async hello(): Promise<void> {
     const rep = await this.o.manager.detect(true);
     const def = await this.o.manager.defaultBackend();
-    this.sendEnv(
-      envelope("host.hello", {
-        machineId: this.o.machineId,
-        hostname: os.hostname(),
-        roots: this.o.cfg.roots,
-        backends: { herdr: rep.herdr, tmux: rep.tmux, wt: rep.wt, console: rep.console },
-        defaultBackend: def,
-        launchers: Object.keys(this.o.cfg.launchers),
-        defaultLauncher: this.o.cfg.defaultLauncher,
-      }),
-    );
+    const quotas = await this.o.manager.collectQuotas();
+    const body: HostHelloBody = {
+      machineId: this.o.machineId,
+      hostname: os.hostname(),
+      roots: this.o.cfg.roots,
+      backends: { herdr: rep.herdr, tmux: rep.tmux, wt: rep.wt, console: rep.console },
+      defaultBackend: def ?? undefined,
+      launchers: Object.keys(this.o.cfg.launchers),
+      defaultLauncher: this.o.cfg.defaultLauncher,
+    };
+    if (quotas && quotas.length > 0) {
+      body.quotas = quotas;
+    }
+    this.sendEnv(envelope("host.hello", body));
   }
 
   /** Handle one relay request; always answers with `re` = request id. */
