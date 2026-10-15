@@ -11,8 +11,8 @@ Branch: `feat/piquota-host-collection` | Status: in_progress
 - S6: Build, documentation, and release readiness. Run `npm run typecheck`, `npm run build`, and `npm run test:unit`. Update docs and bump version in `package.json` to 0.1.4.
 
 ## Tasks
-- T1 (S1, S3) [inline] Protocol types in protocol.ts and config options in config.ts: pending
-- T2 (S2) [inline] Quota collector implementation in src/host/quota.ts and unit tests in test/host-quota.test.ts: pending
+- T1 (S1, S3) [inline] Protocol types in protocol.ts and config options in config.ts: done (1571707)
+- T2 (S2) [inline] Quota collector implementation in src/host/quota.ts and unit tests in test/host-quota.test.ts: in_progress
 - T3 (S4) [inline] Connect quota collector to HostManager and HostConnection (host.hello + host.quotas): pending
 - T4 (S5) [inline] Wire contract validation and integration tests in test/host.test.ts and test/contract.test.ts: pending
 - T5 (S6) [inline] Documentation, build, package version bump to 0.1.4 and verification: pending
