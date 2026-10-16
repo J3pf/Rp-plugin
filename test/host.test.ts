@@ -9,7 +9,7 @@ import { TmuxBackend, parseTmuxVersion, tmuxSupportsEnv, tmuxSessionName } from 
 import { WindowsTerminalBackend, ConsoleBackend, wtArgs, consoleArgs, killScript } from "../src/host/backends/windows.ts";
 import { HostManager } from "../src/host/manager.ts";
 import { HostConnection, parseTarget } from "../src/host/connection.ts";
-import { checkLinger, enableLinger, isStaleNodePath, launchdPlist, resolveStableNodePath, schtasksCreateArgs, systemdUnit, installService, uninstallService } from "../src/host/service.ts";
+import { checkLinger, enableLinger, isStaleNodePath, launchdPlist, resolveStableNodePath, schtasksCreateArgs, schtasksCreateXmlArgs, schtasksXml, systemdUnit, installService, uninstallService } from "../src/host/service.ts";
 import type { Runner } from "../src/host/runner.ts";
 import { FakeRelay, waitUntil } from "./helpers.ts";
 import { envelope } from "../src/shared/protocol.ts";
@@ -500,9 +500,74 @@ describe("service installation", () => {
     expect(systemdUnit({ ...spec, envPath: "" })).not.toContain('Environment="PATH=');
   });
   it("Task Scheduler at logon, without admin", () => {
-    const a = schtasksCreateArgs({ ...spec, platform: "win32", nodePath: "C:\\Program Files\\nodejs\\node.exe", scriptPath: "C:\\rp\\bin\\rp-host.mjs" });
+    const windowsSpec = { ...spec, platform: "win32" as const, nodePath: "C:\\Program Files\\nodejs\\node.exe", scriptPath: "C:\\rp\\bin\\rp-host.mjs" };
+    const a = schtasksCreateArgs(windowsSpec);
     expect(a).toEqual(["/Create", "/SC", "ONLOGON", "/TN", "rp-host", "/TR", '"C:\\Program Files\\nodejs\\node.exe" "C:\\rp\\bin\\rp-host.mjs" run', "/F"]);
     expect(a).not.toContain("/RU");
+    expect(schtasksCreateArgs(windowsSpec, "C:\\Temp\\task.xml")).toEqual(["/Create", "/XML", "C:\\Temp\\task.xml", "/TN", "rp-host", "/F"]);
+    expect(schtasksCreateXmlArgs("C:\\Temp\\task.xml")).toEqual(["/Create", "/XML", "C:\\Temp\\task.xml", "/TN", "rp-host", "/F"]);
+  });
+  it("generates Task Scheduler XML with required policies and escaped paths", () => {
+    const xml = schtasksXml({
+      ...spec,
+      platform: "win32",
+      nodePath: "C:\\Program Files\\RP & Co\\node.exe",
+      scriptPath: "C:\\RP <Host>\\rp&host.mjs",
+    });
+    for (const element of [
+      '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+      "<Description>RP host (create Pi agents from the phone)</Description>",
+      "<LogonTrigger><Enabled>true</Enabled></LogonTrigger>",
+      "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+      "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+      "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+      "<StartWhenAvailable>true</StartWhenAvailable>",
+      "<LogonType>InteractiveToken</LogonType>",
+      "<RunLevel>LeastPrivilege</RunLevel>",
+      "<Hidden>true</Hidden>",
+      "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+      "<Interval>PT1M</Interval>",
+      "<Count>999</Count>",
+      "<Command>C:\\Program Files\\RP &amp; Co\\node.exe</Command>",
+      '<Arguments>"C:\\RP &lt;Host&gt;\\rp&amp;host.mjs" run</Arguments>',
+    ]) expect(xml).toContain(element);
+  });
+  it("installs Windows Task Scheduler from a temporary XML file and cleans it up", async () => {
+    const home = tmp();
+    let xmlPath = "";
+    let xmlDuringCreate = "";
+    const f = fakeRun({
+      schtasks: (args) => {
+        if (args[0] === "/Create") {
+          expect(args.slice(0, 2)).toEqual(["/Create", "/XML"]);
+          xmlPath = args[2]!;
+          expect(args.slice(3)).toEqual(["/TN", "rp-host", "/F"]);
+          expect(fs.existsSync(xmlPath)).toBe(true);
+          xmlDuringCreate = fs.readFileSync(xmlPath, "utf8");
+        }
+        return {};
+      },
+    });
+    try {
+      const message = await installService({
+        ...spec,
+        platform: "win32",
+        home,
+        nodePath: "C:\\Program Files\\nodejs\\node.exe",
+        scriptPath: "C:\\rp\\bin\\rp-host.mjs",
+      }, f.run);
+      expect(message).toContain("scheduled task rp-host created");
+      expect(xmlDuringCreate).toContain("<Task version=\"1.2\"");
+      expect(xmlDuringCreate).toContain("C:\\Program Files\\nodejs\\node.exe");
+      expect(xmlDuringCreate).toContain('"C:\\rp\\bin\\rp-host.mjs" run');
+      expect(fs.existsSync(xmlPath)).toBe(false);
+      expect(f.calls.map((call) => [call.cmd, call.args])).toEqual([
+        ["schtasks", ["/Create", "/XML", xmlPath, "/TN", "rp-host", "/F"]],
+        ["schtasks", ["/Run", "/TN", "rp-host"]],
+      ]);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
   it("launchd plist escapes XML and includes runtime environment and logs", () => {
     const home = "/Users/alice";
@@ -554,7 +619,9 @@ describe("service installation", () => {
       expect(fs.existsSync(unitPath)).toBe(false);
       const w = fakeRun({ schtasks: () => ({}) });
       await installService({ ...spec, platform: "win32", home }, w.run);
-      expect(w.calls[0]!.args.slice(0, 5)).toEqual(["/Create", "/SC", "ONLOGON", "/TN", "rp-host"]);
+      expect(w.calls[0]!.args.slice(0, 2)).toEqual(["/Create", "/XML"]);
+      expect(w.calls[0]!.args.slice(3)).toEqual(["/TN", "rp-host", "/F"]);
+      expect(fs.existsSync(w.calls[0]!.args[2]!)).toBe(false);
       await uninstallService("win32", w.run, home);
       expect(w.calls.some((c) => c.args[0] === "/Delete")).toBe(true);
       const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().uid;

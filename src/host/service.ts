@@ -88,7 +88,55 @@ export function systemdUnitPath(home = os.homedir()): string {
   return path.join(home, ".config", "systemd", "user", "rp-host.service");
 }
 
-export function schtasksCreateArgs(spec: ServiceSpec): string[] {
+export function schtasksXml(spec: ServiceSpec): string {
+  const esc = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>RP host (create Pi agents from the phone)</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>${esc(spec.nodePath)}</Command>
+      <Arguments>${esc(`"${spec.scriptPath}" run`)}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`;
+}
+
+export function schtasksCreateXmlArgs(xmlPath: string): string[] {
+  return ["/Create", "/XML", xmlPath, "/TN", "rp-host", "/F"];
+}
+
+export function schtasksCreateArgs(spec: ServiceSpec, xmlPath?: string): string[] {
+  if (xmlPath !== undefined) return schtasksCreateXmlArgs(xmlPath);
   const tr = `"${spec.nodePath}" "${spec.scriptPath}" run`;
   return ["/Create", "/SC", "ONLOGON", "/TN", "rp-host", "/TR", tr, "/F"];
 }
@@ -185,10 +233,21 @@ export async function installService(spec: ServiceSpec, run: Runner = realRun): 
     return `systemd user service installed (${f})${warning}`;
   }
   if (spec.platform === "win32") {
-    const r = await run("schtasks", schtasksCreateArgs(spec));
-    if (r.code !== 0) throw new Error(`schtasks failed: ${r.stderr.trim() || r.stdout.trim()}`);
-    await run("schtasks", ["/Run", "/TN", "rp-host"]);
-    return "scheduled task rp-host created (runs at logon)";
+    const installedSpec = {
+      ...spec,
+      nodePath: resolveStableNodePath(process.env, spec.platform, spec.nodePath),
+    };
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-host-task-"));
+    const xmlPath = path.join(tempDir, "task.xml");
+    try {
+      fs.writeFileSync(xmlPath, schtasksXml(installedSpec));
+      const r = await run("schtasks", schtasksCreateArgs(installedSpec, xmlPath));
+      if (r.code !== 0) throw new Error(`schtasks failed: ${r.stderr.trim() || r.stdout.trim()}`);
+      await run("schtasks", ["/Run", "/TN", "rp-host"]);
+      return "scheduled task rp-host created (runs at logon)";
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   }
   if (spec.platform === "darwin") {
     const installedSpec = {
