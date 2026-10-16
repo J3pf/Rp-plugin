@@ -2,7 +2,7 @@
 import os from "node:os";
 import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { newId, type AgentHelloBody, type AgentStatus, type Envelope, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
+import { newId, type AgentEventPayload, type AgentHelloBody, type AgentStatus, type Envelope, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
 import { parseTodoTasks, replayTodoBranch } from "./todos.ts";
 import { errMsg, preview } from "../shared/util.ts";
 import type { RpConfig } from "./config.ts";
@@ -127,12 +127,11 @@ export class Runtime {
       onChange: () => this.updateWaiting(),
     });
     this.adapters = new AdapterRegistry(this.broker);
-    // SAFETY: SubagentUpdateEvent is a structured object payload conforming to agent.event wire shape.
     this.subagents = new SubagentTracker({
-      emit: (event) => this.emitEvent(event as unknown as Record<string, unknown>),
+      emit: (event) => this.emitEvent(event),
     });
     this.comm = new CommTracker({
-      emit: (event) => this.emitEvent(event as any),
+      emit: (event) => this.emitEvent(event),
       isRedacted: () => this.cfg.redactContent,
     });
 
@@ -140,7 +139,8 @@ export class Runtime {
       redact: cfg.redactContent,
       send: (e) => this.emitEvent(e),
       onAgentStart: () => this.statuses.working(),
-      onAgentSettled: () => {
+      onAgentSettled: (aborted) => {
+        this.comm.onAgentSettled(aborted);
         this.statuses.idle();
         void this.refreshGit();
         const w = this.settledWaiters.splice(0);
@@ -214,6 +214,7 @@ export class Runtime {
 
   start(): void {
     const ctx = this.lastCtx;
+    this.comm.reset();
     this.comm.seedSeen(this.safeBranch());
     this.adapters.enabled = this.adaptersAllowed();
     // always installed (setStatus is observed for agent.statuses); dialogs are patched only when mirrorDialogs is on
@@ -230,6 +231,7 @@ export class Runtime {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.comm.reset();
     try {
       this.broker.shutdown();
       this.herdrBlocker.releaseAll();
@@ -301,7 +303,7 @@ export class Runtime {
     this.statuses.setCompacting(true);
   }
 
-  private emitEvent(e: Record<string, unknown>): void {
+  private emitEvent(e: AgentEventPayload): void {
     this.seq++;
     this.conn.send("agent.event", { epoch: this.epoch, seq: this.seq, e });
   }

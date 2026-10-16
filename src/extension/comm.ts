@@ -21,18 +21,92 @@ export interface InboundCommMessage {
 
 const INTERCOM_ACTIONS = new Set(["send", "ask", "reply", "handover"]);
 const MAX_TEXT_LENGTH = 2000;
+const DEFAULT_CAPACITY = 500;
+
+/** Map with an LRU eviction bound, refreshing entries on access and update. */
+export class BoundedMap<K, V> extends Map<K, V> {
+  private readonly capacity: number;
+
+  constructor(maxCapacity = DEFAULT_CAPACITY) {
+    super();
+    this.capacity = Number.isFinite(maxCapacity) ? Math.max(0, Math.floor(maxCapacity)) : DEFAULT_CAPACITY;
+  }
+
+  override get(key: K): V | undefined {
+    if (!super.has(key)) return undefined;
+    const value = super.get(key)!;
+    super.delete(key);
+    super.set(key, value);
+    return value;
+  }
+
+  override has(key: K): boolean {
+    if (!super.has(key)) return false;
+    const value = super.get(key)!;
+    super.delete(key);
+    super.set(key, value);
+    return true;
+  }
+
+  override set(key: K, value: V): this {
+    super.delete(key);
+    super.set(key, value);
+    if (this.size > this.capacity) {
+      const oldest = this.keys().next();
+      if (!oldest.done) super.delete(oldest.value);
+    }
+    return this;
+  }
+}
+
+/** Set with an LRU eviction bound, refreshing entries on access and update. */
+export class BoundedSet<T> extends Set<T> {
+  private readonly capacity: number;
+
+  constructor(maxCapacity = DEFAULT_CAPACITY) {
+    super();
+    this.capacity = Number.isFinite(maxCapacity) ? Math.max(0, Math.floor(maxCapacity)) : DEFAULT_CAPACITY;
+  }
+
+  override has(value: T): boolean {
+    if (!super.has(value)) return false;
+    super.delete(value);
+    super.add(value);
+    return true;
+  }
+
+  override add(value: T): this {
+    super.delete(value);
+    super.add(value);
+    if (this.size > this.capacity) {
+      const oldest = this.values().next();
+      if (!oldest.done) super.delete(oldest.value);
+    }
+    return this;
+  }
+}
 
 /** Correlates inter-agent tool calls into outgoing CommEvents. */
 export class CommTracker {
-  private readonly activeCalls = new Map<string, CommEvent>();
-  private readonly inboundMessages = new Map<string, CommPeer>();
-  private readonly seenInboundMessageIds = new Set<string>();
-  private readonly knownPeers = new Map<string, CommPeer>();
-  private mostRecentInbound: CommPeer | null = null;
+  private readonly activeCalls = new BoundedMap<string, CommEvent>();
+  private readonly inboundMessages = new BoundedMap<string, CommPeer>();
+  private readonly seenInboundMessageIds = new BoundedSet<string>();
+  private readonly knownPeers = new BoundedMap<string, CommPeer>();
   private readonly now: () => number;
 
   constructor(private readonly deps: CommTrackerDeps) {
     this.now = deps.now ?? Date.now;
+  }
+
+  onAgentSettled(aborted?: boolean): void {
+    if (aborted) this.activeCalls.clear();
+  }
+
+  reset(): void {
+    this.activeCalls.clear();
+    this.inboundMessages.clear();
+    this.knownPeers.clear();
+    this.seenInboundMessageIds.clear();
   }
 
   onMessage(message: unknown): void {
@@ -118,7 +192,6 @@ export class CommTracker {
       if (peer.name) this.knownPeers.set(peer.name, peer);
       if (typeof message?.id !== "string" || !message.id) return;
       this.inboundMessages.set(message.id, peer);
-      this.mostRecentInbound = peer;
     } catch {
       // Inbound observation must never disrupt the extension hook.
     }
@@ -201,7 +274,6 @@ export class CommTracker {
       }
       call.messageId = messageId;
       call.delivered = typeof details?.delivered === "boolean" ? details.delivered : !isError && !details?.error;
-      call.at = this.now();
       this.activeCalls.delete(toolCallId);
       this.deps.emit(copyEvent(call));
     } catch {
@@ -213,7 +285,7 @@ export class CommTracker {
     const key = typeof replyTo === "string" ? replyTo : null;
     const fromReply = key ? this.inboundMessages.get(key) : undefined;
     const fromRef = peer.ref ? this.knownPeers.get(peer.ref) : undefined;
-    const from = fromReply ?? fromRef ?? this.mostRecentInbound;
+    const from = fromReply ?? fromRef;
     if (!from) return;
     peer.sessionId = from.sessionId;
     peer.name = from.name;

@@ -1,6 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { CommTracker } from "../src/extension/comm.ts";
+import { BoundedMap, BoundedSet, CommTracker } from "../src/extension/comm.ts";
 import type { CommEvent } from "../src/shared/protocol.ts";
+import { validateEnvelope } from "./contract.ts";
+
+describe("bounded collections", () => {
+  it("evicts the least-recently-used entry after exceeding capacity", () => {
+    const map = new BoundedMap<number, number>();
+    for (let i = 0; i <= 500; i++) map.set(i, i);
+    expect(map.size).toBe(500);
+    expect(map.has(0)).toBe(false);
+    expect(map.get(500)).toBe(500);
+
+    // Accessing and updating existing keys refreshes their LRU position.
+    map.get(1);
+    map.set(2, 2);
+    map.set(501, 501);
+    expect(map.has(1)).toBe(true);
+    expect(map.has(2)).toBe(true);
+    expect(map.has(3)).toBe(false);
+
+    const set = new BoundedSet<number>();
+    for (let i = 0; i <= 500; i++) set.add(i);
+    expect(set.size).toBe(500);
+    expect(set.has(0)).toBe(false);
+    expect(set.has(500)).toBe(true);
+
+    // has() and add() of an existing value refresh its LRU position.
+    set.has(1);
+    set.add(2);
+    set.add(501);
+    expect(set.has(1)).toBe(true);
+    expect(set.has(2)).toBe(true);
+    expect(set.has(3)).toBe(false);
+  });
+});
 
 describe("CommTracker outgoing events", () => {
   function tracker(redacted = false) {
@@ -34,7 +67,9 @@ describe("CommTracker outgoing events", () => {
     comm.onToolEnd("intercom", { details: { delivered: true, messageId: "sent-1" } }, false, "call-1");
 
     expect(events).toHaveLength(2);
-    expect(events[1]).toEqual({ ...events[0], commId, messageId: "sent-1", delivered: true, at: 101 });
+    expect(events[1]).toEqual({ ...events[0], commId, messageId: "sent-1", delivered: true });
+    expect(events[1]!.at).toBe(events[0]!.at);
+    expect(events[1]!.at).toBe(100);
   });
 
   it("ignores unsupported intercom actions and replies without a message", () => {
@@ -79,6 +114,67 @@ describe("CommTracker outgoing events", () => {
         peer: { sessionId: "peer-session", name: "Peer", cwd: "/peer", ref: null },
       }),
     ]);
+  });
+
+  it("resolves replies only from the matching inbound message or explicit peer ref", () => {
+    const { comm, events } = tracker();
+    comm.recordInbound({ id: "peer-a", name: "Agent A", cwd: "/a" }, { id: "msg-1" });
+    comm.recordInbound({ id: "peer-b", name: "Agent B", cwd: "/b" }, { id: "msg-2" });
+
+    comm.onToolStart("intercom", { action: "reply", replyTo: "msg-1", message: "answer A" }, "reply-a");
+    expect(events[0]!.peer.sessionId).toBe("peer-a");
+    expect(events[0]!.peer.name).toBe("Agent A");
+    expect(events[0]!.peer.cwd).toBe("/a");
+
+    comm.onToolStart("intercom", { action: "reply", replyTo: "msg-unknown", message: "unknown reply" }, "reply-unknown");
+    expect(events[1]!.peer.sessionId).toBeNull();
+    expect(events[1]!.peer.name).toBeNull();
+    expect(events[1]!.peer.cwd).toBeNull();
+    expect(events[1]!.replyTo).toBe("msg-unknown");
+  });
+
+  it("clears active calls after an aborted agent settles", () => {
+    const { comm, events } = tracker();
+    comm.onToolStart("intercom", { action: "send", message: "hello" }, "aborted-call");
+    comm.onAgentSettled(true);
+    comm.onToolEnd("intercom", { details: { delivered: true, messageId: "late-message" } }, false, "aborted-call");
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ direction: "out", messageId: null, delivered: null });
+  });
+
+  it("reset clears active calls, inbound messages, known peers, and deduplication state", () => {
+    const { comm, events } = tracker();
+    const previouslySeen = {
+      customType: "intercom_message",
+      details: { from: { id: "peer-session", name: "Peer", cwd: "/peer" }, message: { id: "seen-message" }, bodyText: "hello" },
+    };
+    comm.onToolStart("intercom", { action: "send", message: "pending" }, "pending-call");
+    comm.recordInbound({ id: "peer-session", name: "Peer", cwd: "/peer" }, { id: "inbound-message" });
+    comm.onMessage(previouslySeen);
+    expect(events).toHaveLength(2);
+
+    comm.reset();
+    comm.onToolEnd("intercom", { details: { delivered: true, messageId: "late-message" } }, false, "pending-call");
+    comm.onToolStart("intercom", { action: "reply", replyTo: "inbound-message", message: "answer" }, "reply-1");
+    comm.onToolStart("intercom", { action: "reply", to: "Peer", replyTo: "unknown-message", message: "answer" }, "reply-2");
+
+    expect(events).toHaveLength(4);
+    expect(events[2]!.peer).toEqual({ sessionId: null, name: null, cwd: null, ref: null });
+    expect(events[3]!.peer).toEqual({ sessionId: null, name: null, cwd: null, ref: "Peer" });
+
+    comm.onMessage(previouslySeen);
+    expect(events).toHaveLength(5);
+    expect(events[4]).toMatchObject({ direction: "in", messageId: "seen-message" });
+  });
+
+  it("preserves active calls when an agent settles without aborting", () => {
+    const { comm, events } = tracker();
+    comm.onToolStart("intercom", { action: "send", message: "hello" }, "call-1");
+    comm.onAgentSettled(false);
+    comm.onToolEnd("intercom", { details: { messageId: "sent-1" } }, false, "call-1");
+    expect(events).toHaveLength(2);
+    expect(events[1]).toMatchObject({ messageId: "sent-1", delivered: true });
   });
 
   it("uses details.delivered when boolean and otherwise derives delivery from error", () => {
@@ -208,5 +304,65 @@ describe("CommTracker outgoing events", () => {
     expect(() => comm.onMessage(throwingMessage)).not.toThrow();
     expect(() => comm.seedSeen([throwingMessage])).not.toThrow();
     expect(events).toEqual([]);
+  });
+
+  it("emits CommTracker events that validate against the frozen envelope contract", () => {
+    const { comm, events } = tracker();
+    const envelope = (event: CommEvent, seq: number) => ({
+      v: 1,
+      t: "agent.event",
+      ts: event.at,
+      d: { epoch: "test-epoch", seq, e: event },
+    });
+
+    comm.onToolStart("intercom", { action: "ask", to: "peer-ref", message: "question" }, "ask-1");
+    const start = events[0]!;
+    comm.onToolEnd("intercom", { details: { delivered: true, messageId: "ask-message" } }, false, "ask-1");
+    const end = events[1]!;
+
+    expect(validateEnvelope(envelope(start, 1))).toEqual([]);
+    expect(validateEnvelope(envelope(end, 2))).toEqual([]);
+    expect(start).toMatchObject({ delivered: null, messageId: null });
+    expect(end).toMatchObject({ delivered: true, messageId: "ask-message" });
+    expect(end.commId).toBe(start.commId);
+    expect(end.at).toBe(start.at);
+    expect(end.peer).toEqual(start.peer);
+    expect(end.text).toBe(start.text);
+    expect(end.channel).toBe(start.channel);
+    expect(end.action).toBe(start.action);
+
+    for (const action of ["send", "ask", "reply", "handover"] as const) {
+      comm.onToolStart("intercom", { action, to: "peer-ref", message: "message" }, `call-${action}`);
+    }
+    comm.onToolStart("orchestrator_send_message", { recipient_session_id: "session-2", message: "delegated" }, "orch-1");
+    comm.onMessage({
+      customType: "intercom_message",
+      details: {
+        from: { id: "peer-session", name: "Peer", cwd: "/peer" },
+        message: { id: "incoming-1", expectsReply: true },
+        bodyText: "inbound",
+      },
+    });
+
+    for (const [index, event] of events.entries()) {
+      expect(validateEnvelope(envelope(event, index + 1))).toEqual([]);
+      if (event.channel === "intercom") {
+        expect(["send", "ask", "reply", "handover"]).toContain(event.action);
+      } else {
+        expect(event.channel).toBe("orchestrator");
+        expect(event.action).toBe("message");
+      }
+    }
+    const inbound = events.at(-1)!;
+    expect(inbound.direction).toBe("in");
+    expect("delivered" in inbound).toBe(false);
+
+    const redacted = tracker(true);
+    redacted.comm.onMessage({
+      customType: "intercom_message",
+      details: { message: { id: "redacted-1" }, bodyText: "secret" },
+    });
+    expect(validateEnvelope(envelope(redacted.events[0]!, 1))).toEqual([]);
+    expect(redacted.events[0]).toMatchObject({ text: null, truncated: false });
   });
 });

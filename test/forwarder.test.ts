@@ -92,6 +92,13 @@ describe("Forwarder", () => {
     f.handle("agent_settled", { aborted: true });
     expect(calls).toEqual(["start", "tool:bash", "settled"]);
   });
+  it("passes the aborted flag to onAgentSettled", () => {
+    const settled: boolean[] = [];
+    const f = new Forwarder({ send: () => {}, redact: false, onAgentSettled: (aborted) => settled.push(!!aborted) });
+    f.handle("agent_settled", { aborted: true });
+    f.handle("agent_settled", {});
+    expect(settled).toEqual([true, false]);
+  });
   it("redactContent: only state, tool names and ids", () => {
     const r: any[] = [];
     const f = new Forwarder({ send: (e) => r.push(e), redact: true });

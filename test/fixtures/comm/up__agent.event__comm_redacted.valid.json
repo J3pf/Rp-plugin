@@ -1,0 +1,24 @@
+{
+  "v": 1,
+  "t": "agent.event",
+  "ts": 1760342403000,
+  "d": {
+    "epoch": "01JA0000000000000000000E01",
+    "seq": 64,
+    "e": {
+      "type": "comm",
+      "commId": "comm-004",
+      "direction": "out",
+      "channel": "intercom",
+      "action": "send",
+      "peer": { "sessionId": "sess-peer-1", "name": "peer-agent", "cwd": "/workspace", "ref": "peer-agent" },
+      "messageId": null,
+      "replyTo": null,
+      "expectsReply": false,
+      "text": null,
+      "truncated": false,
+      "delivered": true,
+      "at": 1760342403000
+    }
+  }
+}

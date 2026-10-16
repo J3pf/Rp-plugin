@@ -1,0 +1,24 @@
+{
+  "v": 1,
+  "t": "agent.event",
+  "ts": 1760342401000,
+  "d": {
+    "epoch": "01JA0000000000000000000E01",
+    "seq": 62,
+    "e": {
+      "type": "comm",
+      "commId": "comm-001",
+      "direction": "out",
+      "channel": "orchestrator",
+      "action": "message",
+      "peer": { "sessionId": "session-remote", "name": "worker", "cwd": "/workspace", "ref": "ref-1" },
+      "messageId": "msg-001",
+      "replyTo": null,
+      "expectsReply": false,
+      "text": "Starting delegated work",
+      "truncated": false,
+      "delivered": true,
+      "at": 1760342400000
+    }
+  }
+}
