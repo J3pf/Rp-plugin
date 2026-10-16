@@ -29,7 +29,7 @@ Branch: `feat/agent-mesh` | Status: completed
 - L4: "[AGENT MESH — CONTRACT FROZEN] Rp-relay commit 59c8f41 (branch feat/agent-mesh; working tree at /home/drift/Workspace/RP/Rp-relay, fixtures in packages/protocol/fixtures/up__agent.event__comm_*.valid.json). Verified by me: 128/128. Proceed with D6: align your fixtures/contract tests with those 5 comm fixtures (out_start, out_end, out_ask, in, redacted). Also add a test that feeds what your CommTracker emits (start+end of an intercom ask, an inbound, a redacted event) and validates it against the same rules as the fixtures (same commId/at/peer/text in the pair; intercom ⇒ send|ask|reply|handover; orchestrator ⇒ message). Then: merge to main, bump 0.2.1, npm pack, tag v0.2.1, push main+tags, publish the GitHub release with the tgz, and update the README URLs. Final evidence: SHAs on main, test tail, subagent task ids (implementation + verify), release URL + asset."
 
 ## Cycle 2: Review Corrections for v0.2.1
-Branch: `feat/agent-mesh-v0.2.1` | Status: in_progress
+Branch: `feat/agent-mesh-v0.2.1` | Status: completed
 
 ### Specs (Cycle 2)
 - C2-D1: (blocker) onToolEnd must NOT overwrite `call.at = this.now()`. The start/end pair is the same message; `at` remains identical.
@@ -43,4 +43,7 @@ Branch: `feat/agent-mesh-v0.2.1` | Status: in_progress
 - T9 (C2-D1, C2-D2) [gentle-ai-worker] Fix `at` preservation in onToolEnd, remove `mostRecentInbound` fallback in fillReplyPeer, add tests: done (commit 9b76b17)
 - T10 (C2-D3, C2-D4) [gentle-ai-worker] Implement bounded memory (LRU 500), abort clearing, session reset in Runtime, and strongly typed emitEvent: done (commit d7cc92e)
 - T11 (C2-D5) [gentle-ai-worker] Document inbound handover behavior in `docs/PLAN-PLUGIN.md`: done (commit 83a9a6f)
-- T12 (C2-D6) [gentle-ai-verify] Await frozen relay SHA, run fixtures/contract tests, independent verification, and deliver v0.2.1 release: in_progress
+- T12 (C2-D6) [gentle-ai-verify] Await frozen relay SHA, run fixtures/contract tests, independent verification, and deliver v0.2.1 release: done (commit pending, tag v0.2.1)
+
+## Log (Cycle 2)
+- L5: Fixtures alineados al commit congelado de relay 59c8f41 con 5 fixtures locales en test/fixtures/comm/ y test de emisión de CommTracker en test/comm.test.ts (commit 0c00cad). Merge de feat/agent-mesh-v0.2.1 a main, bump de versión a 0.2.1 en package.json y README.md. Tag v0.2.1 creado y publicado en GitHub releases con j3pf-pi-rp-0.2.1.tgz. Subagentes utilizados: mvaanxmy-5-na8f (T9 worker), mvaastsg-6-52qw (T10 worker), mvabbzm1-8-472e (T12 worker), mvab4wjs-7-hhg6 (T9-T11 verify), mvabnigm-9-btie (T12 verify). Reporte final enviado al orquestador.
