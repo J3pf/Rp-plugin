@@ -669,15 +669,127 @@ describe("service installation", () => {
     const xml = schtasksXml({ ...spec, platform: "win32", nodePath, scriptPath });
     const f = fakeRun({
       "schtasks /Query /TN rp-host /XML": () => ({ stdout: xml }),
-      "schtasks /Query /TN rp-host /V /FO LIST": () => ({ stdout: "Status: Running\n" }),
+      "powershell -NoProfile -NonInteractive -Command (Get-ScheduledTask -TaskName 'rp-host').State": () => ({ stdout: "Running\r\n" }),
     });
-    await expect(inspectService({ ...spec, platform: "win32", home }, f.run)).resolves.toMatchObject({ installed: true, running: true, stale: false, nodePath, nodePathValid: true, scriptPath, scriptPathValid: true, enabled: true, details: { executionTimeLimit: "PT0S", disallowStartIfOnBatteries: false, stopIfGoingOnBatteries: false, enabled: true } });
+    await expect(inspectService({ ...spec, platform: "win32", home }, f.run)).resolves.toMatchObject({
+      installed: true,
+      running: true,
+      stale: false,
+      nodePath,
+      nodePathValid: true,
+      scriptPath,
+      scriptPathValid: true,
+      enabled: true,
+      details: { executionTimeLimit: "PT0S", disallowStartIfOnBatteries: false, stopIfGoingOnBatteries: false, enabled: true, taskState: "Running" },
+    });
     const missing = await inspectService({ ...spec, platform: "win32", home }, fakeRun({ "schtasks /Query": () => ({ code: 1 }) }).run);
     expect(missing).toMatchObject({ installed: false, running: false, stale: false });
     expect(f.calls.map(({ cmd, args }) => `${cmd} ${args.join(" ")}`)).toEqual([
       "schtasks /Query /TN rp-host /XML",
-      "schtasks /Query /TN rp-host /V /FO LIST",
+      "powershell -NoProfile -NonInteractive -Command (Get-ScheduledTask -TaskName 'rp-host').State",
     ]);
+  });
+  it("inspects Windows task state using locale-independent powershell or localized schtasks fallback", async () => {
+    const home = serviceTmp();
+    const nodePath = path.join(home, "node.exe");
+    const scriptPath = path.join(home, "rp-host.mjs");
+    fs.writeFileSync(nodePath, "node");
+    fs.writeFileSync(scriptPath, "script");
+    const xml = schtasksXml({ ...spec, platform: "win32", nodePath, scriptPath });
+
+    // 1. PowerShell returns "Ready" (stopped, not running)
+    const psReady = fakeRun({
+      "schtasks /Query /TN rp-host /XML": () => ({ stdout: xml }),
+      "powershell -NoProfile -NonInteractive -Command (Get-ScheduledTask -TaskName 'rp-host').State": () => ({ stdout: "Ready\r\n" }),
+    });
+    const readyResult = await inspectService({ ...spec, platform: "win32", home }, psReady.run);
+    expect(readyResult.running).toBe(false);
+    expect(readyResult.details?.taskState).toBe("Ready");
+
+    // 2. PowerShell fails, English schtasks fixture ("Status: Running")
+    const englishFixture = `Folder: \\
+HostName: TEST-PC
+TaskName: \\rp-host
+Next Run Time: N/A
+Status: Running
+Logon Mode: Interactive/Background
+`;
+    const fallbackEnglish = fakeRun({
+      "schtasks /Query /TN rp-host /XML": () => ({ stdout: xml }),
+      "powershell": () => ({ code: 1, stderr: "powershell not available" }),
+      "schtasks /Query /TN rp-host /V /FO LIST": () => ({ stdout: englishFixture }),
+    });
+    const enResult = await inspectService({ ...spec, platform: "win32", home }, fallbackEnglish.run);
+    expect(enResult.running).toBe(true);
+    expect(enResult.details?.taskState).toBe("Running");
+
+    // 3. PowerShell fails, Spanish schtasks fixture ("Estado: En ejecución")
+    const spanishRunningFixture = `Carpeta: \\
+Nombre de host: TEST-PC
+Nombre de tarea: \\rp-host
+Hora próxima ejecución: N/A
+Estado: En ejecución
+Modo de inicio de sesión: Interactivo/Fondo
+`;
+    const fallbackSpanish = fakeRun({
+      "schtasks /Query /TN rp-host /XML": () => ({ stdout: xml }),
+      "powershell": () => ({ code: 1, stderr: "powershell not available" }),
+      "schtasks /Query /TN rp-host /V /FO LIST": () => ({ stdout: spanishRunningFixture }),
+    });
+    const esResult = await inspectService({ ...spec, platform: "win32", home }, fallbackSpanish.run);
+    expect(esResult.running).toBe(true);
+    expect(esResult.details?.taskState).toBe("Running");
+
+    // 4. PowerShell fails, Spanish schtasks fixture ("Estado: Listo")
+    const spanishReadyFixture = `Carpeta: \\
+Nombre de tarea: \\rp-host
+Estado: Listo
+`;
+    const fallbackSpanishReady = fakeRun({
+      "schtasks /Query /TN rp-host /XML": () => ({ stdout: xml }),
+      "powershell": () => ({ code: 1, stderr: "powershell not available" }),
+      "schtasks /Query /TN rp-host /V /FO LIST": () => ({ stdout: spanishReadyFixture }),
+    });
+    const esReadyResult = await inspectService({ ...spec, platform: "win32", home }, fallbackSpanishReady.run);
+    expect(esReadyResult.running).toBe(false);
+    expect(esReadyResult.details?.taskState).toBe("Ready");
+
+    // 5. PowerShell fails, unknown localized label ("Statut: Inconnu") -> treated as unknown, not "not running"
+    const unknownFixture = `Folder: \\
+TaskName: \\rp-host
+Statut: Inconnu
+`;
+    const fallbackUnknown = fakeRun({
+      "schtasks /Query /TN rp-host /XML": () => ({ stdout: xml }),
+      "powershell": () => ({ code: 1, stderr: "powershell not available" }),
+      "schtasks /Query /TN rp-host /V /FO LIST": () => ({ stdout: unknownFixture }),
+    });
+    const unknownResult = await inspectService({ ...spec, platform: "win32", home }, fallbackUnknown.run);
+    expect(unknownResult.running).toBe(true);
+    expect(unknownResult.details?.taskState).toBe("Unknown");
+  });
+  it("tolerates UTF-16 encoded XML with BOM and NUL bytes from schtasks /Query /XML", async () => {
+    const home = serviceTmp();
+    const nodePath = path.join(home, "node.exe");
+    const scriptPath = path.join(home, "rp-host.mjs");
+    fs.writeFileSync(nodePath, "node");
+    fs.writeFileSync(scriptPath, "script");
+    const xml = schtasksXml({ ...spec, platform: "win32", nodePath, scriptPath });
+    // Simulate schtasks outputting UTF-16LE with BOM decoded as UTF-8 string containing NUL bytes
+    const utf16Buffer = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, "utf16le")]);
+    const utf16Stdout = utf16Buffer.toString("utf8");
+
+    const f = fakeRun({
+      "schtasks /Query /TN rp-host /XML": () => ({ stdout: utf16Stdout }),
+      "powershell -NoProfile -NonInteractive -Command (Get-ScheduledTask -TaskName 'rp-host').State": () => ({ stdout: "Running\r\n" }),
+    });
+    const inspection = await inspectService({ ...spec, platform: "win32", home }, f.run);
+    expect(inspection.installed).toBe(true);
+    expect(inspection.stale).toBe(false);
+    expect(inspection.nodePathValid).toBe(true);
+    expect(inspection.scriptPathValid).toBe(true);
+    expect(inspection.nodePath).toBe(nodePath);
+    expect(inspection.scriptPath).toBe(scriptPath);
   });
   it("detects legacy Windows tasks running node.exe directly as stale and self-heals them", async () => {
     const home = serviceTmp();

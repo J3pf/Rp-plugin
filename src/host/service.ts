@@ -228,15 +228,21 @@ function xmlUnescape(value: string): string {
   return value.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
 }
 
+function normalizeXmlString(xml: string): string {
+  return xml.replace(/^\uFEFF/, "").replace(/\0/g, "");
+}
+
 function xmlValue(xml: string, key: string): string | undefined {
+  const cleanXml = normalizeXmlString(xml);
   const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = xml.match(new RegExp(`<${escapedKey}>([\\s\\S]*?)</${escapedKey}>`, "i"));
+  const match = cleanXml.match(new RegExp(`<${escapedKey}>([\\s\\S]*?)</${escapedKey}>`, "i"));
   return match ? xmlUnescape(match[1]!.trim()) : undefined;
 }
 
 function xmlArray(xml: string, key: string): string[] {
+  const cleanXml = normalizeXmlString(xml);
   const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = xml.match(new RegExp(`<key>${escapedKey}</key>\\s*<array>([\\s\\S]*?)</array>`, "i"));
+  const match = cleanXml.match(new RegExp(`<key>${escapedKey}</key>\\s*<array>([\\s\\S]*?)</array>`, "i"));
   return match ? [...match[1]!.matchAll(/<string>([\s\S]*?)<\/string>/gi)].map((entry) => xmlUnescape(entry[1]!.trim())) : [];
 }
 
@@ -353,7 +359,8 @@ export async function inspectService(spec: ServiceSpec, run: Runner = realRun): 
     const query = await run("schtasks", ["/Query", "/TN", "rp-host", "/XML"]);
     if (query.code !== 0) return inspection;
     inspection.installed = true;
-    const xml = query.stdout;
+    const rawXml = query.stdout;
+    const xml = normalizeXmlString(rawXml);
     const command = xmlValue(xml, "Command") ?? "";
     const argumentsValue = xmlValue(xml, "Arguments") ?? "";
     const isConhost = /(?:^|[\\/])conhost(?:\.exe)?$/i.test(command);
@@ -371,8 +378,39 @@ export async function inspectService(spec: ServiceSpec, run: Runner = realRun): 
     }
     inspection.nodePathValid = validInstalledNode(inspection.nodePath);
     inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
-    const status = await run("schtasks", ["/Query", "/TN", "rp-host", "/V", "/FO", "LIST"]);
-    inspection.running = status.stdout.split("\n").some((line) => line.trim().replace(/\r$/, "").toLowerCase() === "status: running");
+
+    let taskState: string | undefined;
+    const ps = await run("powershell", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "(Get-ScheduledTask -TaskName 'rp-host').State",
+    ]);
+    if (ps.code === 0 && ps.stdout.trim()) {
+      taskState = ps.stdout.trim();
+      inspection.running = /^running$/i.test(taskState);
+      if (/^disabled$/i.test(taskState)) inspection.enabled = false;
+      else if (/^(?:running|ready)$/i.test(taskState)) inspection.enabled = true;
+    } else {
+      const status = await run("schtasks", ["/Query", "/TN", "rp-host", "/V", "/FO", "LIST"]);
+      const lines = status.stdout.split("\n").map((line) => line.trim().replace(/\r$/, ""));
+      const isRunning = lines.some((line) =>
+        /^(?:status|estado|statut)\s*:\s*(?:running|en ejecución|en cours d'exécution|wird ausgeführt)$/i.test(line)
+      );
+      const isStopped = lines.some((line) =>
+        /^(?:status|estado|statut)\s*:\s*(?:ready|listo|prêt|bereit|disabled|deshabilitado|désactivé)$/i.test(line)
+      );
+      if (isRunning) {
+        taskState = "Running";
+        inspection.running = true;
+      } else if (isStopped) {
+        taskState = "Ready";
+        inspection.running = false;
+      } else {
+        taskState = "Unknown";
+        inspection.running = true;
+      }
+    }
 
     const executionTimeLimit = xmlValue(xml, "ExecutionTimeLimit");
     const disallowStartIfOnBatteries = xmlValue(xml, "DisallowStartIfOnBatteries");
@@ -386,21 +424,22 @@ export async function inspectService(spec: ServiceSpec, run: Runner = realRun): 
     inspection.details = {
       command,
       arguments: argumentsValue,
+      taskState,
       executionTimeLimit,
       disallowStartIfOnBatteries: disallowStartIfOnBatteries === undefined ? undefined : disallowStartIfOnBatteries.toLowerCase() === "true",
       stopIfGoingOnBatteries: stopIfGoingOnBatteries === undefined ? undefined : stopIfGoingOnBatteries.toLowerCase() === "true",
       startWhenAvailable: startWhenAvailable === undefined ? undefined : startWhenAvailable.toLowerCase() === "true",
-      enabled: enabled === undefined ? undefined : enabled.toLowerCase() === "true",
+      enabled: enabled === undefined ? inspection.enabled : enabled.toLowerCase() === "true",
       multipleInstancesPolicy,
       restartOnFailure: restartInterval !== undefined && restartCount !== undefined ? { interval: restartInterval, count: Number(restartCount) } : undefined,
     };
-    inspection.enabled = enabled?.toLowerCase() === "true";
+    if (enabled !== undefined) inspection.enabled = enabled.toLowerCase() === "true";
     const reasons: string[] = [];
     if (!isConhost) reasons.push("task does not use windowless conhost launcher (visible console window)");
     else if (!/--headless/i.test(argumentsValue)) reasons.push("task arguments missing --headless flag");
     if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
     if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
-    if (enabled?.toLowerCase() !== "true") reasons.push("task is disabled");
+    if (inspection.enabled === false) reasons.push("task is disabled");
     if (executionTimeLimit !== "PT0S") reasons.push("task is missing ExecutionTimeLimit=PT0S");
     if (disallowStartIfOnBatteries?.toLowerCase() !== "false") reasons.push("task does not allow starting on battery power");
     if (stopIfGoingOnBatteries?.toLowerCase() !== "false") reasons.push("task may stop when switching to battery power");
