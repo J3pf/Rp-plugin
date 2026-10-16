@@ -12,6 +12,20 @@ export interface ServiceSpec {
   envPath?: string;
 }
 
+export interface ServiceInspection {
+  platform: NodeJS.Platform;
+  installed: boolean;
+  enabled?: boolean;
+  running: boolean;
+  nodePath?: string;
+  nodePathValid: boolean;
+  scriptPath?: string;
+  scriptPathValid: boolean;
+  stale: boolean;
+  staleReason?: string;
+  details?: Record<string, unknown>;
+}
+
 function isVersionedNodePath(nodePath: string): boolean {
   const normalized = nodePath.replace(/\\/g, "/");
   return normalized.includes("/Cellar/node/") ||
@@ -208,6 +222,216 @@ export async function enableLinger(user?: string, run: Runner = realRun): Promis
 function launchdDomain(): string {
   const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().uid;
   return `gui/${uid}`;
+}
+
+function xmlUnescape(value: string): string {
+  return value.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+}
+
+function xmlValue(xml: string, key: string): string | undefined {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = xml.match(new RegExp(`<${escapedKey}>([\\s\\S]*?)</${escapedKey}>`, "i"));
+  return match ? xmlUnescape(match[1]!.trim()) : undefined;
+}
+
+function xmlArray(xml: string, key: string): string[] {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = xml.match(new RegExp(`<key>${escapedKey}</key>\\s*<array>([\\s\\S]*?)</array>`, "i"));
+  return match ? [...match[1]!.matchAll(/<string>([\s\S]*?)<\/string>/gi)].map((entry) => xmlUnescape(entry[1]!.trim())) : [];
+}
+
+function parseExecStart(value: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let quoted = false;
+  let escaped = false;
+  for (const char of value.trim()) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+    } else if (char.charCodeAt(0) === 92) {
+      escaped = true;
+    } else if (char === '"') {
+      quoted = !quoted;
+    } else if (char.trim() === "" && !quoted) {
+      if (current) args.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  if (escaped) current += String.fromCharCode(92);
+  if (current) args.push(current);
+  return args;
+}
+
+function validInstalledNode(nodePath: string | undefined): boolean {
+  return Boolean(nodePath && fs.existsSync(nodePath) && !isStaleNodePath(nodePath));
+}
+
+function validInstalledScript(scriptPath: string | undefined): boolean {
+  return Boolean(scriptPath && fs.existsSync(scriptPath));
+}
+
+function uniqueReasons(reasons: string[]): string[] {
+  return [...new Set(reasons)];
+}
+
+export async function inspectService(spec: ServiceSpec, run: Runner = realRun): Promise<ServiceInspection> {
+  const home = spec.home ?? os.homedir();
+  const inspection: ServiceInspection = {
+    platform: spec.platform,
+    installed: false,
+    running: false,
+    nodePathValid: false,
+    scriptPathValid: false,
+    stale: false,
+  };
+
+  if (spec.platform === "linux") {
+    const unitPath = systemdUnitPath(home);
+    const enabled = await run("systemctl", ["--user", "is-enabled", "rp-host"]);
+    const active = await run("systemctl", ["--user", "is-active", "rp-host"]);
+    const linger = await checkLinger(undefined, run);
+    inspection.details = { linger: linger.lingering, ...(linger.error ? { lingerError: linger.error } : {}) };
+    inspection.enabled = enabled.code === 0;
+    if (!fs.existsSync(unitPath)) return inspection;
+
+    inspection.installed = true;
+    const reasons: string[] = [];
+    let unit = "";
+    try {
+      unit = fs.readFileSync(unitPath, "utf8");
+    } catch (error) {
+      reasons.push(`could not read systemd unit: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const execStart = unit.match(/^ExecStart=(.*)$/m)?.[1];
+    const args = execStart ? parseExecStart(execStart) : [];
+    inspection.nodePath = args[0];
+    inspection.scriptPath = args[1];
+    inspection.nodePathValid = validInstalledNode(inspection.nodePath);
+    inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
+    if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
+    if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
+    if (!unit.split("\n").some((line) => /^StartLimitIntervalSec\s*=\s*0\s*$/.test(line))) reasons.push("systemd unit is missing StartLimitIntervalSec=0");
+    if (!unit.split("\n").some((line) => line.startsWith('Environment="PATH='))) reasons.push('systemd unit is missing Environment="PATH=..."');
+    inspection.running = active.code === 0 || active.stdout === "active\n";
+    inspection.stale = reasons.length > 0;
+    if (inspection.stale) inspection.staleReason = uniqueReasons(reasons).join("; ");
+    return inspection;
+  }
+
+  if (spec.platform === "darwin") {
+    const plistPath = launchdPath(home);
+    if (!fs.existsSync(plistPath)) return inspection;
+    inspection.installed = true;
+    let plist = "";
+    const reasons: string[] = [];
+    try {
+      plist = fs.readFileSync(plistPath, "utf8");
+    } catch (error) {
+      reasons.push(`could not read launchd plist: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const args = xmlArray(plist, "ProgramArguments");
+    inspection.nodePath = args[0];
+    inspection.scriptPath = args[1];
+    inspection.nodePathValid = validInstalledNode(inspection.nodePath);
+    inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
+    if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
+    if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
+    const hasEnvironment = plist.includes("<key>EnvironmentVariables</key>");
+    inspection.details = { environmentVariables: hasEnvironment };
+    if (!hasEnvironment) reasons.push("launchd plist is missing EnvironmentVariables");
+    const status = await run("launchctl", ["list", LAUNCHD_LABEL]);
+    inspection.running = status.code === 0;
+    inspection.stale = reasons.length > 0;
+    if (inspection.stale) inspection.staleReason = uniqueReasons(reasons).join("; ");
+    return inspection;
+  }
+
+  if (spec.platform === "win32") {
+    const query = await run("schtasks", ["/Query", "/TN", "rp-host", "/XML"]);
+    if (query.code !== 0) return inspection;
+    inspection.installed = true;
+    const xml = query.stdout;
+    const command = xmlValue(xml, "Command");
+    const argumentsValue = xmlValue(xml, "Arguments") ?? "";
+    const trimmedArguments = argumentsValue.trim();
+    const firstQuote = trimmedArguments.startsWith('"') ? trimmedArguments.indexOf('"', 1) : -1;
+    inspection.nodePath = command;
+    inspection.scriptPath = firstQuote > 1 ? trimmedArguments.slice(1, firstQuote) : trimmedArguments.split(/\s/, 1)[0];
+    inspection.nodePathValid = validInstalledNode(inspection.nodePath);
+    inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
+    const status = await run("schtasks", ["/Query", "/TN", "rp-host", "/V", "/FO", "LIST"]);
+    inspection.running = status.stdout.split("\n").some((line) => line.trim().replace(/\r$/, "").toLowerCase() === "status: running");
+
+    const executionTimeLimit = xmlValue(xml, "ExecutionTimeLimit");
+    const disallowStartIfOnBatteries = xmlValue(xml, "DisallowStartIfOnBatteries");
+    const stopIfGoingOnBatteries = xmlValue(xml, "StopIfGoingOnBatteries");
+    const startWhenAvailable = xmlValue(xml, "StartWhenAvailable");
+    const settings = xml.match(/<Settings>([\s\S]*?)<\/Settings>/i)?.[1] ?? "";
+    const enabled = xmlValue(settings, "Enabled");
+    const multipleInstancesPolicy = xmlValue(xml, "MultipleInstancesPolicy");
+    const restartInterval = xmlValue(xml, "Interval");
+    const restartCount = xmlValue(xml, "Count");
+    inspection.details = {
+      executionTimeLimit,
+      disallowStartIfOnBatteries: disallowStartIfOnBatteries === undefined ? undefined : disallowStartIfOnBatteries.toLowerCase() === "true",
+      stopIfGoingOnBatteries: stopIfGoingOnBatteries === undefined ? undefined : stopIfGoingOnBatteries.toLowerCase() === "true",
+      startWhenAvailable: startWhenAvailable === undefined ? undefined : startWhenAvailable.toLowerCase() === "true",
+      enabled: enabled === undefined ? undefined : enabled.toLowerCase() === "true",
+      multipleInstancesPolicy,
+      restartOnFailure: restartInterval !== undefined && restartCount !== undefined ? { interval: restartInterval, count: Number(restartCount) } : undefined,
+    };
+    inspection.enabled = enabled?.toLowerCase() === "true";
+    const reasons: string[] = [];
+    if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
+    if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
+    if (enabled?.toLowerCase() !== "true") reasons.push("task is disabled");
+    if (executionTimeLimit !== "PT0S") reasons.push("task is missing ExecutionTimeLimit=PT0S");
+    if (disallowStartIfOnBatteries?.toLowerCase() !== "false") reasons.push("task does not allow starting on battery power");
+    if (stopIfGoingOnBatteries?.toLowerCase() !== "false") reasons.push("task may stop when switching to battery power");
+    if (startWhenAvailable?.toLowerCase() !== "true") reasons.push("task is missing StartWhenAvailable=true");
+    if (multipleInstancesPolicy !== "IgnoreNew") reasons.push("task is missing MultipleInstancesPolicy=IgnoreNew");
+    if (restartInterval !== "PT1M" || restartCount !== "999") reasons.push("task is missing its restart-on-failure policy");
+    inspection.stale = reasons.length > 0;
+    if (inspection.stale) inspection.staleReason = uniqueReasons(reasons).join("; ");
+    return inspection;
+  }
+
+  throw new Error(`unsupported platform ${spec.platform}`);
+}
+
+export async function ensureHostService(spec: ServiceSpec, run: Runner = realRun): Promise<{ action: "none" | "installed" | "reinstalled" | "started"; inspection: ServiceInspection; warning?: string }> {
+  const inspection = await inspectService(spec, run);
+  if (!inspection.installed) {
+    const warning = await installService(spec, run);
+    return { action: "installed", inspection, warning };
+  }
+  if (inspection.stale) {
+    const warning = await installService(spec, run);
+    return { action: "reinstalled", inspection, warning };
+  }
+  if (!inspection.running) {
+    let command: string;
+    let args: string[];
+    if (spec.platform === "linux") {
+      command = "systemctl";
+      args = ["--user", "start", "rp-host"];
+    } else if (spec.platform === "darwin") {
+      command = "launchctl";
+      args = ["kickstart", "-k", `${launchdDomain()}/${LAUNCHD_LABEL}`];
+    } else if (spec.platform === "win32") {
+      command = "schtasks";
+      args = ["/Run", "/TN", "rp-host"];
+    } else {
+      throw new Error(`unsupported platform ${spec.platform}`);
+    }
+    const started = await run(command, args);
+    if (started.code !== 0) throw new Error(`${command} start failed: ${started.stderr.trim() || started.stdout.trim() || `exit code ${started.code}`}`);
+    return { action: "started", inspection };
+  }
+  return { action: "none", inspection };
 }
 
 export async function installService(spec: ServiceSpec, run: Runner = realRun): Promise<string> {

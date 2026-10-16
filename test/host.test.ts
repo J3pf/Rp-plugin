@@ -9,7 +9,7 @@ import { TmuxBackend, parseTmuxVersion, tmuxSupportsEnv, tmuxSessionName } from 
 import { WindowsTerminalBackend, ConsoleBackend, wtArgs, consoleArgs, killScript } from "../src/host/backends/windows.ts";
 import { HostManager } from "../src/host/manager.ts";
 import { HostConnection, parseTarget } from "../src/host/connection.ts";
-import { checkLinger, enableLinger, isStaleNodePath, launchdPlist, resolveStableNodePath, schtasksCreateArgs, schtasksCreateXmlArgs, schtasksXml, systemdUnit, installService, uninstallService } from "../src/host/service.ts";
+import { checkLinger, enableLinger, ensureHostService, inspectService, isStaleNodePath, launchdPlist, resolveStableNodePath, schtasksCreateArgs, schtasksCreateXmlArgs, schtasksXml, systemdUnit, installService, uninstallService } from "../src/host/service.ts";
 import type { Runner } from "../src/host/runner.ts";
 import { FakeRelay, waitUntil } from "./helpers.ts";
 import { envelope } from "../src/shared/protocol.ts";
@@ -457,6 +457,15 @@ describe("HostConnection protocol", () => {
 });
 
 describe("service installation", () => {
+  const serviceHomes: string[] = [];
+  const serviceTmp = () => {
+    const home = tmp();
+    serviceHomes.push(home);
+    return home;
+  };
+  afterEach(() => {
+    for (const home of serviceHomes.splice(0)) fs.rmSync(home, { recursive: true, force: true });
+  });
   const spec = { nodePath: "/usr/bin/node", scriptPath: "/opt/rp/bin/rp-host.mjs", platform: "linux" as const };
   it("resolves a non-realpath'd PATH node matching a versioned execPath", () => {
     const root = tmp();
@@ -594,6 +603,104 @@ describe("service installation", () => {
     const failedEnable = fakeRun({ "loginctl enable-linger alice": () => ({ code: 1, stderr: "access denied" }) });
     await expect(enableLinger("alice", failedEnable.run)).resolves.toEqual({ ok: false, message: expect.stringContaining("access denied") });
     expect((await enableLinger("alice", failedEnable.run)).message).toContain("privileges");
+  });
+  it("inspects a Linux systemd service and linger status", async () => {
+    const home = serviceTmp();
+    const nodePath = path.join(home, "node");
+    const scriptPath = path.join(home, "rp-host.mjs");
+    fs.writeFileSync(nodePath, "node");
+    fs.writeFileSync(scriptPath, "script");
+    const linuxSpec = { ...spec, home, nodePath, scriptPath };
+    const unitPath = path.join(home, ".config", "systemd", "user", "rp-host.service");
+    fs.mkdirSync(path.dirname(unitPath), { recursive: true });
+    fs.writeFileSync(unitPath, systemdUnit({ ...linuxSpec, envPath: "/usr/bin" }));
+    const f = fakeRun({
+      "systemctl --user is-enabled rp-host": () => ({ stdout: "enabled\n" }),
+      "systemctl --user is-active rp-host": () => ({ code: 3, stdout: "active\n" }),
+      "loginctl show-user": () => ({ stdout: "Linger=yes\n" }),
+    });
+    const inspection = await inspectService(linuxSpec, f.run);
+    expect(inspection).toMatchObject({ platform: "linux", installed: true, enabled: true, running: true, nodePath, nodePathValid: true, scriptPath, scriptPathValid: true, stale: false, details: { linger: true } });
+    expect(f.calls.map(({ cmd, args }) => `${cmd} ${args.join(" ")}`)).toEqual([
+      "systemctl --user is-enabled rp-host",
+      "systemctl --user is-active rp-host",
+      `loginctl show-user ${process.env.USER ?? os.userInfo().username} -p Linger`,
+    ]);
+  });
+  it("marks missing Linux services uninstalled and stale service contents for repair", async () => {
+    const home = serviceTmp();
+    const missing = await inspectService({ ...spec, home }, fakeRun({ "loginctl show-user": () => ({ stdout: "Linger=no\n" }) }).run);
+    expect(missing).toMatchObject({ installed: false, running: false, stale: false, details: { linger: false } });
+    const unit = path.join(home, ".config/systemd/user/rp-host.service");
+    fs.mkdirSync(path.dirname(unit), { recursive: true });
+    fs.writeFileSync(unit, `[Unit]\n[Service]\nExecStart=/missing/node /missing/rp-host.mjs run\n`);
+    const stale = await inspectService({ ...spec, home }, fakeRun({ "loginctl show-user": () => ({ stdout: "Linger=yes\n" }) }).run);
+    expect(stale).toMatchObject({ installed: true, stale: true, nodePath: "/missing/node", nodePathValid: false, scriptPath: "/missing/rp-host.mjs", scriptPathValid: false });
+    expect(stale.staleReason).toMatch(/node|script|StartLimit|PATH/i);
+  });
+  it("inspects a Darwin launchd agent and detects stale or incomplete plists", async () => {
+    const home = serviceTmp();
+    const nodePath = path.join(home, "node");
+    const scriptPath = path.join(home, "rp-host.mjs");
+    fs.writeFileSync(nodePath, "node");
+    fs.writeFileSync(scriptPath, "script");
+    const plist = path.join(home, "Library/LaunchAgents/dev.j3pf.rp-host.plist");
+    fs.mkdirSync(path.dirname(plist), { recursive: true });
+    fs.writeFileSync(plist, launchdPlist({ ...spec, platform: "darwin", home, nodePath, scriptPath, envPath: "/usr/bin" }));
+    const f = fakeRun({ "launchctl list dev.j3pf.rp-host": () => ({}) });
+    await expect(inspectService({ ...spec, platform: "darwin", home, nodePath, scriptPath }, f.run)).resolves.toMatchObject({ installed: true, running: true, stale: false, nodePath, nodePathValid: true, scriptPath, scriptPathValid: true });
+    fs.writeFileSync(plist, `<dict><key>ProgramArguments</key><array><string>/missing/node</string><string>/missing/script</string></array></dict>`);
+    await expect(inspectService({ ...spec, platform: "darwin", home }, fakeRun({ "launchctl list": () => ({ code: 1 }) }).run)).resolves.toMatchObject({ installed: true, running: false, stale: true, nodePathValid: false, scriptPathValid: false });
+  });
+  it("inspects Windows task status, paths and required recovery policies", async () => {
+    const home = serviceTmp();
+    const nodePath = path.join(home, "node.exe");
+    const scriptPath = path.join(home, "rp-host.mjs");
+    fs.writeFileSync(nodePath, "node");
+    fs.writeFileSync(scriptPath, "script");
+    const xml = schtasksXml({ ...spec, platform: "win32", nodePath, scriptPath });
+    const f = fakeRun({
+      "schtasks /Query /TN rp-host /XML": () => ({ stdout: xml }),
+      "schtasks /Query /TN rp-host /V /FO LIST": () => ({ stdout: "Status: Running\n" }),
+    });
+    await expect(inspectService({ ...spec, platform: "win32", home }, f.run)).resolves.toMatchObject({ installed: true, running: true, stale: false, nodePath, nodePathValid: true, scriptPath, scriptPathValid: true, enabled: true, details: { executionTimeLimit: "PT0S", disallowStartIfOnBatteries: false, stopIfGoingOnBatteries: false, enabled: true } });
+    const missing = await inspectService({ ...spec, platform: "win32", home }, fakeRun({ "schtasks /Query": () => ({ code: 1 }) }).run);
+    expect(missing).toMatchObject({ installed: false, running: false, stale: false });
+    expect(f.calls.map(({ cmd, args }) => `${cmd} ${args.join(" ")}`)).toEqual([
+      "schtasks /Query /TN rp-host /XML",
+      "schtasks /Query /TN rp-host /V /FO LIST",
+    ]);
+  });
+  it("self-heals services according to installed, stale, running and healthy state", async () => {
+    const home = serviceTmp();
+    const nodePath = path.join(home, "node");
+    const scriptPath = path.join(home, "rp-host.mjs");
+    fs.writeFileSync(nodePath, "node");
+    fs.writeFileSync(scriptPath, "script");
+    const linuxSpec = { ...spec, home, nodePath, scriptPath };
+    const handlers = (active: boolean) => ({
+      "systemctl --user is-enabled rp-host": () => ({ stdout: "enabled\n" }),
+      "systemctl --user is-active rp-host": () => active ? ({ stdout: "active\n" }) : ({ code: 3, stdout: "inactive\n" }),
+      "loginctl show-user": () => ({ stdout: "Linger=yes\n" }),
+      "systemctl --user daemon-reload": () => ({}),
+      "systemctl --user enable --now rp-host": () => ({}),
+      "systemctl --user start rp-host": () => ({}),
+    });
+    const absent = await ensureHostService(linuxSpec, fakeRun(handlers(false)).run);
+    expect(absent.action).toBe("installed");
+    const unit = systemdUnit({ ...linuxSpec, envPath: process.env.PATH });
+    const unitPath = path.join(home, ".config", "systemd", "user", "rp-host.service");
+    fs.mkdirSync(path.dirname(unitPath), { recursive: true });
+    fs.writeFileSync(unitPath, unit.replace(nodePath, "/missing/old-node"));
+    const stale = await ensureHostService(linuxSpec, fakeRun(handlers(false)).run);
+    expect(stale.action).toBe("reinstalled");
+    fs.writeFileSync(unitPath, unit);
+    const stopped = fakeRun(handlers(false));
+    expect((await ensureHostService(linuxSpec, stopped.run)).action).toBe("started");
+    expect(stopped.calls.some(({ cmd, args }) => cmd === "systemctl" && args.includes("start"))).toBe(true);
+    const healthy = fakeRun(handlers(true));
+    expect((await ensureHostService(linuxSpec, healthy.run)).action).toBe("none");
+    expect(healthy.calls.some(({ args }) => args.includes("start"))).toBe(false);
   });
   it("install/uninstall run the right commands per OS", async () => {
     const home = tmp();
