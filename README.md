@@ -13,10 +13,10 @@ para lanzar agentes nuevos desde el móvil (en herdr, tmux o Windows Terminal).
 ### Desde la release oficial de GitHub (Recomendado)
 ```bash
 # Pi estándar (~/.pi/agent)
-pi install https://github.com/J3pf/Rp-plugin/releases/download/v0.1.0/j3pf-pi-rp-0.1.0.tgz
+pi install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.0/j3pf-pi-rp-0.2.0.tgz
 
 # gentle-shell (~/.gentle-shell/agent)
-gentle-shell install https://github.com/J3pf/Rp-plugin/releases/download/v0.1.0/j3pf-pi-rp-0.1.0.tgz
+gentle-shell install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.0/j3pf-pi-rp-0.2.0.tgz
 ```
 
 ### O desde código fuente local
