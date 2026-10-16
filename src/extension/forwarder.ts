@@ -78,7 +78,7 @@ export interface ForwarderDeps {
   onToolStart?: (toolName: string, args: any, toolCallId?: string, parentToolCallId?: string) => void;
   onToolEnd?: (toolName: string, result: any, isError: boolean, toolCallId?: string, durationMs?: number, parentToolCallId?: string) => void;
   onAgentStart?: () => void;
-  onAgentSettled?: () => void;
+  onAgentSettled?: (aborted?: boolean) => void;
   timers?: { set: typeof setTimeout; clear: typeof clearTimeout };
   now?: () => number;
 }
@@ -113,7 +113,7 @@ export class Forwarder {
         return this.d.send({ type: "agent_start" });
       case "agent_settled":
         this.flushDeltas();
-        this.d.onAgentSettled?.();
+        this.d.onAgentSettled?.(!!ev?.aborted);
         return this.d.send({ type: "agent_settled", aborted: !!ev?.aborted });
       case "turn_start":
         return this.d.send({ type: "turn_start", turnIndex: ev?.turnIndex });

@@ -39,7 +39,7 @@ Branch: `feat/agent-mesh-v0.2.1` | Status: in_progress
 - C2-D6: Wait for frozen relay SHA: `npm run fixtures` + contract tests against relay's fixtures; merge to main, bump 0.2.1, npm pack, tag, push, release, README URLs.
 
 ### Tasks (Cycle 2)
-- T9 (C2-D1, C2-D2) [gentle-ai-worker] Fix `at` preservation in onToolEnd, remove `mostRecentInbound` fallback in fillReplyPeer, add tests: done (commit pending)
-- T10 (C2-D3, C2-D4) [gentle-ai-worker] Implement bounded memory (LRU 500), abort clearing, session reset in Runtime, and strongly typed emitEvent: in_progress
-- T11 (C2-D5) [gentle-ai-worker] Document inbound handover behavior in `docs/PLAN-PLUGIN.md`: pending
+- T9 (C2-D1, C2-D2) [gentle-ai-worker] Fix `at` preservation in onToolEnd, remove `mostRecentInbound` fallback in fillReplyPeer, add tests: done (commit 9b76b17)
+- T10 (C2-D3, C2-D4) [gentle-ai-worker] Implement bounded memory (LRU 500), abort clearing, session reset in Runtime, and strongly typed emitEvent: done (commit pending)
+- T11 (C2-D5) [gentle-ai-worker] Document inbound handover behavior in `docs/PLAN-PLUGIN.md`: in_progress
 - T12 (C2-D6) [gentle-ai-verify] Await frozen relay SHA, run fixtures/contract tests, independent verification, and deliver v0.2.1 release: pending

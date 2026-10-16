@@ -75,6 +75,7 @@ export interface CommEvent {
   delivered?: boolean | null;
   at: number;
 }
+export type AgentEventPayload = CommEvent | SubagentUpdateEvent | TodoUpdateEvent | Record<string, unknown>;
 export type GentleMode = "normal" | "auto" | "yolo" | "unknown";
 export type PromptKind = "confirm" | "select" | "input" | "questionnaire";
 export type PromptCategory = "permission" | "question" | "dialog";

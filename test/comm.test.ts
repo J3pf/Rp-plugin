@@ -1,6 +1,38 @@
 import { describe, expect, it } from "vitest";
-import { CommTracker } from "../src/extension/comm.ts";
+import { BoundedMap, BoundedSet, CommTracker } from "../src/extension/comm.ts";
 import type { CommEvent } from "../src/shared/protocol.ts";
+
+describe("bounded collections", () => {
+  it("evicts the least-recently-used entry after exceeding capacity", () => {
+    const map = new BoundedMap<number, number>();
+    for (let i = 0; i <= 500; i++) map.set(i, i);
+    expect(map.size).toBe(500);
+    expect(map.has(0)).toBe(false);
+    expect(map.get(500)).toBe(500);
+
+    // Accessing and updating existing keys refreshes their LRU position.
+    map.get(1);
+    map.set(2, 2);
+    map.set(501, 501);
+    expect(map.has(1)).toBe(true);
+    expect(map.has(2)).toBe(true);
+    expect(map.has(3)).toBe(false);
+
+    const set = new BoundedSet<number>();
+    for (let i = 0; i <= 500; i++) set.add(i);
+    expect(set.size).toBe(500);
+    expect(set.has(0)).toBe(false);
+    expect(set.has(500)).toBe(true);
+
+    // has() and add() of an existing value refresh its LRU position.
+    set.has(1);
+    set.add(2);
+    set.add(501);
+    expect(set.has(1)).toBe(true);
+    expect(set.has(2)).toBe(true);
+    expect(set.has(3)).toBe(false);
+  });
+});
 
 describe("CommTracker outgoing events", () => {
   function tracker(redacted = false) {
@@ -98,6 +130,50 @@ describe("CommTracker outgoing events", () => {
     expect(events[1]!.peer.name).toBeNull();
     expect(events[1]!.peer.cwd).toBeNull();
     expect(events[1]!.replyTo).toBe("msg-unknown");
+  });
+
+  it("clears active calls after an aborted agent settles", () => {
+    const { comm, events } = tracker();
+    comm.onToolStart("intercom", { action: "send", message: "hello" }, "aborted-call");
+    comm.onAgentSettled(true);
+    comm.onToolEnd("intercom", { details: { delivered: true, messageId: "late-message" } }, false, "aborted-call");
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ direction: "out", messageId: null, delivered: null });
+  });
+
+  it("reset clears active calls, inbound messages, known peers, and deduplication state", () => {
+    const { comm, events } = tracker();
+    const previouslySeen = {
+      customType: "intercom_message",
+      details: { from: { id: "peer-session", name: "Peer", cwd: "/peer" }, message: { id: "seen-message" }, bodyText: "hello" },
+    };
+    comm.onToolStart("intercom", { action: "send", message: "pending" }, "pending-call");
+    comm.recordInbound({ id: "peer-session", name: "Peer", cwd: "/peer" }, { id: "inbound-message" });
+    comm.onMessage(previouslySeen);
+    expect(events).toHaveLength(2);
+
+    comm.reset();
+    comm.onToolEnd("intercom", { details: { delivered: true, messageId: "late-message" } }, false, "pending-call");
+    comm.onToolStart("intercom", { action: "reply", replyTo: "inbound-message", message: "answer" }, "reply-1");
+    comm.onToolStart("intercom", { action: "reply", to: "Peer", replyTo: "unknown-message", message: "answer" }, "reply-2");
+
+    expect(events).toHaveLength(4);
+    expect(events[2]!.peer).toEqual({ sessionId: null, name: null, cwd: null, ref: null });
+    expect(events[3]!.peer).toEqual({ sessionId: null, name: null, cwd: null, ref: "Peer" });
+
+    comm.onMessage(previouslySeen);
+    expect(events).toHaveLength(5);
+    expect(events[4]).toMatchObject({ direction: "in", messageId: "seen-message" });
+  });
+
+  it("preserves active calls when an agent settles without aborting", () => {
+    const { comm, events } = tracker();
+    comm.onToolStart("intercom", { action: "send", message: "hello" }, "call-1");
+    comm.onAgentSettled(false);
+    comm.onToolEnd("intercom", { details: { messageId: "sent-1" } }, false, "call-1");
+    expect(events).toHaveLength(2);
+    expect(events[1]).toMatchObject({ messageId: "sent-1", delivered: true });
   });
 
   it("uses details.delivered when boolean and otherwise derives delivery from error", () => {
