@@ -13,19 +13,19 @@ para lanzar agentes nuevos desde el móvil (en herdr, tmux o Windows Terminal).
 ### Desde la release oficial de GitHub (Recomendado)
 ```bash
 # Pi estándar (~/.pi/agent)
-pi install git:github.com/J3pf/Rp-plugin@v0.2.2
+pi install git:github.com/J3pf/Rp-plugin@v0.2.3
 
 # gentle-shell (~/.gentle-shell/agent) — verificado: reenvía git: a su entorno aislado
-gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.2
+gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.3
 ```
 
 ### Alternativa offline (desde tarball de la release)
-Pi registra la ruta local de la carpeta donde se instala; para evitar perder el paquete si se limpian carpetas temporales o de descargas, descomprime el `.tgz` en una ubicación permanente (ej. `~/.pi/agent/packages/j3pf-pi-rp-0.2.2`):
+Pi registra la ruta local de la carpeta donde se instala; para evitar perder el paquete si se limpian carpetas temporales o de descargas, descomprime el `.tgz` en una ubicación permanente (ej. `~/.pi/agent/packages/j3pf-pi-rp-0.2.3`):
 ```bash
-mkdir -p ~/.pi/agent/packages/j3pf-pi-rp-0.2.2
-tar -xzf j3pf-pi-rp-0.2.2.tgz -C ~/.pi/agent/packages/j3pf-pi-rp-0.2.2 --strip-components=1
-cd ~/.pi/agent/packages/j3pf-pi-rp-0.2.2 && npm install --omit=dev
-cd ~/.pi/agent && pi install ./packages/j3pf-pi-rp-0.2.2
+mkdir -p ~/.pi/agent/packages/j3pf-pi-rp-0.2.3
+tar -xzf j3pf-pi-rp-0.2.3.tgz -C ~/.pi/agent/packages/j3pf-pi-rp-0.2.3 --strip-components=1
+cd ~/.pi/agent/packages/j3pf-pi-rp-0.2.3 && npm install --omit=dev
+cd ~/.pi/agent && pi install ./packages/j3pf-pi-rp-0.2.3
 ```
 
 ### O desde código fuente local
@@ -39,7 +39,7 @@ pi install .
 Para evitar que una versión anterior y la nueva carguen a la vez en Pi:
 1. **Instala la nueva versión primero** (para garantizar que una falla de red nunca te deje sin plugin):
    ```bash
-   pi install git:github.com/J3pf/Rp-plugin@v0.2.2
+   pi install git:github.com/J3pf/Rp-plugin@v0.2.3
    ```
 2. **Revisa las fuentes instaladas con `pi list` y desinstala la versión anterior**:
    ```bash

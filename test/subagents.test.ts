@@ -77,32 +77,107 @@ describe("SubagentTracker", () => {
     expect(last.error).toBe("out of budget");
   });
 
-  it("integrates with gentle-pi notification events", () => {
+  it("integrates with gentle-pi notification events with epoch timestamps", () => {
     const emitted: SubagentUpdateEvent[] = [];
+    const t0 = 1760000000000;
     const tracker = new SubagentTracker({
       emit: (ev) => emitted.push(ev),
-      now: () => 5000,
+      now: () => t0,
     });
 
     tracker.onGentleNotification({
       source: "subagent",
       taskId: "gentle_task_1",
       status: "running",
-      occurredAt: 5000,
+      occurredAt: t0,
     });
     expect(emitted).toHaveLength(1);
     expect(emitted[0].taskId).toBe("gentle_task_1");
     expect(emitted[0].status).toBe("running");
+    expect(emitted[0].startedAt).toBe(t0);
 
     tracker.onGentleNotification({
       source: "subagent",
       taskId: "gentle_task_1",
       status: "completed",
-      occurredAt: 5400,
+      occurredAt: t0 + 400,
     });
     expect(emitted).toHaveLength(2);
     expect(emitted[1].status).toBe("completed");
+    expect(emitted[1].endedAt).toBe(t0 + 400);
     expect(emitted[1].durationMs).toBe(400);
+  });
+
+  it("normalizes performance.now timestamps (e.g. 47725510.340108) to integer epoch ms from now", () => {
+    const emitted: SubagentUpdateEvent[] = [];
+    const before = Date.now();
+    const tracker = new SubagentTracker({
+      emit: (ev) => emitted.push(ev),
+    });
+
+    // 47725510.340108 is performance.now() (~13h since boot), not epoch ms
+    tracker.onGentleNotification({
+      source: "subagent",
+      taskId: "perf_task",
+      status: "running",
+      occurredAt: 47725510.340108,
+    });
+    const after = Date.now();
+
+    expect(emitted).toHaveLength(1);
+    const start = emitted[0].startedAt!;
+    expect(Number.isInteger(start)).toBe(true);
+    expect(start).toBeGreaterThanOrEqual(before);
+    expect(start).toBeLessThanOrEqual(after);
+
+    // End with another performance.now timestamp
+    tracker.onGentleNotification({
+      source: "subagent",
+      taskId: "perf_task",
+      status: "completed",
+      occurredAt: 47725610.123456,
+    });
+    const end = emitted[1].endedAt!;
+    expect(Number.isInteger(end)).toBe(true);
+    expect(end).toBeGreaterThanOrEqual(start);
+    expect(emitted[1].durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isInteger(emitted[1].durationMs!)).toBe(true);
+  });
+
+  it("keeps valid epoch occurredAt (rounded) and guarantees durationMs is never negative", () => {
+    const emitted: SubagentUpdateEvent[] = [];
+    const validEpoch = 1760000000123.6;
+    const tracker = new SubagentTracker({
+      emit: (ev) => emitted.push(ev),
+      now: () => 1760000000500,
+    });
+
+    tracker.onGentleNotification({
+      source: "subagent",
+      taskId: "valid_task",
+      status: "running",
+      occurredAt: validEpoch,
+    });
+    expect(emitted[0].startedAt).toBe(1760000000124);
+
+    // Backward clock anomaly: endedAt earlier than startedAt -> durationMs must clamp to 0
+    tracker.onGentleNotification({
+      source: "subagent",
+      taskId: "valid_task",
+      status: "completed",
+      occurredAt: validEpoch - 500,
+    });
+    expect(emitted[1].durationMs).toBe(0);
+
+    // Prefers explicit source duration if provided
+    tracker.onGentleNotification({
+      source: "subagent",
+      taskId: "valid_task_2",
+      status: "completed",
+      occurredAt: validEpoch + 1000,
+      durationMs: 750.8,
+    });
+    expect(emitted[2].durationMs).toBe(751);
   });
 
   it("integrates with gentle child metrics events", () => {
@@ -194,6 +269,54 @@ describe("Runtime Subagent integration", () => {
       status: "completed",
       durationMs: 450,
     });
+
+    await rt.dispose();
+    await relay.stop();
+  });
+
+  it("normalizes gentle notification with performance.now timestamp end-to-end over relay", async () => {
+    const relay = await new FakeRelay().start();
+    const ctx = makeCtx();
+    const { pi } = makePi();
+    const rt = new Runtime(pi, ctx, baseConfig(relay.url), detectStaticEnv(), "startup");
+    rt.start();
+    await waitUntil(() => relay.of("agent.snapshot").length === 1);
+
+    const before = Date.now();
+    rt.subagents.onGentleNotification({
+      source: "subagent",
+      taskId: "gentle_task_perf",
+      status: "running",
+      occurredAt: 47725510.340108,
+    });
+
+    await waitUntil(() =>
+      relay.of("agent.event").some((e) => e.d.e?.type === "subagent_update" && e.d.e?.taskId === "gentle_task_perf"),
+    );
+    const after = Date.now();
+    const events = relay.of("agent.event").map((e) => e.d.e);
+    const startEvent = events.find((e: any) => e.type === "subagent_update" && e.taskId === "gentle_task_perf");
+    expect(startEvent).toBeDefined();
+    expect(Number.isInteger(startEvent.startedAt)).toBe(true);
+    expect(startEvent.startedAt).toBeGreaterThanOrEqual(before);
+    expect(startEvent.startedAt).toBeLessThanOrEqual(after);
+
+    rt.subagents.onGentleNotification({
+      source: "subagent",
+      taskId: "gentle_task_perf",
+      status: "completed",
+      occurredAt: 47725610.123456,
+      durationMs: 99.8,
+    });
+
+    await waitUntil(() =>
+      relay.of("agent.event").some((e) => e.d.e?.type === "subagent_update" && e.d.e?.status === "completed" && e.d.e?.taskId === "gentle_task_perf"),
+    );
+    const endEvents = relay.of("agent.event").map((e) => e.d.e);
+    const endEvent = endEvents.filter((e: any) => e.type === "subagent_update" && e.taskId === "gentle_task_perf").pop();
+    expect(endEvent).toBeDefined();
+    expect(Number.isInteger(endEvent.endedAt)).toBe(true);
+    expect(endEvent.durationMs).toBe(100);
 
     await rt.dispose();
     await relay.stop();

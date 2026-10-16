@@ -84,3 +84,34 @@ export class LruSet {
 export function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
+
+export const MIN_PLAUSIBLE_EPOCH_MS = 1577836800000; // 2020-01-01T00:00:00.000Z
+export const MAX_FUTURE_DRIFT_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Validate that a candidate timestamp is a plausible epoch millisecond timestamp; otherwise fallback to now. Always rounds to integer. */
+export function toEpochMs(candidate: unknown, fallbackNow: number = Date.now()): number {
+  const now = Math.round(fallbackNow);
+  if (typeof candidate === "number" && Number.isFinite(candidate)) {
+    const rounded = Math.round(candidate);
+    if (rounded >= MIN_PLAUSIBLE_EPOCH_MS && rounded <= now + MAX_FUTURE_DRIFT_MS) {
+      return rounded;
+    }
+  }
+  return now;
+}
+
+/** Compute a safe, non-negative integer duration in milliseconds. */
+export function safeDurationMs(
+  startedAt?: number,
+  endedAt?: number,
+  sourceDuration?: unknown,
+): number | undefined {
+  if (typeof sourceDuration === "number" && Number.isFinite(sourceDuration) && sourceDuration >= 0) {
+    return Math.round(sourceDuration);
+  }
+  if (startedAt !== undefined && endedAt !== undefined) {
+    return Math.max(0, Math.round(endedAt - startedAt));
+  }
+  return undefined;
+}
+

@@ -1,5 +1,6 @@
 // getBranch() → agent.snapshot (last 200 entries, normalized).
 import { normalizeMessage } from "./forwarder.ts";
+import { toEpochMs } from "../shared/util.ts";
 
 export type EntryKind = "user" | "assistant" | "tool_result" | "bash" | "custom" | "compaction" | "branch_summary" | "model_change";
 
@@ -14,12 +15,12 @@ export const SNAPSHOT_LIMIT = 200;
 
 function at(entry: any): number {
   const t = entry?.timestamp;
-  if (typeof t === "number") return t;
+  if (typeof t === "number") return toEpochMs(t);
   if (typeof t === "string") {
     const p = Date.parse(t);
-    if (!Number.isNaN(p)) return p;
+    if (!Number.isNaN(p)) return toEpochMs(p);
   }
-  return Date.now();
+  return Math.round(Date.now());
 }
 
 /** Map one Pi session entry to the wire Entry, or null when it should not be shown. */

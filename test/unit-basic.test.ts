@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { truncateBytes, sanitizeFileName, backoffDelay, jitter, LruSet, preview } from "../src/shared/util.ts";
+import { truncateBytes, sanitizeFileName, backoffDelay, jitter, LruSet, preview, toEpochMs, safeDurationMs } from "../src/shared/util.ts";
 import { configDir, configPath, defaultInboxDir, hostConfigPath, expandHome } from "../src/shared/platform.ts";
 import { envelope, parseEnvelope } from "../src/shared/protocol.ts";
 import { normalizeConfig, saveConfig, loadConfig, updateConfigFile, DEFAULT_CONFIG } from "../src/extension/config.ts";
@@ -48,6 +48,40 @@ describe("util", () => {
   it("preview flattens and clips", () => {
     expect(preview("a\n b   c", 140)).toBe("a b c");
     expect(preview("x".repeat(200), 10).length).toBe(10);
+  });
+  it("toEpochMs validates plausible epoch ms and rejects performance.now or non-epoch times", () => {
+    const fixedNow = 1760000000000;
+    // performance.now() e.g. 47725510.340108 (~13 hours) -> rejected, returns fallbackNow
+    expect(toEpochMs(47725510.340108, fixedNow)).toBe(fixedNow);
+    // Non-finite or negative numbers -> rejected
+    expect(toEpochMs(-1, fixedNow)).toBe(fixedNow);
+    expect(toEpochMs(Number.NaN, fixedNow)).toBe(fixedNow);
+    expect(toEpochMs(Number.POSITIVE_INFINITY, fixedNow)).toBe(fixedNow);
+    expect(toEpochMs(undefined, fixedNow)).toBe(fixedNow);
+    expect(toEpochMs("1760000000000", fixedNow)).toBe(fixedNow);
+    // Dates before 2020-01-01 -> rejected
+    expect(toEpochMs(1577836799999, fixedNow)).toBe(fixedNow);
+    // Dates > 5 min in the future -> rejected
+    expect(toEpochMs(fixedNow + 6 * 60 * 1000, fixedNow)).toBe(fixedNow);
+    // Valid epoch ms (rounded) -> kept
+    expect(toEpochMs(1760000000123.4, fixedNow)).toBe(1760000000123);
+    expect(toEpochMs(1760000000123.6, fixedNow)).toBe(1760000000124);
+    expect(toEpochMs(1577836800000, fixedNow)).toBe(1577836800000); // 2020-01-01 boundary
+    expect(toEpochMs(fixedNow + 5 * 60 * 1000, fixedNow)).toBe(fixedNow + 5 * 60 * 1000); // upper boundary
+  });
+  it("safeDurationMs guarantees non-negative rounded duration and prefers source duration", () => {
+    // Standard duration from same clock
+    expect(safeDurationMs(1000, 1500)).toBe(500);
+    expect(safeDurationMs(1000, 1000.4)).toBe(0);
+    // Clock anomaly / ended earlier than started -> clamped to 0
+    expect(safeDurationMs(1500, 1000)).toBe(0);
+    // Source duration provided and non-negative -> preferred and rounded
+    expect(safeDurationMs(1000, 2000, 350.2)).toBe(350);
+    expect(safeDurationMs(1000, 2000, 350.8)).toBe(351);
+    // Negative source duration -> ignored, computes ended - started
+    expect(safeDurationMs(1000, 1400, -50)).toBe(400);
+    // Missing endedAt -> undefined
+    expect(safeDurationMs(1000, undefined)).toBeUndefined();
   });
 });
 

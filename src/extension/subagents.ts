@@ -1,4 +1,5 @@
 import type { SubagentToolCall, SubagentUpdateEvent } from "../shared/protocol.ts";
+import { safeDurationMs, toEpochMs } from "../shared/util.ts";
 
 export interface SubagentTrackerDeps {
   emit: (event: SubagentUpdateEvent) => void;
@@ -40,7 +41,7 @@ export class SubagentTracker {
         agent,
         label,
         status: "running",
-        startedAt: this.now(),
+        startedAt: toEpochMs(this.now(), this.now()),
         tools: [],
       };
       this.tasks.set(taskId, task);
@@ -77,12 +78,8 @@ export class SubagentTracker {
       const task = this.tasks.get(taskId);
       if (task) {
         task.status = isError ? "failed" : "completed";
-        task.endedAt = this.now();
-        if (durationMs !== undefined) {
-          task.durationMs = durationMs;
-        } else if (task.startedAt) {
-          task.durationMs = task.endedAt - task.startedAt;
-        }
+        task.endedAt = toEpochMs(this.now(), this.now());
+        task.durationMs = safeDurationMs(task.startedAt, task.endedAt, durationMs);
         if (isError) {
           task.error = typeof result === "string" ? result : JSON.stringify(result);
         } else {
@@ -100,8 +97,8 @@ export class SubagentTracker {
         const t = task.tools.find((x) => x.toolCallId === toolCallId);
         if (t) {
           t.status = isError ? "error" : "completed";
-          if (durationMs !== undefined) {
-            t.durationMs = durationMs;
+          if (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 0) {
+            t.durationMs = Math.round(durationMs);
           }
         }
         this.deps.emit({ ...task });
@@ -121,7 +118,7 @@ export class SubagentTracker {
       agent: "subagent",
       label: ev.taskId,
       status: typeof ev.status === "string" ? ev.status : "running",
-      startedAt: typeof ev.occurredAt === "number" ? ev.occurredAt : this.now(),
+      startedAt: toEpochMs(ev.occurredAt, this.now()),
       tools: [],
     };
 
@@ -134,10 +131,14 @@ export class SubagentTracker {
       task.status === "cancelled" ||
       task.status === "timed_out";
     if (isFinished) {
-      task.endedAt = typeof ev.occurredAt === "number" ? ev.occurredAt : this.now();
-      if (task.startedAt && task.endedAt) {
-        task.durationMs = task.endedAt - task.startedAt;
-      }
+      task.endedAt = toEpochMs(ev.occurredAt, this.now());
+      const sourceDuration =
+        typeof ev.durationMs === "number"
+          ? ev.durationMs
+          : typeof ev.duration === "number"
+            ? ev.duration
+            : undefined;
+      task.durationMs = safeDurationMs(task.startedAt, task.endedAt, sourceDuration);
     }
 
     this.tasks.set(ev.taskId, task);
