@@ -46,7 +46,8 @@ Una vez instalado, abre Pi (`pi` o `gentle-shell`) y ejecuta:
 | Autorizaciones propias (si no hay gentle-pi) y herramienta `rp_ask_user` condicional | `prompts/gate.ts`, `prompts/askUser.ts` |
 | Mensajes del móvil: `api`, **`interactive`** (teclea en la TUI → autoriza en modo Auto), `herdr`, comandos | `delivery/` |
 | Adjuntos (imágenes inline, resto en el inbox con ruta citada) | `attachments.ts` |
-| Comandos `/rp pair|status|doctor|on|off|gate|test|unpair` | `commands.ts` |
+| Agent Mesh: telemetría de comunicación inter-agente (`intercom` y `orchestrator_send_message` entrante/saliente → `CommEvent`) | `src/extension/comm.ts` |
+| Comandos `/rp pair\|status\|doctor\|on\|off\|gate\|test\|unpair` | `commands.ts` |
 | `rp-host`: crear agentes desde el móvil (herdr workspace/pestaña/panel, tmux, Windows Terminal, consola) + servicio | `src/host/` |
 | `rp-host`: recolección periódica de cuotas de IA (`piquota --json`) y reporte a `rp-relay` | `src/host/quota.ts` |
 

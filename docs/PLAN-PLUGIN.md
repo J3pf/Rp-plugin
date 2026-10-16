@@ -54,6 +54,7 @@ rp-plugin/
 │   │   │   └── askUser.ts   # herramienta rp_ask_user (sólo si no hay otra de preguntas)
 │   │   ├── herdr.ts         # herdr:blocked, ubicación del panel
 │   │   ├── status.ts
+│   │   ├── comm.ts           # Agent Mesh: telemetría de intercom y orchestrator (CommEvent)
 │   │   ├── commands.ts      # /rp pair|status|on|off|gate|test|doctor|unpair
 │   │   └── compat.ts        # TODO acceso no público (Pi interno, formas de gentle-pi) pasa por aquí
 │   ├── host/                # rp-host (fase 3)
@@ -419,6 +420,7 @@ Todo lo descrito arriba está implementado en este repositorio. Resumen por tare
 | P10 | Adjuntos | ✅ `attachments.ts` |
 | P11 | rp-host (herdr, tmux, wt, consola; systemd/schtasks/launchd) | ✅ `src/host/` (Windows y herdr sin ejecutar en máquina real) |
 | P12 | Tests de integración gentle-pi/herdr, publicación npm | ✅ tests y `.github/workflows/ci.yml`; la publicación (`npm publish`) la haces tú |
+| P13 | Agent Mesh: telemetría de comunicación inter-agente (`intercom` y `orchestrator_send_message` entrante/saliente → `CommEvent`) | ✅ `src/extension/comm.ts`, `test/comm.test.ts` |
 
 ### Decisiones y diferencias respecto al plan
 - **`@j3pf/rp-protocol`** aún no existe: los tipos están en `src/shared/protocol.ts` y los validadores del contrato en

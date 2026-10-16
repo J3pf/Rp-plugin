@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import rpExtension from "../src/extension/index.ts";
+import { toolDetail } from "../src/extension/runtime.ts";
 import * as configModule from "../src/extension/config.ts";
 import { FakeRelay, baseConfig, makeCtx, makePi, makeUi, waitUntil } from "./helpers.ts";
 import fs from "node:fs";
@@ -615,6 +616,31 @@ describe("Pi never waits for the relay", () => {
     await t.fire("message_end", { message: { role: "assistant", content: "x" } }, t.ctx);
     expect(await t.fire("tool_call", { toolCallId: "1", toolName: "read", input: { path: "x" } }, t.ctx)).toBeUndefined();
     await t.fire("session_shutdown", {}, t.ctx);
+  });
+});
+
+describe("toolDetail telemetry", () => {
+  it("formats subagent_run with agent and label or task", () => {
+    expect(toolDetail("subagent_run", { agent: "worker", label: "fix bug" })).toBe(": worker: fix bug");
+    expect(toolDetail("subagent_run", { agent: "worker", task: "investigate memory leak" })).toBe(": worker: investigate memory leak");
+    expect(toolDetail("subagent_run", { label: "explore repo" })).toBe(": explore repo");
+  });
+
+  it("formats intercom with action and recipient", () => {
+    expect(toolDetail("intercom", { action: "ask", to: "peer-session" })).toBe(": ask → peer-session");
+    expect(toolDetail("intercom", { action: "reply" })).toBe(": reply");
+  });
+
+  it("formats orchestrator_send_message with recipient", () => {
+    expect(toolDetail("orchestrator_send_message", { recipient_session_id: "orch-1" })).toBe(": → orch-1");
+  });
+
+  it("formats standard file, command, query and message tools", () => {
+    expect(toolDetail("bash", { command: "npm test" })).toBe(": npm test");
+    expect(toolDetail("read", { path: "src/app.ts" })).toBe(": src/app.ts");
+    expect(toolDetail("search", { query: "CommEvent" })).toBe(": CommEvent");
+    expect(toolDetail("grep", { pattern: "agent.event" })).toBe(": agent.event");
+    expect(toolDetail("custom", null)).toBe("");
   });
 });
 void configModule;

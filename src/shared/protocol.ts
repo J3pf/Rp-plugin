@@ -49,6 +49,32 @@ export const CLOSE = {
 export const MAX_FRAME_BYTES = 1024 * 1024;
 
 export type AgentStatus = "idle" | "working" | "waiting_input" | "compacting" | "error";
+export type CommChannel = "intercom" | "orchestrator";
+export type CommAction = "send" | "ask" | "reply" | "handover" | "message";
+export type CommDirection = "out" | "in";
+
+export interface CommPeer {
+  sessionId: string | null;
+  name: string | null;
+  cwd: string | null;
+  ref: string | null;
+}
+
+export interface CommEvent {
+  type: "comm";
+  commId: string;
+  direction: CommDirection;
+  channel: CommChannel;
+  action: CommAction;
+  peer: CommPeer;
+  messageId: string | null;
+  replyTo: string | null;
+  expectsReply: boolean;
+  text: string | null;
+  truncated: boolean;
+  delivered?: boolean | null;
+  at: number;
+}
 export type GentleMode = "normal" | "auto" | "yolo" | "unknown";
 export type PromptKind = "confirm" | "select" | "input" | "questionnaire";
 export type PromptCategory = "permission" | "question" | "dialog";

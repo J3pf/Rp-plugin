@@ -26,6 +26,7 @@ import { relayBlobFetcher } from "./attachments.ts";
 import { routeInbound, pendingAnswers } from "./inbound.ts";
 import { pluginVersion } from "./version.ts";
 import { SubagentTracker } from "./subagents.ts";
+import { CommTracker } from "./comm.ts";
 
 interface Waiter<T> {
   resolve: (v: T) => void;
@@ -68,6 +69,7 @@ export class Runtime {
   readonly deliverer: Deliverer;
   readonly forwarder: Forwarder;
   readonly subagents: SubagentTracker;
+  readonly comm: CommTracker;
   readonly allowed: Set<string>;
 
   mirror: MirrorResult = { uninstall: () => {}, installed: false, dialogs: false };
@@ -129,6 +131,10 @@ export class Runtime {
     this.subagents = new SubagentTracker({
       emit: (event) => this.emitEvent(event as unknown as Record<string, unknown>),
     });
+    this.comm = new CommTracker({
+      emit: (event) => this.emitEvent(event as any),
+      isRedacted: () => this.cfg.redactContent,
+    });
 
     this.forwarder = new Forwarder({
       redact: cfg.redactContent,
@@ -142,9 +148,11 @@ export class Runtime {
       },
       onToolStart: (name, args, toolCallId, parentToolCallId) => {
         this.statuses.working(`${name}${this.cfg.redactContent ? "" : toolDetail(name, args)}`);
+        this.comm.onToolStart(name, args, toolCallId);
         this.subagents.onToolStart(name, args, toolCallId, parentToolCallId);
       },
       onToolEnd: (name, result, isError, toolCallId, durationMs, parentToolCallId) => {
+        this.comm.onToolEnd(name, result, isError, toolCallId);
         if (name === "todo" && !isError) {
           const tasks = parseTodoTasks(result?.details ?? result);
           if (tasks) {
@@ -206,6 +214,7 @@ export class Runtime {
 
   start(): void {
     const ctx = this.lastCtx;
+    this.comm.seedSeen(this.safeBranch());
     this.adapters.enabled = this.adaptersAllowed();
     // always installed (setStatus is observed for agent.statuses); dialogs are patched only when mirrorDialogs is on
     this.mirror = installMirror(ctx, this.broker, this.adapters, this.statuses, { dialogs: this.cfg.mirrorDialogs });
@@ -276,6 +285,11 @@ export class Runtime {
     if (name === "model_select" && ev?.model) this.model = { provider: ev.model.provider, id: ev.model.id };
     if (name === "thinking_level_select") this.thinking = ev?.level ?? null;
     if (name === "session_compact") this.statuses.setCompacting(false);
+    try {
+      if (name === "message_end") this.comm.onMessage(ev?.message);
+    } catch {
+      /* message observation must never break Pi */
+    }
     try {
       this.forwarder.handle(name, ev);
     } catch {
@@ -384,7 +398,7 @@ export class Runtime {
   }
 
   features(): string[] {
-    const f = ["attachments", "statuses"];
+    const f = ["attachments", "statuses", "comm"];
     if (this.mirror.dialogs) f.push("mirror_ui");
     if (this.adapters.enabled && this.gentleInfo()) f.push("adapters:gentle-ask");
     if (this.gateMode() !== "off") f.push("gate");
@@ -606,9 +620,41 @@ export class Runtime {
   }
 }
 
-function toolDetail(_name: string, args: any): string {
+export function toolDetail(name: string, args: any): string {
   if (!args || typeof args !== "object") return "";
-  const v = typeof args.command === "string" ? args.command : typeof args.path === "string" ? args.path : "";
+  if (name === "subagent_run") {
+    const agent = typeof args.agent === "string" ? args.agent : "";
+    const label =
+      typeof args.label === "string"
+        ? args.label
+        : typeof args.task === "string"
+          ? args.task
+          : "";
+    const desc = agent && label ? `${agent}: ${label}` : agent || label;
+    return desc ? `: ${preview(desc, 60)}` : "";
+  }
+  if (name === "intercom") {
+    const action = typeof args.action === "string" ? args.action : "";
+    const to = typeof args.to === "string" ? args.to : "";
+    const desc = action && to ? `${action} → ${to}` : action || to;
+    return desc ? `: ${preview(desc, 60)}` : "";
+  }
+  if (name === "orchestrator_send_message") {
+    const to = typeof args.recipient_session_id === "string" ? args.recipient_session_id : "";
+    return to ? `: → ${preview(to, 60)}` : "";
+  }
+  const v =
+    typeof args.command === "string"
+      ? args.command
+      : typeof args.path === "string"
+        ? args.path
+        : typeof args.query === "string"
+          ? args.query
+          : typeof args.pattern === "string"
+            ? args.pattern
+            : typeof args.message === "string"
+              ? args.message
+              : "";
   return v ? `: ${preview(v, 60)}` : "";
 }
 
