@@ -1,0 +1,23 @@
+{
+  "v": 1,
+  "t": "agent.event",
+  "ts": 1760342402000,
+  "d": {
+    "epoch": "01JA0000000000000000000E01",
+    "seq": 63,
+    "e": {
+      "type": "comm",
+      "commId": "comm-003",
+      "direction": "in",
+      "channel": "intercom",
+      "action": "reply",
+      "peer": { "sessionId": "session-remote", "name": "worker", "cwd": null, "ref": "ref-1" },
+      "messageId": "message-003",
+      "replyTo": "message-002",
+      "expectsReply": false,
+      "text": "Review complete",
+      "truncated": false,
+      "at": 1760342402000
+    }
+  }
+}

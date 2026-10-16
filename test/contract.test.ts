@@ -7,6 +7,13 @@ import { validateEnvelope, validators, check, promptOpenShape } from "./contract
 import os from "node:os";
 
 let relay: FakeRelay;
+const commFixtureFiles = [
+  "up__agent.event__comm_in.valid.json",
+  "up__agent.event__comm_out_ask.valid.json",
+  "up__agent.event__comm_out_end.valid.json",
+  "up__agent.event__comm_out_start.valid.json",
+  "up__agent.event__comm_redacted.valid.json",
+];
 const envBackup = { ...process.env };
 beforeEach(async () => {
   relay = await new FakeRelay().start();
@@ -133,6 +140,23 @@ describe("wire contract (PROTOCOLO v1)", () => {
       { ...incomingComm, delivered: null },
     ];
     for (const event of malformed) expect(validateEnvelope(envelope(event as typeof comm))).not.toEqual([]);
+  });
+
+  it("validates frozen comm fixtures and aligns local copies with rp-relay when available", () => {
+    const localDir = path.resolve(import.meta.dirname, "fixtures/comm");
+    const relayDir = "/home/drift/Workspace/RP/Rp-relay/packages/protocol/fixtures";
+    const hasRelayFixtures = fs.existsSync(relayDir);
+
+    for (const file of commFixtureFiles) {
+      const local = JSON.parse(fs.readFileSync(path.join(localDir, file), "utf8"));
+      expect(validateEnvelope(local), file).toEqual([]);
+
+      if (hasRelayFixtures) {
+        const canonical = JSON.parse(fs.readFileSync(path.join(relayDir, file), "utf8"));
+        expect(validateEnvelope(canonical), `relay/${file}`).toEqual([]);
+        expect(local, `${file} must match the frozen relay fixture`).toEqual(canonical);
+      }
+    }
   });
 
   it("the committed fixtures validate (shared with rp-relay / rp-app contract tests)", () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { BoundedMap, BoundedSet, CommTracker } from "../src/extension/comm.ts";
 import type { CommEvent } from "../src/shared/protocol.ts";
+import { validateEnvelope } from "./contract.ts";
 
 describe("bounded collections", () => {
   it("evicts the least-recently-used entry after exceeding capacity", () => {
@@ -303,5 +304,65 @@ describe("CommTracker outgoing events", () => {
     expect(() => comm.onMessage(throwingMessage)).not.toThrow();
     expect(() => comm.seedSeen([throwingMessage])).not.toThrow();
     expect(events).toEqual([]);
+  });
+
+  it("emits CommTracker events that validate against the frozen envelope contract", () => {
+    const { comm, events } = tracker();
+    const envelope = (event: CommEvent, seq: number) => ({
+      v: 1,
+      t: "agent.event",
+      ts: event.at,
+      d: { epoch: "test-epoch", seq, e: event },
+    });
+
+    comm.onToolStart("intercom", { action: "ask", to: "peer-ref", message: "question" }, "ask-1");
+    const start = events[0]!;
+    comm.onToolEnd("intercom", { details: { delivered: true, messageId: "ask-message" } }, false, "ask-1");
+    const end = events[1]!;
+
+    expect(validateEnvelope(envelope(start, 1))).toEqual([]);
+    expect(validateEnvelope(envelope(end, 2))).toEqual([]);
+    expect(start).toMatchObject({ delivered: null, messageId: null });
+    expect(end).toMatchObject({ delivered: true, messageId: "ask-message" });
+    expect(end.commId).toBe(start.commId);
+    expect(end.at).toBe(start.at);
+    expect(end.peer).toEqual(start.peer);
+    expect(end.text).toBe(start.text);
+    expect(end.channel).toBe(start.channel);
+    expect(end.action).toBe(start.action);
+
+    for (const action of ["send", "ask", "reply", "handover"] as const) {
+      comm.onToolStart("intercom", { action, to: "peer-ref", message: "message" }, `call-${action}`);
+    }
+    comm.onToolStart("orchestrator_send_message", { recipient_session_id: "session-2", message: "delegated" }, "orch-1");
+    comm.onMessage({
+      customType: "intercom_message",
+      details: {
+        from: { id: "peer-session", name: "Peer", cwd: "/peer" },
+        message: { id: "incoming-1", expectsReply: true },
+        bodyText: "inbound",
+      },
+    });
+
+    for (const [index, event] of events.entries()) {
+      expect(validateEnvelope(envelope(event, index + 1))).toEqual([]);
+      if (event.channel === "intercom") {
+        expect(["send", "ask", "reply", "handover"]).toContain(event.action);
+      } else {
+        expect(event.channel).toBe("orchestrator");
+        expect(event.action).toBe("message");
+      }
+    }
+    const inbound = events.at(-1)!;
+    expect(inbound.direction).toBe("in");
+    expect("delivered" in inbound).toBe(false);
+
+    const redacted = tracker(true);
+    redacted.comm.onMessage({
+      customType: "intercom_message",
+      details: { message: { id: "redacted-1" }, bodyText: "secret" },
+    });
+    expect(validateEnvelope(envelope(redacted.events[0]!, 1))).toEqual([]);
+    expect(redacted.events[0]).toMatchObject({ text: null, truncated: false });
   });
 });

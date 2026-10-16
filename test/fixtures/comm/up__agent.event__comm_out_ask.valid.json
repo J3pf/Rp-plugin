@@ -1,0 +1,24 @@
+{
+  "v": 1,
+  "t": "agent.event",
+  "ts": 1760342404000,
+  "d": {
+    "epoch": "01JA0000000000000000000E01",
+    "seq": 65,
+    "e": {
+      "type": "comm",
+      "commId": "comm-003",
+      "direction": "out",
+      "channel": "intercom",
+      "action": "ask",
+      "peer": { "sessionId": "sess-peer-3", "name": "peer-agent", "cwd": "/workspace", "ref": "peer-agent" },
+      "messageId": "msg-003",
+      "replyTo": null,
+      "expectsReply": true,
+      "text": "Can you review this change?",
+      "truncated": false,
+      "delivered": true,
+      "at": 1760342404000
+    }
+  }
+}
