@@ -65,6 +65,7 @@ describe("wire contract (PROTOCOLO v1)", () => {
     expect(bad).toEqual([]);
     for (const t of ["agent.hello", "agent.snapshot", "agent.event", "agent.status", "agent.statuses", "prompt.open", "prompt.resolved", "prompt.ack", "user.message.ack"]) expect(seen.has(t), `no ${t} sent`).toBe(true);
     expect(relay.all[0]!.id).toBeTruthy(); // hello needs an id (it expects welcome)
+    expect(relay.all[0]!.d.plugin.features).toContain("comm");
 
     if (process.env.UPDATE_FIXTURES === "1") {
       const dir = path.resolve(import.meta.dirname, "fixtures/protocol");
@@ -81,6 +82,48 @@ describe("wire contract (PROTOCOLO v1)", () => {
       }
     }
     await f.fire("session_shutdown", {}, ctx);
+  });
+
+  it("validates outgoing and incoming comm events and rejects malformed comm events", () => {
+    const comm = {
+      type: "comm",
+      commId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      direction: "out",
+      channel: "intercom",
+      action: "ask",
+      peer: { sessionId: null, name: null, cwd: null, ref: "agent-2" },
+      messageId: null,
+      replyTo: null,
+      expectsReply: true,
+      text: "hello",
+      truncated: false,
+      delivered: null,
+      at: 1710000000000,
+    };
+    const envelope = (e: typeof comm) => ({ v: 1, t: "agent.event", ts: 1710000000000, d: { epoch: "epoch", seq: 1, e } });
+
+    expect(validateEnvelope(envelope(comm))).toEqual([]);
+    expect(validateEnvelope(envelope({ ...comm, direction: "in", channel: "orchestrator", action: "message" }))).toEqual([]);
+
+    const malformed = [
+      { ...comm, commId: 42 },
+      { ...comm, direction: "sideways" },
+      { ...comm, channel: "unknown" },
+      { ...comm, action: "cancel" },
+      { ...comm, peer: { ...comm.peer, sessionId: 42 } },
+      { ...comm, peer: { ...comm.peer, name: 42 } },
+      { ...comm, peer: { ...comm.peer, cwd: 42 } },
+      { ...comm, peer: { ...comm.peer, ref: 42 } },
+      { ...comm, peer: null },
+      { ...comm, messageId: 42 },
+      { ...comm, replyTo: 42 },
+      { ...comm, expectsReply: "yes" },
+      { ...comm, text: 42 },
+      { ...comm, truncated: "no" },
+      { ...comm, delivered: "yes" },
+      { ...comm, at: "now" },
+    ];
+    for (const event of malformed) expect(validateEnvelope(envelope(event as typeof comm))).not.toEqual([]);
   });
 
   it("the committed fixtures validate (shared with rp-relay / rp-app contract tests)", () => {

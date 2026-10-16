@@ -384,7 +384,7 @@ export class Runtime {
   }
 
   features(): string[] {
-    const f = ["attachments", "statuses"];
+    const f = ["attachments", "statuses", "comm"];
     if (this.mirror.dialogs) f.push("mirror_ui");
     if (this.adapters.enabled && this.gentleInfo()) f.push("adapters:gentle-ask");
     if (this.gateMode() !== "off") f.push("gate");

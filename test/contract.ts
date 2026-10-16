@@ -51,6 +51,26 @@ export const isMachineQuota = (q: unknown) =>
   q.windows.every(isQuotaWindow) &&
   nullable((v) => typeof v === "string")(q.updatedAt);
 
+export const isCommEvent = (v: unknown) =>
+  isObj(v) &&
+  v.type === "comm" &&
+  typeof v.commId === "string" &&
+  oneOf("out", "in")(v.direction) &&
+  oneOf("intercom", "orchestrator")(v.channel) &&
+  oneOf("send", "ask", "reply", "handover", "message")(v.action) &&
+  isObj(v.peer) &&
+  nullable((x) => typeof x === "string")(v.peer.sessionId) &&
+  nullable((x) => typeof x === "string")(v.peer.name) &&
+  nullable((x) => typeof x === "string")(v.peer.cwd) &&
+  nullable((x) => typeof x === "string")(v.peer.ref) &&
+  nullable((x) => typeof x === "string")(v.messageId) &&
+  nullable((x) => typeof x === "string")(v.replyTo) &&
+  isBool(v.expectsReply) &&
+  nullable((x) => typeof x === "string")(v.text) &&
+  isBool(v.truncated) &&
+  nullable(isBool)(v.delivered) &&
+  isNum(v.at);
+
 export const promptOpenShape: Shape = {
   promptId: isStr,
   agentId: (v) => isStr(v) && String(v).includes(":"),
@@ -112,7 +132,15 @@ export const validators: Record<string, (d: any) => string[]> = {
       "snapshot",
     ),
   "agent.event": (d) =>
-    check(d, { epoch: isStr, seq: (v) => Number.isInteger(v) && (v as number) >= 1, e: (v) => isObj(v) && isStr(v.type) }, "event"),
+    check(
+      d,
+      {
+        epoch: isStr,
+        seq: (v) => Number.isInteger(v) && (v as number) >= 1,
+        e: (v) => isObj(v) && isStr(v.type) && (v.type !== "comm" || isCommEvent(v)),
+      },
+      "event",
+    ),
   "agent.status": (d) => check(d, { status, detail: (v) => typeof v === "string" }, "status", ["detail"]),
   "agent.statuses": (d) => check(d, { items: (v) => isObj(v) && Object.values(v).every((x) => typeof x === "string") }, "statuses"),
   "prompt.open": (d) => check(d, promptOpenShape, "prompt.open", ["message", "tool", "source", "options", "placeholder", "questions"]),
