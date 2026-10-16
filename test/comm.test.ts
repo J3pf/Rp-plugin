@@ -34,7 +34,9 @@ describe("CommTracker outgoing events", () => {
     comm.onToolEnd("intercom", { details: { delivered: true, messageId: "sent-1" } }, false, "call-1");
 
     expect(events).toHaveLength(2);
-    expect(events[1]).toEqual({ ...events[0], commId, messageId: "sent-1", delivered: true, at: 101 });
+    expect(events[1]).toEqual({ ...events[0], commId, messageId: "sent-1", delivered: true });
+    expect(events[1]!.at).toBe(events[0]!.at);
+    expect(events[1]!.at).toBe(100);
   });
 
   it("ignores unsupported intercom actions and replies without a message", () => {
@@ -79,6 +81,23 @@ describe("CommTracker outgoing events", () => {
         peer: { sessionId: "peer-session", name: "Peer", cwd: "/peer", ref: null },
       }),
     ]);
+  });
+
+  it("resolves replies only from the matching inbound message or explicit peer ref", () => {
+    const { comm, events } = tracker();
+    comm.recordInbound({ id: "peer-a", name: "Agent A", cwd: "/a" }, { id: "msg-1" });
+    comm.recordInbound({ id: "peer-b", name: "Agent B", cwd: "/b" }, { id: "msg-2" });
+
+    comm.onToolStart("intercom", { action: "reply", replyTo: "msg-1", message: "answer A" }, "reply-a");
+    expect(events[0]!.peer.sessionId).toBe("peer-a");
+    expect(events[0]!.peer.name).toBe("Agent A");
+    expect(events[0]!.peer.cwd).toBe("/a");
+
+    comm.onToolStart("intercom", { action: "reply", replyTo: "msg-unknown", message: "unknown reply" }, "reply-unknown");
+    expect(events[1]!.peer.sessionId).toBeNull();
+    expect(events[1]!.peer.name).toBeNull();
+    expect(events[1]!.peer.cwd).toBeNull();
+    expect(events[1]!.replyTo).toBe("msg-unknown");
   });
 
   it("uses details.delivered when boolean and otherwise derives delivery from error", () => {

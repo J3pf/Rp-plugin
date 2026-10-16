@@ -28,7 +28,6 @@ export class CommTracker {
   private readonly inboundMessages = new Map<string, CommPeer>();
   private readonly seenInboundMessageIds = new Set<string>();
   private readonly knownPeers = new Map<string, CommPeer>();
-  private mostRecentInbound: CommPeer | null = null;
   private readonly now: () => number;
 
   constructor(private readonly deps: CommTrackerDeps) {
@@ -118,7 +117,6 @@ export class CommTracker {
       if (peer.name) this.knownPeers.set(peer.name, peer);
       if (typeof message?.id !== "string" || !message.id) return;
       this.inboundMessages.set(message.id, peer);
-      this.mostRecentInbound = peer;
     } catch {
       // Inbound observation must never disrupt the extension hook.
     }
@@ -201,7 +199,6 @@ export class CommTracker {
       }
       call.messageId = messageId;
       call.delivered = typeof details?.delivered === "boolean" ? details.delivered : !isError && !details?.error;
-      call.at = this.now();
       this.activeCalls.delete(toolCallId);
       this.deps.emit(copyEvent(call));
     } catch {
@@ -213,7 +210,7 @@ export class CommTracker {
     const key = typeof replyTo === "string" ? replyTo : null;
     const fromReply = key ? this.inboundMessages.get(key) : undefined;
     const fromRef = peer.ref ? this.knownPeers.get(peer.ref) : undefined;
-    const from = fromReply ?? fromRef ?? this.mostRecentInbound;
+    const from = fromReply ?? fromRef;
     if (!from) return;
     peer.sessionId = from.sessionId;
     peer.name = from.name;
