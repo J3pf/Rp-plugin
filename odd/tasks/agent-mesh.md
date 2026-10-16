@@ -13,9 +13,9 @@ Branch: `feat/agent-mesh` | Status: in_progress
 - S8: Delivery: when green → merge to main, bump version (minor, 0.2.0), build the tgz with `npm pack`, tag, PUSH main+tags, PUBLISH a GitHub release with the .tgz attached, and fix the README install URL so it points to the new version.
 
 ## Tasks
-- T1 (S1) [gentle-ai-worker] Define CommEvent schema in `src/shared/protocol.ts`, update `test/contract.ts`, and add `"comm"` to `hello.plugin.features`: pending
-- T2 (S2) [gentle-ai-worker] Implement outgoing comm tracking for `intercom` and `orchestrator_send_message` with start/end correlation and reply resolution: pending
-- T3 (S3) [gentle-ai-worker] Implement incoming comm detection from `message_end` customType `intercom_message` with deduplication: pending
+- T1 (S1) [gentle-ai-worker] Define CommEvent schema in `src/shared/protocol.ts`, update `test/contract.ts`, and add `"comm"` to `hello.plugin.features`: done (commit 28b7376)
+- T2 (S2) [gentle-ai-worker] Implement outgoing comm tracking for `intercom` and `orchestrator_send_message` with start/end correlation and reply resolution: done (commit pending)
+- T3 (S3) [gentle-ai-worker] Implement incoming comm detection from `message_end` customType `intercom_message` with deduplication: in_progress
 - T4 (S4) [gentle-ai-worker] Implement robustness guards (safe hooks, 2000 chars truncation, redactContent, queue compatibility): pending
 - T5 (S5) [gentle-ai-worker] Verify and enhance `subagent_update` and `agent.status` toolDetail for current activity: pending
 - T6 (S6) [gentle-ai-worker] Write comprehensive unit tests in `test/comm.test.ts`, regenerate fixtures (`npm run fixtures`), and verify suite: pending

@@ -26,6 +26,7 @@ import { relayBlobFetcher } from "./attachments.ts";
 import { routeInbound, pendingAnswers } from "./inbound.ts";
 import { pluginVersion } from "./version.ts";
 import { SubagentTracker } from "./subagents.ts";
+import { CommTracker } from "./comm.ts";
 
 interface Waiter<T> {
   resolve: (v: T) => void;
@@ -68,6 +69,7 @@ export class Runtime {
   readonly deliverer: Deliverer;
   readonly forwarder: Forwarder;
   readonly subagents: SubagentTracker;
+  readonly comm: CommTracker;
   readonly allowed: Set<string>;
 
   mirror: MirrorResult = { uninstall: () => {}, installed: false, dialogs: false };
@@ -129,6 +131,10 @@ export class Runtime {
     this.subagents = new SubagentTracker({
       emit: (event) => this.emitEvent(event as unknown as Record<string, unknown>),
     });
+    this.comm = new CommTracker({
+      emit: (event) => this.emitEvent(event as any),
+      isRedacted: () => this.cfg.redactContent,
+    });
 
     this.forwarder = new Forwarder({
       redact: cfg.redactContent,
@@ -142,9 +148,11 @@ export class Runtime {
       },
       onToolStart: (name, args, toolCallId, parentToolCallId) => {
         this.statuses.working(`${name}${this.cfg.redactContent ? "" : toolDetail(name, args)}`);
+        this.comm.onToolStart(name, args, toolCallId);
         this.subagents.onToolStart(name, args, toolCallId, parentToolCallId);
       },
       onToolEnd: (name, result, isError, toolCallId, durationMs, parentToolCallId) => {
+        this.comm.onToolEnd(name, result, isError, toolCallId);
         if (name === "todo" && !isError) {
           const tasks = parseTodoTasks(result?.details ?? result);
           if (tasks) {
