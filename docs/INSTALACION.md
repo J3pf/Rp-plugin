@@ -19,10 +19,10 @@ Puedes instalar el paquete directamente en Pi utilizando el tarball publicado en
 
 ```bash
 # Para Pi estándar (~/.pi/agent)
-pi install https://github.com/J3pf/Rp-plugin/releases/download/v0.1.0/j3pf-pi-rp-0.1.0.tgz
+pi install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.1/j3pf-pi-rp-0.2.1.tgz
 
 # Para gentle-shell (~/.gentle-shell/agent), si está instalado
-gentle-shell install https://github.com/J3pf/Rp-plugin/releases/download/v0.1.0/j3pf-pi-rp-0.1.0.tgz
+gentle-shell install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.1/j3pf-pi-rp-0.2.1.tgz
 ```
 
 ### Método B: Desde Código Fuente (Desarrollo / Clon Local)
