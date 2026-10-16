@@ -26,12 +26,83 @@ const MAX_TEXT_LENGTH = 2000;
 export class CommTracker {
   private readonly activeCalls = new Map<string, CommEvent>();
   private readonly inboundMessages = new Map<string, CommPeer>();
+  private readonly seenInboundMessageIds = new Set<string>();
   private readonly knownPeers = new Map<string, CommPeer>();
   private mostRecentInbound: CommPeer | null = null;
   private readonly now: () => number;
 
   constructor(private readonly deps: CommTrackerDeps) {
     this.now = deps.now ?? Date.now;
+  }
+
+  onMessage(message: unknown): void {
+    try {
+      const inbound = this.parseInbound(message);
+      if (!inbound || this.seenInboundMessageIds.has(inbound.messageId)) return;
+      this.seenInboundMessageIds.add(inbound.messageId);
+      this.recordInbound(inbound.from, inbound.message);
+
+      const content = this.content(inbound.bodyText);
+      const event: CommEvent = {
+        type: "comm",
+        commId: newId(),
+        direction: "in",
+        channel: "intercom",
+        action: resolveInboundAction(inbound.message),
+        peer: {
+          sessionId: nonEmptyString(inbound.from.id),
+          name: nonEmptyString(inbound.from.name),
+          cwd: nonEmptyString(inbound.from.cwd),
+          ref: null,
+        },
+        messageId: inbound.messageId,
+        replyTo: nonEmptyString(inbound.message.replyTo),
+        expectsReply: Boolean(inbound.message.expectsReply),
+        text: content.text,
+        truncated: content.truncated,
+        at: this.now(),
+      };
+      this.deps.emit(copyEvent(event));
+    } catch {
+      // Message hooks are observational and must never break Pi execution.
+    }
+  }
+
+  /** Seed messages already present in the session branch without emitting them. */
+  seedSeen(branch: any[]): void {
+    try {
+      if (!Array.isArray(branch)) return;
+      for (const entry of branch) {
+        try {
+          const message = entry?.message ?? entry;
+          const inbound = this.parseInbound(message);
+          if (!inbound) continue;
+          this.seenInboundMessageIds.add(inbound.messageId);
+          this.recordInbound(inbound.from, inbound.message);
+        } catch {
+          // Ignore malformed historical branch entries.
+        }
+      }
+    } catch {
+      // Branch seeding must never disrupt session startup.
+    }
+  }
+
+  private parseInbound(message: unknown): {
+    from: InboundCommFrom;
+    message: InboundCommMessage;
+    messageId: string;
+    bodyText: unknown;
+  } | null {
+    const raw = message as any;
+    if (raw?.customType !== "intercom_message") return null;
+    const details = raw?.details;
+    const from = details?.from ?? {};
+    const inboundMessage = details?.message ?? {};
+    const messageId = inboundMessage?.id ?? details?.id;
+    if (typeof messageId !== "string" || !messageId) return null;
+    const bodyText = details?.bodyText ?? (typeof raw?.content === "string" ? raw.content : "");
+    return { from, message: inboundMessage, messageId, bodyText };
   }
 
   /** Remember an inbound message so a subsequent reply can be attributed to its sender. */
@@ -166,6 +237,14 @@ function nonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value ? value : null;
 }
 
+function resolveInboundAction(message: InboundCommMessage): CommEvent["action"] {
+  if (message.expectsReply) return "ask";
+  if (message.replyTo) return "reply";
+  return "send";
+}
+
 function copyEvent(event: CommEvent): CommEvent {
-  return { ...event, peer: { ...event.peer } };
+  const out = { ...event, peer: { ...event.peer } };
+  if (out.delivered === undefined) delete out.delivered;
+  return out;
 }

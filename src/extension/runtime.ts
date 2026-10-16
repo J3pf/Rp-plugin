@@ -214,6 +214,7 @@ export class Runtime {
 
   start(): void {
     const ctx = this.lastCtx;
+    this.comm.seedSeen(this.safeBranch());
     this.adapters.enabled = this.adaptersAllowed();
     // always installed (setStatus is observed for agent.statuses); dialogs are patched only when mirrorDialogs is on
     this.mirror = installMirror(ctx, this.broker, this.adapters, this.statuses, { dialogs: this.cfg.mirrorDialogs });
@@ -284,6 +285,11 @@ export class Runtime {
     if (name === "model_select" && ev?.model) this.model = { provider: ev.model.provider, id: ev.model.id };
     if (name === "thinking_level_select") this.thinking = ev?.level ?? null;
     if (name === "session_compact") this.statuses.setCompacting(false);
+    try {
+      if (name === "message_end") this.comm.onMessage(ev?.message);
+    } catch {
+      /* message observation must never break Pi */
+    }
     try {
       this.forwarder.handle(name, ev);
     } catch {

@@ -105,4 +105,108 @@ describe("CommTracker outgoing events", () => {
     plain.comm.onToolStart("intercom", { action: "send", message }, "long");
     expect(plain.events[0]).toMatchObject({ text: "x".repeat(2000), truncated: true });
   });
+
+  it("emits incoming intercom messages with sender and reply metadata", () => {
+    const { comm, events } = tracker();
+    comm.onMessage({
+      customType: "intercom_message",
+      details: {
+        from: { id: "peer-session", name: "Peer", cwd: "/peer" },
+        message: { id: "incoming-1", expectsReply: true, replyTo: "outgoing-1" },
+        bodyText: "hello from peer",
+      },
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "comm",
+        direction: "in",
+        channel: "intercom",
+        action: "ask",
+        peer: { sessionId: "peer-session", name: "Peer", cwd: "/peer", ref: null },
+        messageId: "incoming-1",
+        expectsReply: true,
+        replyTo: "outgoing-1",
+        text: "hello from peer",
+        truncated: false,
+      }),
+    ]);
+    expect("delivered" in events[0]!).toBe(false);
+  });
+
+  it("deduplicates the same incoming intercom message", () => {
+    const { comm, events } = tracker();
+    const message = {
+      customType: "intercom_message",
+      details: { from: { id: "peer-session" }, message: { id: "incoming-1" }, bodyText: "hello" },
+    };
+
+    comm.onMessage(message);
+    comm.onMessage(message);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ direction: "in", messageId: "incoming-1" });
+  });
+
+  it("seeds existing branch messages without emitting them again", () => {
+    const { comm, events } = tracker();
+    const message = {
+      customType: "intercom_message",
+      details: {
+        from: { id: "peer-session", name: "Peer", cwd: "/peer" },
+        message: { id: "incoming-1", expectsReply: true },
+        bodyText: "already in branch",
+      },
+    };
+
+    comm.seedSeen([{ type: "message", message }]);
+    comm.onMessage(message);
+
+    expect(events).toEqual([]);
+    comm.onToolStart("intercom", { action: "reply", replyTo: "incoming-1", message: "answer" }, "reply-1");
+    expect(events[0]).toMatchObject({ peer: { sessionId: "peer-session", name: "Peer", cwd: "/peer" } });
+  });
+
+  it("redacts incoming intercom message content", () => {
+    const { comm, events } = tracker(true);
+    comm.onMessage({ customType: "intercom_message", details: { message: { id: "incoming-1" }, bodyText: "secret" } });
+    expect(events[0]).toMatchObject({ direction: "in", text: null, truncated: false });
+  });
+
+  it("truncates incoming intercom message content to 2000 characters", () => {
+    const { comm, events } = tracker();
+    const bodyText = "x".repeat(2001);
+    comm.onMessage({ customType: "intercom_message", details: { message: { id: "incoming-1" }, bodyText } });
+    expect(events[0]).toMatchObject({ direction: "in", text: "x".repeat(2000), truncated: true });
+  });
+
+  it("ignores messages that are not intercom custom messages or lack an id", () => {
+    const { comm, events } = tracker();
+    comm.onMessage({ customType: "other", details: { message: { id: "other-1" } } });
+    comm.onMessage({ customType: "intercom_message", details: { message: { expectsReply: true } } });
+    expect(events).toEqual([]);
+  });
+
+  it("produces zero comm events when intercom is absent or unrelated tools run", () => {
+    const { comm, events } = tracker();
+    comm.onToolStart("bash", { command: "ls" }, "call-bash");
+    comm.onToolEnd("bash", { result: "ok" }, false, "call-bash");
+    comm.onToolStart("read", { path: "src/index.ts" }, "call-read");
+    comm.onToolEnd("read", { content: "text" }, false, "call-read");
+    comm.onToolStart("subagent_run", { agent: "worker" }, "call-subagent");
+    comm.onToolEnd("subagent_run", { result: "done" }, false, "call-subagent");
+    expect(events).toEqual([]);
+  });
+
+  it("never throws for malformed or throwing incoming message objects", () => {
+    const { comm, events } = tracker();
+    expect(() => comm.onMessage(null)).not.toThrow();
+    expect(() => comm.onMessage({ customType: "intercom_message", details: null })).not.toThrow();
+    expect(() => comm.seedSeen([{ message: null }, null])).not.toThrow();
+
+    const throwingMessage = Object.defineProperty({}, "customType", { get: () => { throw new Error("bad input"); } });
+    expect(() => comm.onMessage(throwingMessage)).not.toThrow();
+    expect(() => comm.seedSeen([throwingMessage])).not.toThrow();
+    expect(events).toEqual([]);
+  });
 });

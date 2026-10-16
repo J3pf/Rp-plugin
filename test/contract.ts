@@ -57,6 +57,7 @@ export const isCommEvent = (v: unknown) =>
   typeof v.commId === "string" &&
   oneOf("out", "in")(v.direction) &&
   oneOf("intercom", "orchestrator")(v.channel) &&
+  (v.channel !== "orchestrator" || v.action === "message") &&
   oneOf("send", "ask", "reply", "handover", "message")(v.action) &&
   isObj(v.peer) &&
   nullable((x) => typeof x === "string")(v.peer.sessionId) &&
@@ -68,7 +69,9 @@ export const isCommEvent = (v: unknown) =>
   isBool(v.expectsReply) &&
   nullable((x) => typeof x === "string")(v.text) &&
   isBool(v.truncated) &&
-  nullable(isBool)(v.delivered) &&
+  (v.direction === "in"
+    ? !("delivered" in v) || v.delivered === undefined
+    : "delivered" in v && (v.delivered === null || typeof v.delivered === "boolean")) &&
   isNum(v.at);
 
 export const promptOpenShape: Shape = {

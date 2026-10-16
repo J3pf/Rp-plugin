@@ -100,15 +100,22 @@ describe("wire contract (PROTOCOLO v1)", () => {
       delivered: null,
       at: 1710000000000,
     };
-    const envelope = (e: typeof comm) => ({ v: 1, t: "agent.event", ts: 1710000000000, d: { epoch: "epoch", seq: 1, e } });
+    const envelope = (e: unknown) => ({ v: 1, t: "agent.event", ts: 1710000000000, d: { epoch: "epoch", seq: 1, e } });
 
+    const { delivered: _ignored, ...incomingComm } = {
+      ...comm,
+      direction: "in" as const,
+      channel: "intercom" as const,
+      action: "send" as const,
+    };
     expect(validateEnvelope(envelope(comm))).toEqual([]);
-    expect(validateEnvelope(envelope({ ...comm, direction: "in", channel: "orchestrator", action: "message" }))).toEqual([]);
+    expect(validateEnvelope(envelope(incomingComm))).toEqual([]);
 
     const malformed = [
       { ...comm, commId: 42 },
       { ...comm, direction: "sideways" },
       { ...comm, channel: "unknown" },
+      { ...comm, channel: "orchestrator", action: "send" }, // orchestrator action must be "message"
       { ...comm, action: "cancel" },
       { ...comm, peer: { ...comm.peer, sessionId: 42 } },
       { ...comm, peer: { ...comm.peer, name: 42 } },
@@ -122,6 +129,8 @@ describe("wire contract (PROTOCOLO v1)", () => {
       { ...comm, truncated: "no" },
       { ...comm, delivered: "yes" },
       { ...comm, at: "now" },
+      { ...incomingComm, delivered: true }, // delivered must be omitted on "in"
+      { ...incomingComm, delivered: null },
     ];
     for (const event of malformed) expect(validateEnvelope(envelope(event as typeof comm))).not.toEqual([]);
   });

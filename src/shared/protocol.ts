@@ -72,7 +72,7 @@ export interface CommEvent {
   expectsReply: boolean;
   text: string | null;
   truncated: boolean;
-  delivered: boolean | null;
+  delivered?: boolean | null;
   at: number;
 }
 export type GentleMode = "normal" | "auto" | "yolo" | "unknown";
