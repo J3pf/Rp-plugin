@@ -437,4 +437,5 @@ Todo lo descrito arriba está implementado en este repositorio. Resumen por tare
 - **Versión de gentle-pi**: se lee del `package.json` de nombre `gentle-pi` más cercano a la ruta de la herramienta; si no se
   encuentra, los adaptadores siguen activos (cada uno valida la forma de los parámetros) y sólo se desactivan fuera de `>=4.0 <5`.
 - **SDK de Pi**: `session.dispose()` no emite `session_shutdown`; el socket está `unref()`-ado para no retener el proceso.
+- **Agent Mesh (handover entrante)**: en `pi-intercom`, los mensajes de tipo `handover` se inyectan sin un marcador específico en `Message` (su payload llega como mensaje de texto estándar en `pi.sendMessage`), por lo que el lado receptor emite el evento `comm` con `action: "send"`. En cambio, el lado emisor sí intercepta la herramienta `intercom` con `action: "handover"` y emite `action: "handover"`.
 - **Modo Vim**: la detección es heurística (estado de pie de página que contenga «vim»); pendiente de confirmar en S7.

@@ -40,6 +40,6 @@ Branch: `feat/agent-mesh-v0.2.1` | Status: in_progress
 
 ### Tasks (Cycle 2)
 - T9 (C2-D1, C2-D2) [gentle-ai-worker] Fix `at` preservation in onToolEnd, remove `mostRecentInbound` fallback in fillReplyPeer, add tests: done (commit 9b76b17)
-- T10 (C2-D3, C2-D4) [gentle-ai-worker] Implement bounded memory (LRU 500), abort clearing, session reset in Runtime, and strongly typed emitEvent: done (commit pending)
-- T11 (C2-D5) [gentle-ai-worker] Document inbound handover behavior in `docs/PLAN-PLUGIN.md`: in_progress
+- T10 (C2-D3, C2-D4) [gentle-ai-worker] Implement bounded memory (LRU 500), abort clearing, session reset in Runtime, and strongly typed emitEvent: done (commit d7cc92e)
+- T11 (C2-D5) [gentle-ai-worker] Document inbound handover behavior in `docs/PLAN-PLUGIN.md`: done (commit pending)
 - T12 (C2-D6) [gentle-ai-verify] Await frozen relay SHA, run fixtures/contract tests, independent verification, and deliver v0.2.1 release: pending
