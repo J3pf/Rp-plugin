@@ -9,7 +9,7 @@ import { TmuxBackend, parseTmuxVersion, tmuxSupportsEnv, tmuxSessionName } from 
 import { WindowsTerminalBackend, ConsoleBackend, wtArgs, consoleArgs, killScript } from "../src/host/backends/windows.ts";
 import { HostManager } from "../src/host/manager.ts";
 import { HostConnection, parseTarget } from "../src/host/connection.ts";
-import { launchdPlist, schtasksCreateArgs, systemdUnit, installService, uninstallService } from "../src/host/service.ts";
+import { checkLinger, enableLinger, isStaleNodePath, launchdPlist, resolveStableNodePath, schtasksCreateArgs, systemdUnit, installService, uninstallService } from "../src/host/service.ts";
 import type { Runner } from "../src/host/runner.ts";
 import { FakeRelay, waitUntil } from "./helpers.ts";
 import { envelope } from "../src/shared/protocol.ts";
@@ -458,39 +458,131 @@ describe("HostConnection protocol", () => {
 
 describe("service installation", () => {
   const spec = { nodePath: "/usr/bin/node", scriptPath: "/opt/rp/bin/rp-host.mjs", platform: "linux" as const };
-  it("systemd user unit", () => {
-    const u = systemdUnit(spec);
+  it("resolves a non-realpath'd PATH node matching a versioned execPath", () => {
+    const root = tmp();
+    try {
+      const versioned = path.join(root, "Cellar", "node", "26.0.0", "bin", "node");
+      const stable = path.join(root, "bin", "node");
+      fs.mkdirSync(path.dirname(versioned), { recursive: true });
+      fs.mkdirSync(path.dirname(stable), { recursive: true });
+      fs.writeFileSync(versioned, "node");
+      fs.symlinkSync(versioned, stable);
+      expect(resolveStableNodePath({ PATH: path.dirname(stable) }, "linux", versioned)).toBe(stable);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it("detects missing and Cellar node paths as stale, but accepts a valid path", () => {
+    const root = tmp();
+    try {
+      const valid = path.join(root, "node");
+      const cellar = path.join(root, "Cellar", "node", "26.0.0", "bin", "node");
+      fs.writeFileSync(valid, "node");
+      fs.mkdirSync(path.dirname(cellar), { recursive: true });
+      fs.writeFileSync(cellar, "node");
+      expect(isStaleNodePath(path.join(root, "missing"))).toBe(true);
+      expect(isStaleNodePath(cellar)).toBe(true);
+      expect(isStaleNodePath(valid)).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it("systemd user unit includes restart limits and captured PATH", () => {
+    const u = systemdUnit({ ...spec, envPath: "/home/u/bin:/usr/bin" });
     expect(u).toContain("ExecStart=/usr/bin/node /opt/rp/bin/rp-host.mjs run");
     expect(u).toContain("Restart=always");
+    expect(u).toContain("RestartSec=5");
+    expect(u).toContain("StartLimitIntervalSec=0");
+    expect(u).toContain('Environment="PATH=/home/u/bin:/usr/bin"');
     expect(u).toContain("WantedBy=default.target");
     expect(systemdUnit({ ...spec, scriptPath: "/opt/my dir/rp.mjs" })).toContain('"/opt/my dir/rp.mjs"');
+    expect(systemdUnit(spec)).toContain(`Environment="PATH=${process.env.PATH ?? ""}"`);
+    expect(systemdUnit({ ...spec, envPath: "" })).not.toContain('Environment="PATH=');
   });
   it("Task Scheduler at logon, without admin", () => {
     const a = schtasksCreateArgs({ ...spec, platform: "win32", nodePath: "C:\\Program Files\\nodejs\\node.exe", scriptPath: "C:\\rp\\bin\\rp-host.mjs" });
     expect(a).toEqual(["/Create", "/SC", "ONLOGON", "/TN", "rp-host", "/TR", '"C:\\Program Files\\nodejs\\node.exe" "C:\\rp\\bin\\rp-host.mjs" run', "/F"]);
     expect(a).not.toContain("/RU");
   });
-  it("launchd plist escapes XML", () => {
-    const p = launchdPlist({ ...spec, platform: "darwin", scriptPath: "/a&b/rp.mjs" });
+  it("launchd plist escapes XML and includes runtime environment and logs", () => {
+    const home = "/Users/alice";
+    const p = launchdPlist({ ...spec, platform: "darwin", home, envPath: "/opt/bin:/usr/bin", scriptPath: "/a&b/rp.mjs" });
     expect(p).toContain("<string>/a&amp;b/rp.mjs</string>");
     expect(p).toContain("<key>KeepAlive</key>");
+    expect(p).toContain("<key>EnvironmentVariables</key>");
+    expect(p).toContain("<key>PATH</key>");
+    expect(p).toContain("<string>/opt/bin:/usr/bin</string>");
+    expect(p).toContain("<key>ThrottleInterval</key>\n  <integer>5</integer>");
+    expect(p).toContain(`<key>StandardOutPath</key>\n  <string>${home}/Library/Logs/rp-host.log</string>`);
+    expect(p).toContain(`<key>StandardErrorPath</key>\n  <string>${home}/Library/Logs/rp-host.log</string>`);
+  });
+  it("checks and enables login linger through the injected runner", async () => {
+    const yes = fakeRun({ "loginctl show-user alice -p Linger": () => ({ stdout: "Linger=yes\n" }) });
+    await expect(checkLinger("alice", yes.run)).resolves.toEqual({ lingering: true });
+    expect(yes.calls).toEqual([{ cmd: "loginctl", args: ["show-user", "alice", "-p", "Linger"], env: undefined, cwd: undefined }]);
+    const no = fakeRun({ "loginctl show-user alice -p Linger": () => ({ stdout: "Linger=no\n" }) });
+    await expect(checkLinger("alice", no.run)).resolves.toEqual({ lingering: false });
+    const failedCheck = fakeRun({ "loginctl show-user alice -p Linger": () => ({ code: 1, stderr: "denied" }) });
+    await expect(checkLinger("alice", failedCheck.run)).resolves.toEqual({ lingering: false, error: "denied" });
+    const enabled = fakeRun({ "loginctl enable-linger alice": () => ({}) });
+    await expect(enableLinger("alice", enabled.run)).resolves.toEqual({ ok: true, message: "Linger enabled for alice" });
+    const failedEnable = fakeRun({ "loginctl enable-linger alice": () => ({ code: 1, stderr: "access denied" }) });
+    await expect(enableLinger("alice", failedEnable.run)).resolves.toEqual({ ok: false, message: expect.stringContaining("access denied") });
+    expect((await enableLinger("alice", failedEnable.run)).message).toContain("privileges");
   });
   it("install/uninstall run the right commands per OS", async () => {
     const home = tmp();
-    const f = fakeRun({ systemctl: () => ({}), schtasks: () => ({}), launchctl: () => ({}) });
-    await installService({ ...spec, home }, f.run);
-    expect(fs.existsSync(path.join(home, ".config", "systemd", "user", "rp-host.service"))).toBe(true);
-    expect(f.calls.map((c) => c.args.join(" "))).toEqual(["--user daemon-reload", "--user enable --now rp-host"]);
-    await uninstallService("linux", f.run, home);
-    expect(fs.existsSync(path.join(home, ".config", "systemd", "user", "rp-host.service"))).toBe(false);
-    const w = fakeRun({ schtasks: () => ({}) });
-    await installService({ ...spec, platform: "win32", home }, w.run);
-    expect(w.calls[0]!.args.slice(0, 5)).toEqual(["/Create", "/SC", "ONLOGON", "/TN", "rp-host"]);
-    await uninstallService("win32", w.run, home);
-    expect(w.calls.some((c) => c.args[0] === "/Delete")).toBe(true);
-    const m = fakeRun({ launchctl: () => ({}) });
-    await installService({ ...spec, platform: "darwin", home }, m.run);
-    expect(fs.existsSync(path.join(home, "Library", "LaunchAgents", "dev.j3pf.rp-host.plist"))).toBe(true);
-    await expect(installService({ ...spec, platform: "linux", home }, fakeRun({ systemctl: () => ({ code: 1, stderr: "no bus" }) }).run)).rejects.toThrow(/no bus/);
+    try {
+      const f = fakeRun({
+        "loginctl show-user": () => ({ stdout: "Linger=no\n" }),
+        "loginctl enable-linger": () => ({ code: 1, stderr: "access denied" }),
+        systemctl: () => ({}), schtasks: () => ({}), launchctl: () => ({}),
+      });
+      const linuxResult = await installService({ ...spec, home, envPath: "/captured/path" }, f.run);
+      expect(linuxResult).toContain("warning");
+      expect(linuxResult).toContain("privileges");
+      const unitPath = path.join(home, ".config", "systemd", "user", "rp-host.service");
+      expect(fs.existsSync(unitPath)).toBe(true);
+      expect(fs.readFileSync(unitPath, "utf8")).toContain('Environment="PATH=/captured/path"');
+      expect(f.calls.map((c) => `${c.cmd} ${c.args.join(" ")}`)).toEqual([
+        `loginctl show-user ${process.env.USER ?? os.userInfo().username} -p Linger`,
+        `loginctl enable-linger ${process.env.USER ?? os.userInfo().username}`,
+        "systemctl --user daemon-reload",
+        "systemctl --user enable --now rp-host",
+      ]);
+      await uninstallService("linux", f.run, home);
+      expect(fs.existsSync(unitPath)).toBe(false);
+      const w = fakeRun({ schtasks: () => ({}) });
+      await installService({ ...spec, platform: "win32", home }, w.run);
+      expect(w.calls[0]!.args.slice(0, 5)).toEqual(["/Create", "/SC", "ONLOGON", "/TN", "rp-host"]);
+      await uninstallService("win32", w.run, home);
+      expect(w.calls.some((c) => c.args[0] === "/Delete")).toBe(true);
+      const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().uid;
+      const m = fakeRun({ launchctl: () => ({}) });
+      await installService({ ...spec, platform: "darwin", home }, m.run);
+      const plist = path.join(home, "Library", "LaunchAgents", "dev.j3pf.rp-host.plist");
+      expect(fs.existsSync(plist)).toBe(true);
+      expect(fs.existsSync(path.join(home, "Library", "Logs"))).toBe(true);
+      expect(m.calls.map((c) => `${c.cmd} ${c.args.join(" ")}`)).toEqual([
+        `launchctl bootstrap gui/${uid} ${plist}`,
+        `launchctl kickstart -k gui/${uid}/dev.j3pf.rp-host`,
+      ]);
+      await uninstallService("darwin", m.run, home);
+      expect(m.calls.slice(-1)[0]!.args).toEqual(["bootout", `gui/${uid}/dev.j3pf.rp-host`]);
+      expect(fs.existsSync(plist)).toBe(false);
+      const fallback = fakeRun({
+        "launchctl bootstrap": () => ({ code: 1, stderr: "already loaded" }),
+        "launchctl load": () => ({}),
+        "launchctl kickstart": () => ({}),
+      });
+      await installService({ ...spec, platform: "darwin", home }, fallback.run);
+      expect(fallback.calls.map((c) => c.args[0])).toEqual(["bootstrap", "load", "kickstart"]);
+      const unloadFallback = fakeRun({ "launchctl bootout": () => ({ code: 1, stderr: "not loaded" }), "launchctl unload": () => ({}) });
+      await uninstallService("darwin", unloadFallback.run, home);
+      expect(unloadFallback.calls.map((c) => c.args[0])).toEqual(["bootout", "unload"]);
+      await expect(installService({ ...spec, home }, fakeRun({ systemctl: () => ({ code: 1, stderr: "no bus" }) }).run)).rejects.toThrow(/no bus/);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 });
