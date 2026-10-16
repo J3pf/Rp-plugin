@@ -620,9 +620,41 @@ export class Runtime {
   }
 }
 
-function toolDetail(_name: string, args: any): string {
+export function toolDetail(name: string, args: any): string {
   if (!args || typeof args !== "object") return "";
-  const v = typeof args.command === "string" ? args.command : typeof args.path === "string" ? args.path : "";
+  if (name === "subagent_run") {
+    const agent = typeof args.agent === "string" ? args.agent : "";
+    const label =
+      typeof args.label === "string"
+        ? args.label
+        : typeof args.task === "string"
+          ? args.task
+          : "";
+    const desc = agent && label ? `${agent}: ${label}` : agent || label;
+    return desc ? `: ${preview(desc, 60)}` : "";
+  }
+  if (name === "intercom") {
+    const action = typeof args.action === "string" ? args.action : "";
+    const to = typeof args.to === "string" ? args.to : "";
+    const desc = action && to ? `${action} → ${to}` : action || to;
+    return desc ? `: ${preview(desc, 60)}` : "";
+  }
+  if (name === "orchestrator_send_message") {
+    const to = typeof args.recipient_session_id === "string" ? args.recipient_session_id : "";
+    return to ? `: → ${preview(to, 60)}` : "";
+  }
+  const v =
+    typeof args.command === "string"
+      ? args.command
+      : typeof args.path === "string"
+        ? args.path
+        : typeof args.query === "string"
+          ? args.query
+          : typeof args.pattern === "string"
+            ? args.pattern
+            : typeof args.message === "string"
+              ? args.message
+              : "";
   return v ? `: ${preview(v, 60)}` : "";
 }
 

@@ -15,10 +15,10 @@ Branch: `feat/agent-mesh` | Status: in_progress
 ## Tasks
 - T1 (S1) [gentle-ai-worker] Define CommEvent schema in `src/shared/protocol.ts`, update `test/contract.ts`, and add `"comm"` to `hello.plugin.features`: done (commit 28b7376)
 - T2 (S2) [gentle-ai-worker] Implement outgoing comm tracking for `intercom` and `orchestrator_send_message` with start/end correlation and reply resolution: done (commit 97eca7c)
-- T3 (S3) [gentle-ai-worker] Implement incoming comm detection from `message_end` customType `intercom_message` with deduplication: done (commit pending)
-- T4 (S4) [gentle-ai-worker] Implement robustness guards (safe hooks, 2000 chars truncation, redactContent, queue compatibility): done (commit pending)
-- T5 (S5) [gentle-ai-worker] Verify and enhance `subagent_update` and `agent.status` toolDetail for current activity: in_progress
-- T6 (S6) [gentle-ai-worker] Write comprehensive unit tests in `test/comm.test.ts`, regenerate fixtures (`npm run fixtures`), and verify suite: pending
+- T3 (S3) [gentle-ai-worker] Implement incoming comm detection from `message_end` customType `intercom_message` with deduplication: done (commit 8f09634)
+- T4 (S4) [gentle-ai-worker] Implement robustness guards (safe hooks, 2000 chars truncation, redactContent, queue compatibility): done (commit 8f09634)
+- T5 (S5) [gentle-ai-worker] Verify and enhance `subagent_update` and `agent.status` toolDetail for current activity: done (commit pending)
+- T6 (S6) [gentle-ai-worker] Write comprehensive unit tests in `test/comm.test.ts`, regenerate fixtures (`npm run fixtures`), and verify suite: in_progress
 - T7 (S7) [gentle-ai-worker] Update README.md and `docs/PLAN-PLUGIN.md` in Spanish: pending
 - T8 (S8) [gentle-ai-verify] Run independent verification and perform delivery (merge, bump 0.2.0, npm pack, tag, push, release, README URL, final report): pending
 
