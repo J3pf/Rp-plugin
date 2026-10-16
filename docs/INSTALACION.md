@@ -21,23 +21,23 @@ Guía práctica y completa para instalar, emparejar y operar `@j3pf/pi-rp` en cu
 # Para Pi estándar (~/.pi/agent)
 pi install git:github.com/J3pf/Rp-plugin@v0.2.2
 
-# Para gentle-shell (~/.gentle-shell/agent), si está instalado
+# Para gentle-shell (~/.gentle-shell/agent) — verificado: gentle-shell reenvía la fuente git: a su home aislado
 gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.2
 ```
 
 ### Método B: Desde Tarball de la Release (Alternativa Offline)
-Si necesitas instalar en un entorno sin acceso a git o prefieres el tarball descargado:
+Pi registra la ruta local donde reside el paquete. Para evitar que la instalación quede huérfana si se borran directorios temporales o de descargas, descomprime el tarball en una carpeta permanente del agente (por ejemplo `~/.pi/agent/packages/j3pf-pi-rp-0.2.2`):
 
 ```bash
-# 1. Descargar el archivo .tgz de la release y descomprimirlo
-tar -xzf j3pf-pi-rp-0.2.2.tgz
-cd package
+# 1. Crear carpeta permanente y descomprimir el tarball de la release
+mkdir -p ~/.pi/agent/packages/j3pf-pi-rp-0.2.2
+tar -xzf j3pf-pi-rp-0.2.2.tgz -C ~/.pi/agent/packages/j3pf-pi-rp-0.2.2 --strip-components=1
 
 # 2. Instalar dependencias de producción
-npm install --omit=dev
+cd ~/.pi/agent/packages/j3pf-pi-rp-0.2.2 && npm install --omit=dev
 
-# 3. Instalar en Pi apuntando a la carpeta descomprimida
-pi install .
+# 3. Registrar el paquete en Pi desde la carpeta del agente
+cd ~/.pi/agent && pi install ./packages/j3pf-pi-rp-0.2.2
 ```
 
 ### Método C: Desde Código Fuente (Desarrollo / Clon Local)
@@ -56,16 +56,23 @@ pi install .
 ```
 
 ### Actualización desde una versión anterior
-Si ya tenías instalada una versión anterior (visible en `pi list`, ej. una ruta local en `settings.json` o un tag anterior):
-1. **Desinstala la versión anterior primero** con `pi remove` para evitar que Pi cargue ambas versiones simultáneamente:
-   ```bash
-   pi list
-   pi remove <cadena-exacta-instalada>   # ej: pi remove packages/j3pf-pi-rp-0.2.1 o pi remove git:github.com/J3pf/Rp-plugin@v0.2.1
-   ```
-2. **Instala la nueva versión**:
+Para evitar que dos versiones del plugin carguen al mismo tiempo en Pi:
+1. **Instala la nueva versión primero** (de este modo una falla de red o de instalación nunca deja el entorno sin plugin):
    ```bash
    pi install git:github.com/J3pf/Rp-plugin@v0.2.2
    ```
+2. **Revisa las fuentes instaladas con `pi list` y elimina la versión anterior**:
+   ```bash
+   pi list
+   ```
+   - Si la versión previa venía de un tag de git (ej. `@v0.2.1`):
+     ```bash
+     pi remove git:github.com/J3pf/Rp-plugin@v0.2.1
+     ```
+   - Si la versión previa era una ruta local (ej. `./packages/j3pf-pi-rp-0.2.1` en `settings.json`): las fuentes relativas se resuelven contra la carpeta del agente, por lo que debes ejecutar `pi remove` desde `~/.pi/agent`:
+     ```bash
+     cd ~/.pi/agent && pi remove ./packages/j3pf-pi-rp-0.2.1
+     ```
 3. **Reinicia las sesiones de Pi**. Para actualizar el servicio `rp-host` en la máquina actual:
    ```bash
    rp-host install   # o dejar que la auto-reparación de Pi lo migre automáticamente

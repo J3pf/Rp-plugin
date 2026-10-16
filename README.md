@@ -15,15 +15,17 @@ para lanzar agentes nuevos desde el móvil (en herdr, tmux o Windows Terminal).
 # Pi estándar (~/.pi/agent)
 pi install git:github.com/J3pf/Rp-plugin@v0.2.2
 
-# gentle-shell (~/.gentle-shell/agent)
+# gentle-shell (~/.gentle-shell/agent) — verificado: reenvía git: a su entorno aislado
 gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.2
 ```
 
 ### Alternativa offline (desde tarball de la release)
+Pi registra la ruta local de la carpeta donde se instala; para evitar perder el paquete si se limpian carpetas temporales o de descargas, descomprime el `.tgz` en una ubicación permanente (ej. `~/.pi/agent/packages/j3pf-pi-rp-0.2.2`):
 ```bash
-# Descargar el .tgz de la release, descomprimirlo e instalar sus dependencias:
-tar -xzf j3pf-pi-rp-0.2.2.tgz && cd package && npm install --omit=dev
-pi install .
+mkdir -p ~/.pi/agent/packages/j3pf-pi-rp-0.2.2
+tar -xzf j3pf-pi-rp-0.2.2.tgz -C ~/.pi/agent/packages/j3pf-pi-rp-0.2.2 --strip-components=1
+cd ~/.pi/agent/packages/j3pf-pi-rp-0.2.2 && npm install --omit=dev
+cd ~/.pi/agent && pi install ./packages/j3pf-pi-rp-0.2.2
 ```
 
 ### O desde código fuente local
@@ -34,17 +36,24 @@ pi install .
 ```
 
 ### Actualización desde una versión previa
-Si ya tenías instalada una versión anterior (visible con `pi list`, ej. una ruta local en `settings.json` o un tag previo):
-1. **Desinstala la versión anterior primero** para evitar que Pi cargue ambas versiones a la vez:
-   ```bash
-   pi list
-   pi remove <cadena-exacta-instalada>   # ej: pi remove packages/j3pf-pi-rp-0.2.1 o pi remove git:github.com/J3pf/Rp-plugin@v0.2.1
-   ```
-2. **Instala v0.2.2**:
+Para evitar que una versión anterior y la nueva carguen a la vez en Pi:
+1. **Instala la nueva versión primero** (para garantizar que una falla de red nunca te deje sin plugin):
    ```bash
    pi install git:github.com/J3pf/Rp-plugin@v0.2.2
    ```
-3. **Reinicia tus sesiones de Pi**. Para actualizar el servicio del host, ejecuta `rp-host install` (o deja que la auto-reparación lo migre en el siguiente inicio).
+2. **Revisa las fuentes instaladas con `pi list` y desinstala la versión anterior**:
+   ```bash
+   pi list
+   ```
+   - Si la versión anterior se instaló desde git (ej. `@v0.2.1`):
+     ```bash
+     pi remove git:github.com/J3pf/Rp-plugin@v0.2.1
+     ```
+   - Si la versión anterior era una instalación local (ej. `./packages/j3pf-pi-rp-0.2.1` en `settings.json`): las rutas relativas se resuelven contra el directorio del agente, por lo que debes ejecutar `pi remove` desde `~/.pi/agent`:
+     ```bash
+     cd ~/.pi/agent && pi remove ./packages/j3pf-pi-rp-0.2.1
+     ```
+3. **Reinicia tus sesiones de Pi**. Para actualizar el servicio del host en la máquina, ejecuta `rp-host install` (o deja que la auto-reparación lo migre en el siguiente inicio).
 
 ### Emparejamiento
 Una vez instalado, abre Pi (`pi` o `gentle-shell`) y ejecuta:
