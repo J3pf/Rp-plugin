@@ -11,7 +11,7 @@ vi.mock("../src/host/service.ts", async (importOriginal) => {
 });
 
 let dir: string;
-let previousExitCode: number | undefined;
+let previousExitCode: typeof process.exitCode;
 const backup = { ...process.env };
 beforeEach(() => {
   previousExitCode = process.exitCode;

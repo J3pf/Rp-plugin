@@ -5,12 +5,14 @@ import { detectStaticEnv } from "./environment.ts";
 import { FORWARDED_EVENTS } from "./forwarder.ts";
 import { Runtime } from "./runtime.ts";
 import { registerCommands } from "./commands.ts";
+import { ensureHostAutostart } from "./host-autostart.ts";
 
 export default function rp(pi: ExtensionAPI): void {
   const env = detectStaticEnv(process.env);
   const { cfg, path: cfgPath } = loadConfig(process.env);
 
   pi.registerFlag("rp-off", { type: "boolean", description: "Disable RP for this run" });
+  pi.registerFlag("rp-no-auto-host", { type: "boolean", description: "Disable automatic host service check/start for this run" });
   pi.registerFlag("rp-spawn-id", { type: "string", description: "Internal: id assigned by rp-host" });
 
   // Gentle Agents children are never registered as agents; their questions arrive through the parent (G4/G5).
@@ -42,6 +44,7 @@ export default function rp(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (ev, ctx) => {
     lastReason = ev.reason;
+    void ensureHostAutostart({ cfg, pi });
     await stop(); // a reload leaves the previous runtime invalid
     start(ctx, ev.reason);
   });

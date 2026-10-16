@@ -11,6 +11,7 @@ export interface RpConfig {
   machineToken: string | null;
   machine: { name?: string; context?: string };
   enabled: boolean;
+  hostAutostart: boolean;
   redactContent: boolean;
   gate: {
     mode: GateMode;
@@ -32,6 +33,7 @@ export const DEFAULT_CONFIG: RpConfig = {
   machineToken: null,
   machine: {},
   enabled: true,
+  hostAutostart: true,
   redactContent: false,
   gate: {
     mode: "auto-detect",
@@ -75,6 +77,7 @@ export function normalizeConfig(raw: any): RpConfig {
     machineToken: typeof r.machineToken === "string" ? r.machineToken : null,
     machine: r.machine && typeof r.machine === "object" ? { ...r.machine } : {},
     enabled: bool(r.enabled, d.enabled),
+    hostAutostart: bool(r.hostAutostart ?? r.autoHost, d.hostAutostart),
     redactContent: bool(r.redactContent, d.redactContent),
     gate: {
       mode: GATE_MODES.includes(g.mode) ? g.mode : d.gate.mode,

@@ -50,7 +50,7 @@ describe("extension factory", () => {
     writeCfg();
     const f = makePi();
     rpExtension(f.pi);
-    expect([...f.flags.keys()].sort()).toEqual(["rp-off", "rp-spawn-id"]);
+    expect([...f.flags.keys()].sort()).toEqual(["rp-no-auto-host", "rp-off", "rp-spawn-id"]);
     expect(f.commands.has("rp")).toBe(true);
     for (const ev of ["session_start", "session_shutdown", "tool_call", "tool_execution_start", "tool_execution_end", "ui_prompt_start", "ui_prompt_end", "input", "message_end", "agent_settled"]) {
       expect(f.handlers.has(ev), ev).toBe(true);
