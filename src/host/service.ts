@@ -104,7 +104,7 @@ export function systemdUnitPath(home = os.homedir()): string {
 
 export function schtasksXml(spec: ServiceSpec): string {
   const esc = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  return `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>RP host (create Pi agents from the phone)</Description>
@@ -137,8 +137,8 @@ export function schtasksXml(spec: ServiceSpec): string {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>${esc(spec.nodePath)}</Command>
-      <Arguments>${esc(`"${spec.scriptPath}" run`)}</Arguments>
+      <Command>conhost.exe</Command>
+      <Arguments>--headless "${esc(spec.nodePath)}" "${esc(spec.scriptPath)}" run</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -151,7 +151,7 @@ export function schtasksCreateXmlArgs(xmlPath: string): string[] {
 
 export function schtasksCreateArgs(spec: ServiceSpec, xmlPath?: string): string[] {
   if (xmlPath !== undefined) return schtasksCreateXmlArgs(xmlPath);
-  const tr = `"${spec.nodePath}" "${spec.scriptPath}" run`;
+  const tr = `conhost.exe --headless "${spec.nodePath}" "${spec.scriptPath}" run`;
   return ["/Create", "/SC", "ONLOGON", "/TN", "rp-host", "/TR", tr, "/F"];
 }
 
@@ -354,12 +354,21 @@ export async function inspectService(spec: ServiceSpec, run: Runner = realRun): 
     if (query.code !== 0) return inspection;
     inspection.installed = true;
     const xml = query.stdout;
-    const command = xmlValue(xml, "Command");
+    const command = xmlValue(xml, "Command") ?? "";
     const argumentsValue = xmlValue(xml, "Arguments") ?? "";
-    const trimmedArguments = argumentsValue.trim();
-    const firstQuote = trimmedArguments.startsWith('"') ? trimmedArguments.indexOf('"', 1) : -1;
-    inspection.nodePath = command;
-    inspection.scriptPath = firstQuote > 1 ? trimmedArguments.slice(1, firstQuote) : trimmedArguments.split(/\s/, 1)[0];
+    const isConhost = /(?:^|[\\/])conhost(?:\.exe)?$/i.test(command);
+    if (isConhost) {
+      const match = argumentsValue.match(/--headless\s+(?:"([^"]+)"|(\S+))\s+(?:"([^"]+)"|(\S+))/i);
+      if (match) {
+        inspection.nodePath = match[1] ?? match[2];
+        inspection.scriptPath = match[3] ?? match[4];
+      }
+    } else {
+      const trimmedArguments = argumentsValue.trim();
+      const firstQuote = trimmedArguments.startsWith('"') ? trimmedArguments.indexOf('"', 1) : -1;
+      inspection.nodePath = command;
+      inspection.scriptPath = firstQuote > 1 ? trimmedArguments.slice(1, firstQuote) : trimmedArguments.split(/\s/, 1)[0];
+    }
     inspection.nodePathValid = validInstalledNode(inspection.nodePath);
     inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
     const status = await run("schtasks", ["/Query", "/TN", "rp-host", "/V", "/FO", "LIST"]);
@@ -375,6 +384,8 @@ export async function inspectService(spec: ServiceSpec, run: Runner = realRun): 
     const restartInterval = xmlValue(xml, "Interval");
     const restartCount = xmlValue(xml, "Count");
     inspection.details = {
+      command,
+      arguments: argumentsValue,
       executionTimeLimit,
       disallowStartIfOnBatteries: disallowStartIfOnBatteries === undefined ? undefined : disallowStartIfOnBatteries.toLowerCase() === "true",
       stopIfGoingOnBatteries: stopIfGoingOnBatteries === undefined ? undefined : stopIfGoingOnBatteries.toLowerCase() === "true",
@@ -385,6 +396,8 @@ export async function inspectService(spec: ServiceSpec, run: Runner = realRun): 
     };
     inspection.enabled = enabled?.toLowerCase() === "true";
     const reasons: string[] = [];
+    if (!isConhost) reasons.push("task does not use windowless conhost launcher (visible console window)");
+    else if (!/--headless/i.test(argumentsValue)) reasons.push("task arguments missing --headless flag");
     if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
     if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
     if (enabled?.toLowerCase() !== "true") reasons.push("task is disabled");
@@ -464,7 +477,10 @@ export async function installService(spec: ServiceSpec, run: Runner = realRun): 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-host-task-"));
     const xmlPath = path.join(tempDir, "task.xml");
     try {
-      fs.writeFileSync(xmlPath, schtasksXml(installedSpec));
+      const xml = schtasksXml(installedSpec);
+      const bom = Buffer.from([0xff, 0xfe]);
+      const body = Buffer.from(xml, "utf16le");
+      fs.writeFileSync(xmlPath, Buffer.concat([bom, body]));
       const r = await run("schtasks", schtasksCreateArgs(installedSpec, xmlPath));
       if (r.code !== 0) throw new Error(`schtasks failed: ${r.stderr.trim() || r.stdout.trim()}`);
       await run("schtasks", ["/Run", "/TN", "rp-host"]);

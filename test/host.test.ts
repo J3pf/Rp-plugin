@@ -342,7 +342,7 @@ describe("HostConnection protocol", () => {
 
     const ask = async (t: string, d: any) => {
       const before = relay.all.length;
-      const id = "REQ" + Math.random();
+      const id = `REQ${Math.random()}`;
       relay.conns[0]!.ws.send(JSON.stringify(envelope(t, d, { id })));
       return waitUntil(() => relay.all.slice(before).find((e) => e.re === id), 3000, `reply to ${t}`);
     };
@@ -508,15 +508,15 @@ describe("service installation", () => {
     expect(systemdUnit(spec)).toContain(`Environment="PATH=${process.env.PATH ?? ""}"`);
     expect(systemdUnit({ ...spec, envPath: "" })).not.toContain('Environment="PATH=');
   });
-  it("Task Scheduler at logon, without admin", () => {
+  it("Task Scheduler at logon, without admin and with windowless conhost launcher", () => {
     const windowsSpec = { ...spec, platform: "win32" as const, nodePath: "C:\\Program Files\\nodejs\\node.exe", scriptPath: "C:\\rp\\bin\\rp-host.mjs" };
     const a = schtasksCreateArgs(windowsSpec);
-    expect(a).toEqual(["/Create", "/SC", "ONLOGON", "/TN", "rp-host", "/TR", '"C:\\Program Files\\nodejs\\node.exe" "C:\\rp\\bin\\rp-host.mjs" run', "/F"]);
+    expect(a).toEqual(["/Create", "/SC", "ONLOGON", "/TN", "rp-host", "/TR", 'conhost.exe --headless "C:\\Program Files\\nodejs\\node.exe" "C:\\rp\\bin\\rp-host.mjs" run', "/F"]);
     expect(a).not.toContain("/RU");
     expect(schtasksCreateArgs(windowsSpec, "C:\\Temp\\task.xml")).toEqual(["/Create", "/XML", "C:\\Temp\\task.xml", "/TN", "rp-host", "/F"]);
     expect(schtasksCreateXmlArgs("C:\\Temp\\task.xml")).toEqual(["/Create", "/XML", "C:\\Temp\\task.xml", "/TN", "rp-host", "/F"]);
   });
-  it("generates Task Scheduler XML with required policies and escaped paths", () => {
+  it("generates Task Scheduler XML with required policies, conhost headless launcher, and UTF-16 declaration", () => {
     const xml = schtasksXml({
       ...spec,
       platform: "win32",
@@ -524,6 +524,7 @@ describe("service installation", () => {
       scriptPath: "C:\\RP <Host>\\rp&host.mjs",
     });
     for (const element of [
+      '<?xml version="1.0" encoding="UTF-16"?>',
       '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
       "<Description>RP host (create Pi agents from the phone)</Description>",
       "<LogonTrigger><Enabled>true</Enabled></LogonTrigger>",
@@ -537,14 +538,14 @@ describe("service installation", () => {
       "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
       "<Interval>PT1M</Interval>",
       "<Count>999</Count>",
-      "<Command>C:\\Program Files\\RP &amp; Co\\node.exe</Command>",
-      '<Arguments>"C:\\RP &lt;Host&gt;\\rp&amp;host.mjs" run</Arguments>',
+      "<Command>conhost.exe</Command>",
+      '<Arguments>--headless "C:\\Program Files\\RP &amp; Co\\node.exe" "C:\\RP &lt;Host&gt;\\rp&amp;host.mjs" run</Arguments>',
     ]) expect(xml).toContain(element);
   });
-  it("installs Windows Task Scheduler from a temporary XML file and cleans it up", async () => {
+  it("installs Windows Task Scheduler from a temporary XML file encoded in UTF-16LE with BOM and cleans it up", async () => {
     const home = tmp();
     let xmlPath = "";
-    let xmlDuringCreate = "";
+    let xmlRawBytes: Buffer | null = null;
     const f = fakeRun({
       schtasks: (args) => {
         if (args[0] === "/Create") {
@@ -552,7 +553,7 @@ describe("service installation", () => {
           xmlPath = args[2]!;
           expect(args.slice(3)).toEqual(["/TN", "rp-host", "/F"]);
           expect(fs.existsSync(xmlPath)).toBe(true);
-          xmlDuringCreate = fs.readFileSync(xmlPath, "utf8");
+          xmlRawBytes = fs.readFileSync(xmlPath);
         }
         return {};
       },
@@ -566,9 +567,16 @@ describe("service installation", () => {
         scriptPath: "C:\\rp\\bin\\rp-host.mjs",
       }, f.run);
       expect(message).toContain("scheduled task rp-host created");
-      expect(xmlDuringCreate).toContain("<Task version=\"1.2\"");
-      expect(xmlDuringCreate).toContain("C:\\Program Files\\nodejs\\node.exe");
-      expect(xmlDuringCreate).toContain('"C:\\rp\\bin\\rp-host.mjs" run');
+      expect(xmlRawBytes).not.toBeNull();
+      // Byte order mark (BOM) for UTF-16LE is 0xFF 0xFE
+      expect(xmlRawBytes![0]).toBe(0xff);
+      expect(xmlRawBytes![1]).toBe(0xfe);
+      // Decode content without BOM
+      const decodedXml = xmlRawBytes!.subarray(2).toString("utf16le");
+      expect(decodedXml).toContain('<?xml version="1.0" encoding="UTF-16"?>');
+      expect(decodedXml).toContain("<Task version=\"1.2\"");
+      expect(decodedXml).toContain("<Command>conhost.exe</Command>");
+      expect(decodedXml).toContain('--headless "C:\\Program Files\\nodejs\\node.exe" "C:\\rp\\bin\\rp-host.mjs" run');
       expect(fs.existsSync(xmlPath)).toBe(false);
       expect(f.calls.map((call) => [call.cmd, call.args])).toEqual([
         ["schtasks", ["/Create", "/XML", xmlPath, "/TN", "rp-host", "/F"]],
@@ -670,6 +678,45 @@ describe("service installation", () => {
       "schtasks /Query /TN rp-host /XML",
       "schtasks /Query /TN rp-host /V /FO LIST",
     ]);
+  });
+  it("detects legacy Windows tasks running node.exe directly as stale and self-heals them", async () => {
+    const home = serviceTmp();
+    const nodePath = path.join(home, "node.exe");
+    const scriptPath = path.join(home, "rp-host.mjs");
+    fs.writeFileSync(nodePath, "node");
+    fs.writeFileSync(scriptPath, "script");
+    const legacyXml = `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Settings>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>${nodePath}</Command>
+      <Arguments>"${scriptPath}" run</Arguments>
+    </Exec>
+  </Actions>
+</Task>`;
+    const f = fakeRun({
+      "schtasks /Query /TN rp-host /XML": () => ({ stdout: legacyXml }),
+      "schtasks /Query /TN rp-host /V /FO LIST": () => ({ stdout: "Status: Running\n" }),
+      "schtasks /Create": () => ({}),
+      "schtasks /Run": () => ({}),
+    });
+    const inspection = await inspectService({ ...spec, platform: "win32", home, nodePath, scriptPath }, f.run);
+    expect(inspection.installed).toBe(true);
+    expect(inspection.stale).toBe(true);
+    expect(inspection.staleReason).toContain("windowless conhost launcher");
+
+    const healed = await ensureHostService({ ...spec, platform: "win32", home, nodePath, scriptPath }, f.run);
+    expect(healed.action).toBe("reinstalled");
+    expect(f.calls.some(({ cmd, args }) => cmd === "schtasks" && args.includes("/Create"))).toBe(true);
   });
   it("self-heals services according to installed, stale, running and healthy state", async () => {
     const home = serviceTmp();
