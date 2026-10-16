@@ -13,10 +13,10 @@ para lanzar agentes nuevos desde el móvil (en herdr, tmux o Windows Terminal).
 ### Desde la release oficial de GitHub (Recomendado)
 ```bash
 # Pi estándar (~/.pi/agent)
-pi install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.1/j3pf-pi-rp-0.2.1.tgz
+pi install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.2/j3pf-pi-rp-0.2.2.tgz
 
 # gentle-shell (~/.gentle-shell/agent)
-gentle-shell install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.1/j3pf-pi-rp-0.2.1.tgz
+gentle-shell install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.2/j3pf-pi-rp-0.2.2.tgz
 ```
 
 ### O desde código fuente local
@@ -48,7 +48,7 @@ Una vez instalado, abre Pi (`pi` o `gentle-shell`) y ejecuta:
 | Adjuntos (imágenes inline, resto en el inbox con ruta citada) | `attachments.ts` |
 | Agent Mesh: telemetría de comunicación inter-agente (`intercom` y `orchestrator_send_message` entrante/saliente → `CommEvent`) | `src/extension/comm.ts` |
 | Comandos `/rp pair\|status\|doctor\|on\|off\|gate\|test\|unpair` | `commands.ts` |
-| `rp-host`: crear agentes desde el móvil (herdr workspace/pestaña/panel, tmux, Windows Terminal, consola) + servicio | `src/host/` |
+| `rp-host`: autostart per-OS (systemd linger/PATH, Task Scheduler XML PT0S/batteries/restart, launchd bootstrap/logs), auto-repair on Pi `session_start`, `rp-host doctor` | `src/host/`, `src/extension/host-autostart.ts` |
 | `rp-host`: recolección periódica de cuotas de IA (`piquota --json`) y reporte a `rp-relay` | `src/host/quota.ts` |
 
 Documentos: [INSTALACION](docs/INSTALACION.md) (instalación y troubleshooting) · [PLAN-PLUGIN](docs/PLAN-PLUGIN.md) (plan + estado de implementación) · [RESILIENCIA](docs/RESILIENCIA.md) ·
@@ -69,16 +69,23 @@ Documentos: [INSTALACION](docs/INSTALACION.md) (instalación y troubleshooting) 
   "mirrorDialogs": true,
   "delivery": { "method": "auto", "interactive": true },   // auto|api|interactive|herdr
   "subagents": "skip",                     // skip|connect
+  "hostAutostart": true,                    // false: no comprobar/reparar el servicio rp-host al iniciar Pi
   "inboxDir": null
 }
 ```
-Variables: `RP_RELAY_URL`, `RP_DISABLED=1`, `RP_CONFIG`, `RP_DEBUG=1`; flags de Pi `--rp-off` y `--rp-spawn-id`.
+Variables: `RP_RELAY_URL`, `RP_DISABLED=1`, `RP_CONFIG`, `RP_DEBUG=1`; flags de Pi `--rp-off`, `--rp-spawn-id` y `--rp-no-auto-host` (omite el autostart para esa ejecución).
 `rp-host` usa `host.json` (mismo directorio): `roots`, `backend`, `launchers`, `defaultLauncher`, `herdrSession`, `quotaEnabled`, `quotaCommand`, `quotaIntervalSec`.
 
 ```bash
-rp-host init && rp-host install     # systemd --user (Linux) / tarea ONLOGON (Windows) / launchd (macOS)
+rp-host init
+rp-host install
+rp-host doctor       # diagnostica el servicio y devuelve error si hay problemas
 rp-host status
 ```
+
+Después de emparejar el PC con `/rp pair`, `rp-host install` configura el servicio de usuario para cada SO. Linux usa systemd `--user` con PATH capturado y lingering; Windows importa una tarea XML de Task Scheduler sin límite de duración, con reinicios y ejecución permitida con batería; macOS instala un agente launchd con PATH y logs. Al iniciar una sesión Pi (`session_start`), la extensión comprueba el servicio y, si falta, está obsoleto o no corre, intenta instalarlo/repararlo o iniciarlo en segundo plano sin bloquear ni hacer fallar Pi. La comprobación se limita a una vez cada 10 minutos.
+
+El autostart está habilitado por defecto. Para deshabilitarlo de forma persistente, configura `"hostAutostart": false` en `~/.config/rp/config.json` (Windows: `%APPDATA%\rp\config.json`); para omitirlo solo en una ejecución, inicia Pi con `--rp-no-auto-host`. Consulta [la guía de instalación](docs/INSTALACION.md) para los detalles por sistema operativo y diagnóstico.
 
 ## Desarrollo
 
