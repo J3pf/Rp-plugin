@@ -19,7 +19,7 @@ Branch: `feat/agent-mesh` | Status: in_progress
 - T4 (S4) [gentle-ai-worker] Implement robustness guards (safe hooks, 2000 chars truncation, redactContent, queue compatibility): done (commit 8f09634)
 - T5 (S5) [gentle-ai-worker] Verify and enhance `subagent_update` and `agent.status` toolDetail for current activity: done (commit 3f8cf3d)
 - T6 (S6) [gentle-ai-worker] Write comprehensive unit tests in `test/comm.test.ts`, regenerate fixtures (`npm run fixtures`), and verify suite: done (commit 3f8cf3d)
-- T7 (S7) [gentle-ai-worker] Update README.md and `docs/PLAN-PLUGIN.md` in Spanish: done (commit pending)
+- T7 (S7) [gentle-ai-worker] Update README.md and `docs/PLAN-PLUGIN.md` in Spanish: done (commit bbf5b4d)
 - T8 (S8) [gentle-ai-verify] Run independent verification and perform delivery (merge, bump 0.2.0, npm pack, tag, push, release, README URL, final report): in_progress
 
 ## Log
