@@ -13,10 +13,17 @@ para lanzar agentes nuevos desde el móvil (en herdr, tmux o Windows Terminal).
 ### Desde la release oficial de GitHub (Recomendado)
 ```bash
 # Pi estándar (~/.pi/agent)
-pi install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.2/j3pf-pi-rp-0.2.2.tgz
+pi install git:github.com/J3pf/Rp-plugin@v0.2.2
 
 # gentle-shell (~/.gentle-shell/agent)
-gentle-shell install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.2/j3pf-pi-rp-0.2.2.tgz
+gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.2
+```
+
+### Alternativa offline (desde tarball de la release)
+```bash
+# Descargar el .tgz de la release, descomprimirlo e instalar sus dependencias:
+tar -xzf j3pf-pi-rp-0.2.2.tgz && cd package && npm install --omit=dev
+pi install .
 ```
 
 ### O desde código fuente local
@@ -25,6 +32,19 @@ git clone https://github.com/J3pf/Rp-plugin.git
 cd Rp-plugin && npm install && npm run build
 pi install .
 ```
+
+### Actualización desde una versión previa
+Si ya tenías instalada una versión anterior (visible con `pi list`, ej. una ruta local en `settings.json` o un tag previo):
+1. **Desinstala la versión anterior primero** para evitar que Pi cargue ambas versiones a la vez:
+   ```bash
+   pi list
+   pi remove <cadena-exacta-instalada>   # ej: pi remove packages/j3pf-pi-rp-0.2.1 o pi remove git:github.com/J3pf/Rp-plugin@v0.2.1
+   ```
+2. **Instala v0.2.2**:
+   ```bash
+   pi install git:github.com/J3pf/Rp-plugin@v0.2.2
+   ```
+3. **Reinicia tus sesiones de Pi**. Para actualizar el servicio del host, ejecuta `rp-host install` (o deja que la auto-reparación lo migre en el siguiente inicio).
 
 ### Emparejamiento
 Una vez instalado, abre Pi (`pi` o `gentle-shell`) y ejecuta:

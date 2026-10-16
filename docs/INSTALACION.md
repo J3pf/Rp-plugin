@@ -14,18 +14,33 @@ Guía práctica y completa para instalar, emparejar y operar `@j3pf/pi-rp` en cu
 
 ## 1. Métodos de Instalación
 
-### Método A: Desde la Release Oficial en GitHub (Recomendado)
-Puedes instalar el paquete directamente en Pi utilizando el tarball publicado en GitHub:
+### Método A: Desde GitHub (Recomendado)
+`pi install` gestiona paquetes clonando desde repositorios git mediante el prefijo `git:` (nota: `pi install` no descarga directamente URLs de tarballs `.tgz` HTTP, sino que espera un repositorio git o una ruta local):
 
 ```bash
 # Para Pi estándar (~/.pi/agent)
-pi install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.2/j3pf-pi-rp-0.2.2.tgz
+pi install git:github.com/J3pf/Rp-plugin@v0.2.2
 
 # Para gentle-shell (~/.gentle-shell/agent), si está instalado
-gentle-shell install https://github.com/J3pf/Rp-plugin/releases/download/v0.2.2/j3pf-pi-rp-0.2.2.tgz
+gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.2
 ```
 
-### Método B: Desde Código Fuente (Desarrollo / Clon Local)
+### Método B: Desde Tarball de la Release (Alternativa Offline)
+Si necesitas instalar en un entorno sin acceso a git o prefieres el tarball descargado:
+
+```bash
+# 1. Descargar el archivo .tgz de la release y descomprimirlo
+tar -xzf j3pf-pi-rp-0.2.2.tgz
+cd package
+
+# 2. Instalar dependencias de producción
+npm install --omit=dev
+
+# 3. Instalar en Pi apuntando a la carpeta descomprimida
+pi install .
+```
+
+### Método C: Desde Código Fuente (Desarrollo / Clon Local)
 Si descargas o clonas el repositorio:
 
 ```bash
@@ -40,7 +55,24 @@ npm run build
 pi install .
 ```
 
-### Método C: Herramienta `rp-host` (Para crear agentes desde el móvil)
+### Actualización desde una versión anterior
+Si ya tenías instalada una versión anterior (visible en `pi list`, ej. una ruta local en `settings.json` o un tag anterior):
+1. **Desinstala la versión anterior primero** con `pi remove` para evitar que Pi cargue ambas versiones simultáneamente:
+   ```bash
+   pi list
+   pi remove <cadena-exacta-instalada>   # ej: pi remove packages/j3pf-pi-rp-0.2.1 o pi remove git:github.com/J3pf/Rp-plugin@v0.2.1
+   ```
+2. **Instala la nueva versión**:
+   ```bash
+   pi install git:github.com/J3pf/Rp-plugin@v0.2.2
+   ```
+3. **Reinicia las sesiones de Pi**. Para actualizar el servicio `rp-host` en la máquina actual:
+   ```bash
+   rp-host install   # o dejar que la auto-reparación de Pi lo migre automáticamente
+   rp-host doctor
+   ```
+
+### Método D: Herramienta `rp-host` (Para crear agentes desde el móvil)
 Si deseas que la app móvil pueda abrir sesiones nuevas de Pi en esta máquina (dentro de herdr, tmux o terminal):
 
 ```bash
