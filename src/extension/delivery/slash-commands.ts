@@ -3,10 +3,16 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 export const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ValidThinkingLevel = (typeof VALID_THINKING_LEVELS)[number];
 
+export interface SlashCommandOptions {
+  askSelect?: (title: string, options: string[]) => Promise<string | undefined>;
+  onBackground?: (task: Promise<void>) => void;
+}
+
 export async function handleModelCommand(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   rawArg: string,
+  opts?: SlashCommandOptions,
 ): Promise<void> {
   const query = rawArg.trim();
   const registry = ctx.modelRegistry;
@@ -78,33 +84,43 @@ export async function handleModelCommand(
   }
 
   const options = available.map((m: any) => `${m.provider}/${m.id}`);
-  const selected = await ctx.ui?.select("Seleccionar modelo", options);
-  if (!selected) return;
+  const selectFn = opts?.askSelect ?? ((title: string, items: string[]) => ctx.ui?.select(title, items));
+  const interactiveFlow = (async () => {
+    const selected = await selectFn("Seleccionar modelo", options);
+    if (!selected) return;
 
-  const selectedModel = available.find(
-    (m: any) => `${m.provider}/${m.id}` === selected || m.id === selected,
-  );
-  if (!selectedModel) return;
+    const selectedModel = available.find(
+      (m: any) => `${m.provider}/${m.id}` === selected || m.id === selected,
+    );
+    if (!selectedModel) return;
 
-  try {
-    const ok = await pi.setModel(selectedModel);
-    if (ok) {
-      ctx.ui?.notify?.(`Modelo cambiado a ${selectedModel.provider}/${selectedModel.id}`, "info");
-    } else {
-      ctx.ui?.notify?.(
-        `No se pudo cambiar al modelo ${selectedModel.provider}/${selectedModel.id}. Verifique la API key o configuración.`,
-        "warning",
-      );
+    try {
+      const ok = await pi.setModel(selectedModel);
+      if (ok) {
+        ctx.ui?.notify?.(`Modelo cambiado a ${selectedModel.provider}/${selectedModel.id}`, "info");
+      } else {
+        ctx.ui?.notify?.(
+          `No se pudo cambiar al modelo ${selectedModel.provider}/${selectedModel.id}. Verifique la API key o configuración.`,
+          "warning",
+        );
+      }
+    } catch (err: any) {
+      ctx.ui?.notify?.(`Error al cambiar de modelo: ${err?.message ?? String(err)}`, "warning");
     }
-  } catch (err: any) {
-    ctx.ui?.notify?.(`Error al cambiar de modelo: ${err?.message ?? String(err)}`, "warning");
+  })();
+
+  if (opts?.onBackground) {
+    opts.onBackground(interactiveFlow);
+    return;
   }
+  await interactiveFlow;
 }
 
 export async function handleThinkingCommand(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   rawArg: string,
+  opts?: SlashCommandOptions,
 ): Promise<void> {
   const query = rawArg.trim();
   if (query) {
@@ -125,16 +141,26 @@ export async function handleThinkingCommand(
     return;
   }
 
-  const selected = await ctx.ui?.select("Nivel de thinking", [...VALID_THINKING_LEVELS]);
-  if (!selected) return;
+  const selectFn = opts?.askSelect ?? ((title: string, items: string[]) => ctx.ui?.select(title, items));
+  const interactiveFlow = (async () => {
+    const selected = await selectFn("Nivel de thinking", [...VALID_THINKING_LEVELS]);
+    if (!selected) return;
 
-  const normalized = selected.trim().toLowerCase();
-  if (VALID_THINKING_LEVELS.includes(normalized as ValidThinkingLevel)) {
-    try {
-      pi.setThinkingLevel(normalized as any);
-      ctx.ui?.notify?.(`Nivel de thinking establecido en ${normalized}`, "info");
-    } catch (err: any) {
-      ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${err?.message ?? String(err)}`, "warning");
+    const normalized = selected.trim().toLowerCase();
+    if (VALID_THINKING_LEVELS.includes(normalized as ValidThinkingLevel)) {
+      try {
+        pi.setThinkingLevel(normalized as any);
+        ctx.ui?.notify?.(`Nivel de thinking establecido en ${normalized}`, "info");
+      } catch (err: any) {
+        ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${err?.message ?? String(err)}`, "warning");
+      }
     }
+  })();
+
+  if (opts?.onBackground) {
+    opts.onBackground(interactiveFlow);
+    return;
   }
+  await interactiveFlow;
 }
+

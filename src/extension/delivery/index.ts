@@ -31,6 +31,7 @@ export interface DelivererDeps {
   interactive: () => InteractiveDeps;
   sendAck: (ack: AckBody) => void;
   notify: (msg: string, level: "info" | "warning") => void;
+  askSelect?: (title: string, options: string[]) => Promise<string | undefined>;
 }
 
 /** Order of methods to try for a message. */
@@ -72,12 +73,19 @@ export class Deliverer {
   constructor(private d: DelivererDeps) {}
 
   handle(msg: UserMessageBody): Promise<void> {
-    const run = this.tail.then(() => this.process(msg)).catch(() => {});
-    this.tail = run;
-    return run;
+    let bg: Promise<void> | null = null;
+    const step = this.tail
+      .then(() =>
+        this.process(msg, (task) => {
+          bg = task;
+        }),
+      )
+      .catch(() => {});
+    this.tail = step;
+    return step.then(() => bg ?? undefined).catch(() => {});
   }
 
-  private async process(msg: UserMessageBody): Promise<void> {
+  private async process(msg: UserMessageBody, onBackground?: (task: Promise<void>) => void): Promise<void> {
     const id = msg.clientMsgId;
     if (this.seen.has(id)) {
       this.d.sendAck({ clientMsgId: id, disposition: "duplicate", method: "api", error: null });
@@ -98,14 +106,14 @@ export class Deliverer {
       this.record(msg, "api");
       this.d.sendAck({ clientMsgId: id, disposition: "command", method: "api", error: null });
       const arg = textTrimmed.replace(/^\/model\s*/i, "").trim();
-      await handleModelCommand(this.d.pi, ctx, arg);
+      await handleModelCommand(this.d.pi, ctx, arg, { askSelect: this.d.askSelect, onBackground });
       return;
     }
     if (lower === "/thinking" || /^\/thinking\s+/i.test(textTrimmed)) {
       this.record(msg, "api");
       this.d.sendAck({ clientMsgId: id, disposition: "command", method: "api", error: null });
       const arg = textTrimmed.replace(/^\/thinking\s*/i, "").trim();
-      await handleThinkingCommand(this.d.pi, ctx, arg);
+      await handleThinkingCommand(this.d.pi, ctx, arg, { askSelect: this.d.askSelect, onBackground });
       return;
     }
     const cfg = this.d.cfg();

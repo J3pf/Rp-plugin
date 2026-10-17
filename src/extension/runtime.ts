@@ -198,6 +198,7 @@ export class Runtime {
       interactive: () => this.interactiveDeps(),
       sendAck: (ack) => this.conn.send("user.message.ack", ack),
       notify: (m, l) => this.notify(m, l),
+      askSelect: (title, options) => this.askSelect(title, options),
     });
 
     const connOpts: ConstructorParameters<typeof Connection>[0] = {

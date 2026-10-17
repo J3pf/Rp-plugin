@@ -374,6 +374,30 @@ describe("Deliverer", () => {
     await m.d.handle({ clientMsgId: "th4", text: "/thinking" });
     expect(m.pi.setThinkingLevel).not.toHaveBeenCalled();
   });
+  it("does not block subsequent deliveries while interactive /model or /thinking select is open", async () => {
+    const m = mk({ gentle: "auto" });
+    m.ctx.modelRegistry.getAvailable = vi.fn(async () => [{ provider: "anthropic", id: "claude-sonnet" }]);
+    let resolveSelect!: (val: string | undefined) => void;
+    m.ctx.ui.select.mockImplementationOnce(
+      () =>
+        new Promise<string | undefined>((r) => {
+          resolveSelect = r;
+        }),
+    );
+
+    const pModel = m.d.handle({ clientMsgId: "m-pending", text: "/model" });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(m.acks[0]).toMatchObject({ clientMsgId: "m-pending", disposition: "command", method: "api" });
+
+    // While /model selector is still open, another message arrives and must be processed & acked immediately
+    await m.d.handle({ clientMsgId: "th-fast", text: "/thinking low" });
+    expect(m.acks[1]).toMatchObject({ clientMsgId: "th-fast", disposition: "command", method: "api" });
+    expect(m.pi.setThinkingLevel).toHaveBeenCalledWith("low");
+
+    resolveSelect("anthropic/claude-sonnet");
+    await pModel;
+    expect(m.pi.setModel).toHaveBeenCalledWith({ provider: "anthropic", id: "claude-sonnet" });
+  });
   it("deliveries are serialized in arrival order", async () => {
     const order: string[] = [];
     let release!: () => void;
