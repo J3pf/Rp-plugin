@@ -25,7 +25,6 @@ export class HostConnection {
   private timer: NodeJS.Timeout | null = null;
   private watchdog: NodeJS.Timeout | null = null;
   private quotaTimer: NodeJS.Timeout | null = null;
-  private quotaPolling = false;
 
   constructor(private o: HostConnectionOptions) {}
 
@@ -97,7 +96,7 @@ export class HostConnection {
       this.attempt = 0;
       this.arm();
       this.startQuotaTimer();
-      void this.hello(ws);
+      void this.hello();
     });
     ws.on("ping", () => this.arm());
     ws.on("message", (data) => {
@@ -147,27 +146,22 @@ export class HostConnection {
   }
 
   async pollQuotas(): Promise<void> {
-    if (this.stopped || !this.ws || this.ws.readyState !== WebSocket.OPEN || this.quotaPolling) return;
-    const ws = this.ws;
-    this.quotaPolling = true;
+    if (this.stopped || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     try {
       const quotas = await this.o.manager.collectQuotas();
-      if (!this.stopped && this.ws === ws && ws.readyState === WebSocket.OPEN && quotas) {
+      if (quotas && this.ws?.readyState === WebSocket.OPEN) {
         const body: HostQuotasBody = { quotas };
         this.sendEnv(envelope("host.quotas", body));
       }
     } catch (e) {
       this.log(`error polling quotas: ${(e as Error).message}`);
-    } finally {
-      this.quotaPolling = false;
     }
   }
 
-  async hello(ws?: WebSocket): Promise<void> {
+  async hello(): Promise<void> {
     const rep = await this.o.manager.detect(true);
     const def = await this.o.manager.defaultBackend();
     const quotas = await this.o.manager.collectQuotas();
-    if (this.stopped || (ws && this.ws !== ws)) return;
     const body: HostHelloBody = {
       machineId: this.o.machineId,
       hostname: os.hostname(),

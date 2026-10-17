@@ -263,25 +263,6 @@ describe("CommTracker outgoing events", () => {
     expect(events[0]).toMatchObject({ peer: { sessionId: "peer-session", name: "Peer", cwd: "/peer" } });
   });
 
-  it("correlates replies when inbound message ID is provided on details.id instead of details.message.id", () => {
-    const { comm, events } = tracker();
-    comm.onMessage({
-      customType: "intercom_message",
-      details: {
-        id: "details-only-id",
-        from: { id: "peer-top", name: "TopPeer", cwd: "/top" },
-        message: { expectsReply: true },
-        bodyText: "question",
-      },
-    });
-    comm.onToolStart("intercom", { action: "reply", replyTo: "details-only-id", message: "answer" }, "reply-top");
-    expect(events[1]).toMatchObject({
-      action: "reply",
-      replyTo: "details-only-id",
-      peer: { sessionId: "peer-top", name: "TopPeer", cwd: "/top", ref: null },
-    });
-  });
-
   it("redacts incoming intercom message content", () => {
     const { comm, events } = tracker(true);
     comm.onMessage({ customType: "intercom_message", details: { message: { id: "incoming-1" }, bodyText: "secret" } });

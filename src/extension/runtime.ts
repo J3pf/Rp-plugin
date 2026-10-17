@@ -3,7 +3,7 @@ import os from "node:os";
 import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { newId, type AgentEventPayload, type AgentHelloBody, type AgentStatus, type Envelope, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
-import { parseTodoTasks, redactTodoTasks, replayTodoBranch } from "./todos.ts";
+import { parseTodoTasks, replayTodoBranch } from "./todos.ts";
 import { errMsg, preview } from "../shared/util.ts";
 import type { RpConfig } from "./config.ts";
 import { resolveInboxDir } from "./config.ts";
@@ -129,7 +129,6 @@ export class Runtime {
     this.adapters = new AdapterRegistry(this.broker);
     this.subagents = new SubagentTracker({
       emit: (event) => this.emitEvent(event),
-      isRedacted: () => this.cfg.redactContent,
     });
     this.comm = new CommTracker({
       emit: (event) => this.emitEvent(event),
@@ -158,10 +157,7 @@ export class Runtime {
           const tasks = parseTodoTasks(result?.details ?? result);
           if (tasks) {
             this.currentTodos = tasks;
-            this.emitEvent({
-              type: "todo_update",
-              tasks: this.cfg.redactContent ? redactTodoTasks(tasks) : tasks,
-            });
+            this.emitEvent({ type: "todo_update", tasks });
           }
         }
         this.subagents.onToolEnd(name, result, isError, toolCallId, durationMs, parentToolCallId);
@@ -438,7 +434,7 @@ export class Runtime {
       thinking: this.thinking,
       status: this.statuses.current as AgentStatus,
       openPrompts: this.broker.openPrompts(),
-      todos: this.currentTodos.length > 0 ? { tasks: this.cfg.redactContent ? redactTodoTasks(this.currentTodos) : this.currentTodos } : null,
+      todos: this.currentTodos.length > 0 ? { tasks: this.currentTodos } : null,
       subagents: this.subagents.getSnapshot().length > 0 ? this.subagents.getSnapshot() : undefined,
     };
   }

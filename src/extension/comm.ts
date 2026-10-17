@@ -172,10 +172,9 @@ export class CommTracker {
     if (raw?.customType !== "intercom_message") return null;
     const details = raw?.details;
     const from = details?.from ?? {};
-    const rawMessage = details?.message ?? {};
-    const messageId = rawMessage?.id ?? details?.id;
+    const inboundMessage = details?.message ?? {};
+    const messageId = inboundMessage?.id ?? details?.id;
     if (typeof messageId !== "string" || !messageId) return null;
-    const inboundMessage: InboundCommMessage = { ...rawMessage, id: messageId };
     const bodyText = details?.bodyText ?? (typeof raw?.content === "string" ? raw.content : "");
     return { from, message: inboundMessage, messageId, bodyText };
   }

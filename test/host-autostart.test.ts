@@ -109,7 +109,6 @@ describe("extension host autostart", () => {
 
   it.each([
     ["config", { hostAutostart: false }, {}],
-    ["disabled config", { enabled: false }, {}],
     ["rp-no-auto-host flag", {}, { "rp-no-auto-host": true }],
     ["rp-off flag", {}, { "rp-off": true }],
   ])("skips the service check when opted out via %s", async (_reason, cfgOver, flags) => {
@@ -118,10 +117,9 @@ describe("extension host autostart", () => {
     expect(runner.calls).toEqual([]);
   });
 
-  it("skips the service check when RP_NO_AUTO_HOST or RP_DISABLED is set", async () => {
+  it("skips the service check when RP_NO_AUTO_HOST is set", async () => {
     const runner = fakeRunner();
     await ensureHostAutostart({ cfg: pairedConfig(), pi: pi(), runner: runner.run, platform: "linux", home: tempHome(), env: { ...cleanEnv(), RP_NO_AUTO_HOST: "1" } });
-    await ensureHostAutostart({ cfg: pairedConfig(), pi: pi(), runner: runner.run, platform: "linux", home: tempHome(), env: { ...cleanEnv(), RP_DISABLED: "1" } });
     expect(runner.calls).toEqual([]);
   });
 

@@ -51,7 +51,7 @@ export async function main(argv: string[]): Promise<void> {
         platform: process.platform,
       };
       const inspection = await inspectService(spec);
-      const healthy = inspection.installed && inspection.enabled !== false && inspection.running && !inspection.stale && inspection.nodePathValid && inspection.scriptPathValid &&
+      const healthy = inspection.installed && inspection.running && !inspection.stale && inspection.nodePathValid && inspection.scriptPathValid &&
         (inspection.platform !== "linux" || inspection.details?.linger === true);
       const status = healthy ? "OK" : "PROBLEM";
       if (argv.includes("--json")) {
@@ -74,7 +74,6 @@ export async function main(argv: string[]): Promise<void> {
         if (!healthy) {
           const problems: string[] = [];
           if (!inspection.installed) problems.push("service is not installed");
-          if (inspection.enabled === false) problems.push("service is disabled");
           if (!inspection.running) problems.push("service is not running");
           if (inspection.stale) problems.push(inspection.staleReason ?? "service configuration is stale");
           if (!inspection.nodePathValid) problems.push("node path is invalid or stale");

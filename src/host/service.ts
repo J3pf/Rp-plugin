@@ -42,18 +42,15 @@ export function resolveStableNodePath(env?: NodeJS.ProcessEnv, platform: NodeJS.
   const nodeName = platform === "win32" ? "node.exe" : "node";
   const directories = searchPath.split(platform === "win32" ? ";" : path.delimiter);
   const candidates: string[] = [];
-  const targetExecPath = execPath ?? process.execPath;
   let realExecPath: string | undefined;
   try {
-    realExecPath = fs.realpathSync(targetExecPath);
+    realExecPath = fs.realpathSync(execPath ?? process.execPath);
   } catch {
     // A missing exec path cannot match a PATH candidate; still try available nodes.
   }
 
-  for (const rawDir of directories) {
-    const dir = rawDir.trim();
-    if (!dir) continue;
-    const candidate = pathApi.join(dir, nodeName);
+  for (const dir of directories) {
+    const candidate = pathApi.join(dir || ".", nodeName);
     if (!fs.existsSync(candidate)) continue;
     candidates.push(candidate);
     if (realExecPath) {
@@ -65,11 +62,7 @@ export function resolveStableNodePath(env?: NodeJS.ProcessEnv, platform: NodeJS.
     }
   }
 
-  if (targetExecPath && !isVersionedNodePath(targetExecPath) && fs.existsSync(targetExecPath)) {
-    return targetExecPath;
-  }
-
-  return candidates.find((candidate) => !isVersionedNodePath(candidate)) ?? candidates[0] ?? targetExecPath;
+  return candidates.find((candidate) => !isVersionedNodePath(candidate)) ?? candidates[0] ?? execPath ?? process.execPath;
 }
 
 export function isStaleNodePath(installedNodePath: string): boolean {
@@ -290,18 +283,6 @@ function uniqueReasons(reasons: string[]): string[] {
   return [...new Set(reasons)];
 }
 
-function isLaunchdJobRunning(status: { code: number; stdout: string }): boolean {
-  if (status.code !== 0) return false;
-  const out = status.stdout.trim();
-  if (!out) return true;
-  const pidMatch = out.match(/"PID"\s*=\s*(\d+)\s*;/i);
-  if (pidMatch) return Number(pidMatch[1]) > 0;
-  if (out.startsWith("{") || /"Label"\s*=/i.test(out)) return false;
-  if (/^-\s+-?\d+\s+/m.test(out)) return false;
-  if (/^\d+\s+-?\d+\s+/m.test(out)) return true;
-  return true;
-}
-
 export async function inspectService(spec: ServiceSpec, run: Runner = realRun): Promise<ServiceInspection> {
   const home = spec.home ?? os.homedir();
   const inspection: ServiceInspection = {
@@ -338,7 +319,6 @@ export async function inspectService(spec: ServiceSpec, run: Runner = realRun): 
     inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
     if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
     if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
-    if (inspection.enabled === false) reasons.push("systemd user service is disabled");
     if (!unit.split("\n").some((line) => /^StartLimitIntervalSec\s*=\s*0\s*$/.test(line))) reasons.push("systemd unit is missing StartLimitIntervalSec=0");
     if (!unit.split("\n").some((line) => line.startsWith('Environment="PATH='))) reasons.push('systemd unit is missing Environment="PATH=..."');
     inspection.running = active.code === 0 || active.stdout === "active\n";
@@ -369,7 +349,7 @@ export async function inspectService(spec: ServiceSpec, run: Runner = realRun): 
     inspection.details = { environmentVariables: hasEnvironment };
     if (!hasEnvironment) reasons.push("launchd plist is missing EnvironmentVariables");
     const status = await run("launchctl", ["list", LAUNCHD_LABEL]);
-    inspection.running = isLaunchdJobRunning(status);
+    inspection.running = status.code === 0;
     inspection.stale = reasons.length > 0;
     if (inspection.stale) inspection.staleReason = uniqueReasons(reasons).join("; ");
     return inspection;
@@ -481,9 +461,6 @@ export async function ensureHostService(spec: ServiceSpec, run: Runner = realRun
     return { action: "installed", inspection, warning };
   }
   if (inspection.stale) {
-    if (spec.platform === "win32" && inspection.running) {
-      await run("schtasks", ["/End", "/TN", "rp-host"]);
-    }
     const warning = await installService(spec, run);
     return { action: "reinstalled", inspection, warning };
   }
@@ -511,17 +488,13 @@ export async function ensureHostService(spec: ServiceSpec, run: Runner = realRun
 
 export async function installService(spec: ServiceSpec, run: Runner = realRun): Promise<string> {
   const home = spec.home ?? os.homedir();
-  const searchEnv = spec.envPath !== undefined
-    ? { ...process.env, PATH: spec.envPath, Path: spec.envPath }
-    : process.env;
   if (spec.platform === "linux") {
     const installedSpec = {
       ...spec,
-      nodePath: resolveStableNodePath(searchEnv, spec.platform, spec.nodePath),
+      nodePath: resolveStableNodePath(process.env, spec.platform, spec.nodePath),
       envPath: spec.envPath ?? process.env.PATH,
     };
     const f = systemdUnitPath(home);
-    const hadUnit = fs.existsSync(f);
     fs.mkdirSync(path.dirname(f), { recursive: true });
     fs.writeFileSync(f, systemdUnit(installedSpec));
     let warning = "";
@@ -533,15 +506,12 @@ export async function installService(spec: ServiceSpec, run: Runner = realRun): 
     await run("systemctl", ["--user", "daemon-reload"]);
     const r = await run("systemctl", ["--user", "enable", "--now", "rp-host"]);
     if (r.code !== 0) throw new Error(`systemctl enable failed: ${r.stderr.trim()}`);
-    if (hadUnit) {
-      await run("systemctl", ["--user", "restart", "rp-host"]);
-    }
     return `systemd user service installed (${f})${warning}`;
   }
   if (spec.platform === "win32") {
     const installedSpec = {
       ...spec,
-      nodePath: resolveStableNodePath(searchEnv, spec.platform, spec.nodePath),
+      nodePath: resolveStableNodePath(process.env, spec.platform, spec.nodePath),
     };
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-host-task-"));
     const xmlPath = path.join(tempDir, "task.xml");
@@ -561,19 +531,14 @@ export async function installService(spec: ServiceSpec, run: Runner = realRun): 
   if (spec.platform === "darwin") {
     const installedSpec = {
       ...spec,
-      nodePath: resolveStableNodePath(searchEnv, spec.platform, spec.nodePath),
+      nodePath: resolveStableNodePath(process.env, spec.platform, spec.nodePath),
       envPath: spec.envPath ?? process.env.PATH,
     };
     const f = launchdPath(home);
-    const hadPlist = fs.existsSync(f);
     fs.mkdirSync(path.dirname(f), { recursive: true });
     fs.mkdirSync(path.join(home, "Library", "Logs"), { recursive: true });
     fs.writeFileSync(f, launchdPlist(installedSpec));
     const domain = launchdDomain();
-    if (hadPlist) {
-      const bootout = await run("launchctl", ["bootout", `${domain}/${LAUNCHD_LABEL}`]);
-      if (bootout.code !== 0) await run("launchctl", ["unload", "-w", f]);
-    }
     const bootstrap = await run("launchctl", ["bootstrap", domain, f]);
     if (bootstrap.code !== 0) {
       const fallback = await run("launchctl", ["load", "-w", f]);

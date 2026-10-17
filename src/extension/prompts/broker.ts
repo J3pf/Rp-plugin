@@ -24,7 +24,6 @@ export interface AdapterPromptSpec {
   source?: { extension?: string; tool?: string; subagent?: boolean };
   category?: PromptCategory;
   danger?: Danger;
-  herdrReported?: boolean;
 }
 
 export interface OpenPrompt {
@@ -142,8 +141,7 @@ export class Broker {
       danger: spec.danger ?? "low",
       expiresAt: null,
     };
-    const herdrReported = spec.herdrReported ?? (spec.source?.extension !== "@eko24ive/pi-ask");
-    return this.register(body, null, herdrReported);
+    return this.register(body, null, true);
   }
 
   close(p: OpenPrompt): void {

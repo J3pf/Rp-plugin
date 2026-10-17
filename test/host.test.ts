@@ -477,7 +477,6 @@ describe("service installation", () => {
       fs.writeFileSync(versioned, "node");
       fs.symlinkSync(versioned, stable);
       expect(resolveStableNodePath({ PATH: path.dirname(stable) }, "linux", versioned)).toBe(stable);
-      expect(resolveStableNodePath({ PATH: "" }, "linux", stable)).toBe(stable);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -658,20 +657,6 @@ describe("service installation", () => {
     fs.writeFileSync(plist, launchdPlist({ ...spec, platform: "darwin", home, nodePath, scriptPath, envPath: "/usr/bin" }));
     const f = fakeRun({ "launchctl list dev.j3pf.rp-host": () => ({}) });
     await expect(inspectService({ ...spec, platform: "darwin", home, nodePath, scriptPath }, f.run)).resolves.toMatchObject({ installed: true, running: true, stale: false, nodePath, nodePathValid: true, scriptPath, scriptPathValid: true });
-    const loadedNoPid = fakeRun({
-      "launchctl list dev.j3pf.rp-host": () => ({
-        code: 0,
-        stdout: '{\n\t"Label" = "dev.j3pf.rp-host";\n\t"LastExitStatus" = 0;\n};\n',
-      }),
-    });
-    await expect(inspectService({ ...spec, platform: "darwin", home, nodePath, scriptPath }, loadedNoPid.run)).resolves.toMatchObject({ installed: true, running: false, stale: false });
-    const loadedWithPid = fakeRun({
-      "launchctl list dev.j3pf.rp-host": () => ({
-        code: 0,
-        stdout: '{\n\t"Label" = "dev.j3pf.rp-host";\n\t"PID" = 4321;\n};\n',
-      }),
-    });
-    await expect(inspectService({ ...spec, platform: "darwin", home, nodePath, scriptPath }, loadedWithPid.run)).resolves.toMatchObject({ installed: true, running: true, stale: false });
     fs.writeFileSync(plist, `<dict><key>ProgramArguments</key><array><string>/missing/node</string><string>/missing/script</string></array></dict>`);
     await expect(inspectService({ ...spec, platform: "darwin", home }, fakeRun({ "launchctl list": () => ({ code: 1 }) }).run)).resolves.toMatchObject({ installed: true, running: false, stale: true, nodePathValid: false, scriptPathValid: false });
   });
