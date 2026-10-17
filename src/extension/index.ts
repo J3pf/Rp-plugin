@@ -38,7 +38,10 @@ export default function rp(pi: ExtensionAPI): void {
     cfg,
     cfgPath,
     getRuntime: () => rt,
-    startRuntime: (ctx: ExtensionCommandContext) => start(ctx),
+    startRuntime: (ctx: ExtensionCommandContext) => {
+      void ensureHostAutostart({ cfg, pi });
+      start(ctx);
+    },
     stopRuntime: stop,
   });
 

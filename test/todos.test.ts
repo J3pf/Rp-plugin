@@ -175,4 +175,54 @@ describe("Runtime TODO integration", () => {
     await rt.dispose();
     await relay.stop();
   });
+
+  it("redacts todo titles and omits notes in makeHello and todo_update when redactContent is true", async () => {
+    const relay = await new FakeRelay().start();
+    const branch = [
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "todo",
+          isError: false,
+          details: {
+            gentleTodo: {
+              tasks: [{ id: 1, title: "Secret initial", status: "in_progress", note: "secret note" }],
+            },
+          },
+        },
+      },
+    ];
+    const ctx = makeCtx({ branch });
+    const { pi } = makePi();
+    const rt = new Runtime(pi, ctx, baseConfig(relay.url, { redactContent: true }), detectStaticEnv(), "startup");
+    expect(rt.makeHello().todos).toEqual({
+      tasks: [{ id: 1, title: "[redacted]", status: "in_progress" }],
+    });
+    rt.start();
+    await waitUntil(() => relay.of("agent.snapshot").length === 1);
+
+    rt.forward("tool_execution_end", {
+      toolCallId: "call_todo_redacted",
+      toolName: "todo",
+      isError: false,
+      result: {
+        details: {
+          gentleTodo: {
+            tasks: [{ id: 2, title: "Secret updated", status: "done", note: "classified" }],
+          },
+        },
+      },
+    }, ctx);
+
+    await waitUntil(() => relay.of("agent.event").some((e) => e.d.e?.type === "todo_update"));
+    const todoEv = relay.of("agent.event").map((e) => e.d.e).find((e: any) => e.type === "todo_update");
+    expect(todoEv).toEqual({
+      type: "todo_update",
+      tasks: [{ id: 2, title: "[redacted]", status: "done" }],
+    });
+
+    await rt.dispose();
+    await relay.stop();
+  });
 });
