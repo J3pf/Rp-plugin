@@ -48,3 +48,11 @@ export function replayTodoBranch(branch: readonly unknown[] | undefined): TodoTa
   }
   return tasks;
 }
+
+export function redactTodoTasks(tasks: readonly TodoTask[]): TodoTask[] {
+  return tasks.map((t) => ({
+    id: t.id,
+    title: "[redacted]",
+    status: t.status,
+  }));
+}

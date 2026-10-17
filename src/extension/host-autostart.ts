@@ -6,7 +6,7 @@ import { run as realRun, type Runner } from "../host/runner.ts";
 
 export const AUTOSTART_COOLDOWN_MS = 10 * 60 * 1000;
 
-type AutostartConfig = Pick<RpConfig, "hostAutostart" | "machineToken" | "relayUrl">;
+type AutostartConfig = Pick<RpConfig, "hostAutostart" | "machineToken" | "relayUrl"> & { enabled?: boolean };
 type FlagReader = { getFlag(name: string): boolean | string | undefined };
 
 let lastAutostartCheckAt: number | undefined;
@@ -25,10 +25,11 @@ export function shouldCheckHostAutostart(
   now = Date.now(),
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
+  if (cfg.enabled === false) return false;
   if (cfg.hostAutostart === false) return false;
   if (pi.getFlag("rp-no-auto-host") || pi.getFlag("rp-off")) return false;
   if (!Boolean(cfg.machineToken && cfg.relayUrl)) return false;
-  if (env.RP_NO_AUTO_HOST === "1") return false;
+  if (env.RP_NO_AUTO_HOST === "1" || env.RP_DISABLED === "1") return false;
   if (lastAutostartCheckAt !== undefined && now - lastAutostartCheckAt < AUTOSTART_COOLDOWN_MS) return false;
 
   // Reserve the cooldown before starting asynchronous work so concurrent sessions cannot race.

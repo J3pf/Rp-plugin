@@ -321,4 +321,36 @@ describe("Runtime Subagent integration", () => {
     await rt.dispose();
     await relay.stop();
   });
+
+  it("redacts subagent labels and omits result/error when redactContent is true, truncates large outputs, and bounds task capacity", () => {
+    const emitted: SubagentUpdateEvent[] = [];
+    let redacted = true;
+    const tracker = new SubagentTracker({
+      emit: (ev) => emitted.push(ev),
+      isRedacted: () => redacted,
+      now: () => 3000,
+    });
+
+    tracker.onToolStart("subagent_run", { agent: "worker", label: "secret label", task: "secret task" }, "call_sec");
+    expect(emitted.at(-1)?.label).toBe("[redacted]");
+
+    tracker.onToolEnd("subagent_run", "secret output", false, "call_sec", 100);
+    expect(emitted.at(-1)?.label).toBe("[redacted]");
+    expect(emitted.at(-1)?.result).toBeUndefined();
+    expect(tracker.getSnapshot()[0]?.label).toBe("[redacted]");
+    expect(tracker.getSnapshot()[0]?.result).toBeUndefined();
+
+    // Unredacted: truncates large results to <= 4096 UTF-8 bytes
+    redacted = false;
+    tracker.onToolStart("subagent_run", { agent: "worker", label: "big task" }, "call_big");
+    tracker.onToolEnd("subagent_run", "x".repeat(10_000), false, "call_big", 200);
+    expect(Buffer.byteLength(emitted.at(-1)!.result!, "utf8")).toBeLessThanOrEqual(4096);
+
+    // Capacity bound: at most 100 tasks retained
+    for (let i = 0; i < 110; i++) {
+      tracker.onToolStart("subagent_run", { agent: "worker", label: `t-${i}` }, `cap_${i}`);
+      tracker.onToolEnd("subagent_run", "ok", false, `cap_${i}`, 10);
+    }
+    expect(tracker.getSnapshot().length).toBeLessThanOrEqual(100);
+  });
 });

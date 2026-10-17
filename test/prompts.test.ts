@@ -275,11 +275,20 @@ describe("gentle-pi 4.1.0 adapters (fixtures taken from the real tool source)", 
     ],
   };
 
-  it("piAskUser: accepts validates questions 1..4 with prompt and options", () => {
+  it("piAskUser: accepts validates questions 1..4 with unique non-empty id, prompt and options", () => {
     expect(piAskUser.accepts(askUserArgs)).toBe(true);
     expect(piAskUser.accepts({ questions: [] })).toBe(false);
     expect(piAskUser.accepts({ questions: [1, 2, 3, 4, 5] })).toBe(false);
     expect(piAskUser.accepts({ questions: [{ prompt: "no options" }] })).toBe(false);
+    expect(piAskUser.accepts({ questions: [{ id: "", prompt: "empty id", options: [{ label: "A" }] }] })).toBe(false);
+    expect(
+      piAskUser.accepts({
+        questions: [
+          { id: "dup", prompt: "Q1", options: [{ label: "A" }] },
+          { id: "dup", prompt: "Q2", options: [{ label: "B" }] },
+        ],
+      }),
+    ).toBe(false);
     expect(piAskUser.accepts(null)).toBe(false);
   });
 
@@ -473,6 +482,16 @@ describe("gentle-pi 4.1.0 adapters (fixtures taken from the real tool source)", 
       source: { extension: "@eko24ive/pi-ask", tool: "ask_user" },
     });
     expect(r.of("prompt.ack")).toEqual([{ promptId: r.open.promptId, accepted: true }]);
+
+    // Verify pi-ask prompts emit herdr:blocked (unlike gentle-pi which emits its own)
+    const bus = new FakeBus();
+    const herdrEvents: any[] = [];
+    bus.on("herdr:blocked", (d) => herdrEvents.push(d));
+    const { broker: hb } = mkBroker({ herdr: new HerdrBlocker(bus, true) });
+    const p = hb.openSpec(piAskUser.toPrompt(askUserArgs));
+    expect(herdrEvents).toEqual([{ active: true, label: "Configuración inicial" }]);
+    hb.close(p);
+    expect(herdrEvents[1]).toEqual({ active: false });
   });
   it("registry ignores unknown tools, bad shapes, and disabled mode", () => {
     const { broker } = mkBroker();

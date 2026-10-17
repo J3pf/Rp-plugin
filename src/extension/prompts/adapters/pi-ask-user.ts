@@ -51,13 +51,24 @@ export const piAskUser: CustomDialogAdapter = {
 
   accepts(args): boolean {
     const a = args as AskParams;
-    return (
-      !!a &&
-      Array.isArray(a.questions) &&
-      a.questions.length >= 1 &&
-      a.questions.length <= 4 &&
-      a.questions.every((q) => q && typeof q.prompt === "string" && Array.isArray(q.options) && q.options.every((o) => o && typeof o.label === "string"))
-    );
+    if (
+      !a ||
+      !Array.isArray(a.questions) ||
+      a.questions.length < 1 ||
+      a.questions.length > 4 ||
+      !a.questions.every(
+        (q) =>
+          q &&
+          typeof q.id === "string" &&
+          q.id.trim().length > 0 &&
+          typeof q.prompt === "string" &&
+          Array.isArray(q.options) &&
+          q.options.every((o) => o && typeof o.label === "string"),
+      )
+    ) {
+      return false;
+    }
+    return new Set(a.questions.map((q) => q.id)).size === a.questions.length;
   },
 
   toPrompt(args) {
@@ -81,6 +92,7 @@ export const piAskUser: CustomDialogAdapter = {
       source: { extension: "@eko24ive/pi-ask", tool: "ask_user", subagent: false },
       category: "question",
       danger: "low",
+      herdrReported: false,
     };
   },
 

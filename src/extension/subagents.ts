@@ -1,8 +1,12 @@
 import type { SubagentToolCall, SubagentUpdateEvent } from "../shared/protocol.ts";
-import { safeDurationMs, toEpochMs } from "../shared/util.ts";
+import { safeDurationMs, toEpochMs, truncateBytes } from "../shared/util.ts";
+
+const MAX_SUBAGENT_TASKS = 100;
+const MAX_SUBAGENT_RESULT_BYTES = 4096;
 
 export interface SubagentTrackerDeps {
   emit: (event: SubagentUpdateEvent) => void;
+  isRedacted?: () => boolean;
   now?: () => number;
 }
 
@@ -15,12 +19,54 @@ export class SubagentTracker {
     this.now = deps.now ?? (() => Date.now());
   }
 
+  private isRedacted(): boolean {
+    return !!this.deps.isRedacted?.();
+  }
+
+  private sanitizeTask(task: SubagentUpdateEvent): SubagentUpdateEvent {
+    const copy: SubagentUpdateEvent = {
+      ...task,
+      ...(task.tools ? { tools: task.tools.map((t) => ({ ...t })) } : {}),
+    };
+    if (this.isRedacted()) {
+      copy.label = "[redacted]";
+      delete copy.result;
+      delete copy.error;
+    }
+    return copy;
+  }
+
+  private setTask(taskId: string, task: SubagentUpdateEvent): void {
+    this.tasks.delete(taskId);
+    this.tasks.set(taskId, task);
+    while (this.tasks.size > MAX_SUBAGENT_TASKS) {
+      let victimId: string | undefined;
+      for (const [id, t] of this.tasks) {
+        if (t.status !== "running") {
+          victimId = id;
+          break;
+        }
+      }
+      if (!victimId) {
+        victimId = this.tasks.keys().next().value;
+      }
+      if (!victimId) break;
+      this.tasks.delete(victimId);
+      for (const [callId, mappedId] of this.callToTaskId) {
+        if (mappedId === victimId || callId === victimId) {
+          this.callToTaskId.delete(callId);
+        }
+      }
+    }
+  }
+
   getSnapshot(): SubagentUpdateEvent[] {
-    return Array.from(this.tasks.values());
+    return Array.from(this.tasks.values(), (t) => this.sanitizeTask(t));
   }
 
   getTask(id: string): SubagentUpdateEvent | undefined {
-    return this.tasks.get(id);
+    const task = this.tasks.get(id);
+    return task ? this.sanitizeTask(task) : undefined;
   }
 
   onToolStart(name: string, args: unknown, toolCallId?: string, parentToolCallId?: string): void {
@@ -29,8 +75,9 @@ export class SubagentTracker {
       this.callToTaskId.set(toolCallId, taskId);
       const a = args as Record<string, unknown> | undefined;
       const agent = typeof a?.agent === "string" ? a.agent : "subagent";
-      const label =
-        typeof a?.label === "string"
+      const label = this.isRedacted()
+        ? "[redacted]"
+        : typeof a?.label === "string"
           ? a.label
           : typeof a?.task === "string"
             ? a.task.slice(0, 72)
@@ -44,8 +91,8 @@ export class SubagentTracker {
         startedAt: toEpochMs(this.now(), this.now()),
         tools: [],
       };
-      this.tasks.set(taskId, task);
-      this.deps.emit({ ...task });
+      this.setTask(taskId, task);
+      this.deps.emit(this.sanitizeTask(task));
       return;
     }
 
@@ -60,7 +107,7 @@ export class SubagentTracker {
           status: "running",
         });
         task.toolCalls = (task.toolCalls ?? 0) + 1;
-        this.deps.emit({ ...task });
+        this.deps.emit(this.sanitizeTask(task));
       }
     }
   }
@@ -75,17 +122,22 @@ export class SubagentTracker {
   ): void {
     if (name === "subagent_run" && toolCallId) {
       const taskId = this.callToTaskId.get(toolCallId) ?? toolCallId;
+      this.callToTaskId.delete(toolCallId);
       const task = this.tasks.get(taskId);
       if (task) {
         task.status = isError ? "failed" : "completed";
         task.endedAt = toEpochMs(this.now(), this.now());
         task.durationMs = safeDurationMs(task.startedAt, task.endedAt, durationMs);
-        if (isError) {
-          task.error = typeof result === "string" ? result : JSON.stringify(result);
-        } else {
-          task.result = typeof result === "string" ? result : JSON.stringify(result);
+        if (!this.isRedacted()) {
+          const raw = typeof result === "string" ? result : JSON.stringify(result) ?? String(result);
+          const text = truncateBytes(raw, MAX_SUBAGENT_RESULT_BYTES).text;
+          if (isError) {
+            task.error = text;
+          } else {
+            task.result = text;
+          }
         }
-        this.deps.emit({ ...task });
+        this.deps.emit(this.sanitizeTask(task));
       }
       return;
     }
@@ -101,7 +153,7 @@ export class SubagentTracker {
             t.durationMs = Math.round(durationMs);
           }
         }
-        this.deps.emit({ ...task });
+        this.deps.emit(this.sanitizeTask(task));
       }
     }
   }
@@ -116,7 +168,7 @@ export class SubagentTracker {
       type: "subagent_update",
       taskId: ev.taskId,
       agent: "subagent",
-      label: ev.taskId,
+      label: this.isRedacted() ? "[redacted]" : ev.taskId,
       status: typeof ev.status === "string" ? ev.status : "running",
       startedAt: toEpochMs(ev.occurredAt, this.now()),
       tools: [],
@@ -141,8 +193,8 @@ export class SubagentTracker {
       task.durationMs = safeDurationMs(task.startedAt, task.endedAt, sourceDuration);
     }
 
-    this.tasks.set(ev.taskId, task);
-    this.deps.emit({ ...task });
+    this.setTask(ev.taskId, task);
+    this.deps.emit(this.sanitizeTask(task));
   }
 
   onGentleMetrics(d: unknown): void {
@@ -177,6 +229,6 @@ export class SubagentTracker {
       task.turns = (task.turns ?? 0) + ev.responses.length;
     }
 
-    this.deps.emit({ ...task });
+    this.deps.emit(this.sanitizeTask(task));
   }
 }
