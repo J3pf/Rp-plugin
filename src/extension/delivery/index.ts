@@ -8,6 +8,7 @@ import { resolveAttachments, type FetchBlob } from "../attachments.ts";
 import { deliverApi } from "./api.ts";
 import { deliverHerdr } from "./herdr.ts";
 import { deliverInteractive, type InteractiveDeps } from "./interactive.ts";
+import { handleModelCommand, handleThinkingCommand } from "./slash-commands.ts";
 
 export interface AckBody {
   clientMsgId: string;
@@ -90,6 +91,21 @@ export class Deliverer {
       this.d.sendAck({ clientMsgId: id, disposition: "command", method: "api", error: null });
       const shutdown = (ctx as { shutdown?: () => void }).shutdown;
       if (typeof shutdown === "function") shutdown();
+      return;
+    }
+    const lower = textTrimmed.toLowerCase();
+    if (lower === "/model" || /^\/model\s+/i.test(textTrimmed)) {
+      this.record(msg, "api");
+      this.d.sendAck({ clientMsgId: id, disposition: "command", method: "api", error: null });
+      const arg = textTrimmed.replace(/^\/model\s*/i, "").trim();
+      await handleModelCommand(this.d.pi, ctx, arg);
+      return;
+    }
+    if (lower === "/thinking" || /^\/thinking\s+/i.test(textTrimmed)) {
+      this.record(msg, "api");
+      this.d.sendAck({ clientMsgId: id, disposition: "command", method: "api", error: null });
+      const arg = textTrimmed.replace(/^\/thinking\s*/i, "").trim();
+      await handleThinkingCommand(this.d.pi, ctx, arg);
       return;
     }
     const cfg = this.d.cfg();

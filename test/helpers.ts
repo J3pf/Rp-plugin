@@ -214,6 +214,7 @@ export interface FakeCtxOptions {
   idle?: boolean;
   branch?: any[];
   ui?: any;
+  modelRegistry?: any;
 }
 
 export function makeCtx(o: FakeCtxOptions = {}) {
@@ -231,6 +232,11 @@ export function makeCtx(o: FakeCtxOptions = {}) {
       getBranch: () => o.branch ?? [],
     },
     model: { provider: "fake", id: "fake-1" },
+    modelRegistry: o.modelRegistry ?? {
+      find: vi.fn(),
+      getAll: vi.fn(() => []),
+      getAvailable: vi.fn(async () => []),
+    },
     thinkingLevel: "off",
     isIdle: () => idle,
     abort: vi.fn(),
@@ -268,6 +274,8 @@ export function makePi(tools: any[] = []) {
     sendUserMessage: vi.fn((content: any, opts?: any) => sent.push({ content, opts })),
     appendEntry: vi.fn((type: string, data: any) => entries.push({ type: "custom", customType: type, data })),
     exec: vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false })),
+    setModel: vi.fn(async (_m: any) => true),
+    setThinkingLevel: vi.fn((_l: any) => {}),
   };
   return {
     pi,

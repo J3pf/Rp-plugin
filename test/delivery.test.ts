@@ -161,9 +161,9 @@ describe("deliverInteractive", () => {
 });
 
 describe("Deliverer", () => {
-  function mk(over: { cfg?: any; gentle?: string | null; herdr?: any; interactive?: any; idle?: boolean; fetchBlob?: any } = {}) {
+  function mk(over: { cfg?: any; gentle?: string | null; herdr?: any; interactive?: any; idle?: boolean; fetchBlob?: any; ctx?: any } = {}) {
     const { pi, sent, entries } = makePi();
-    const ctx = makeCtx({ idle: over.idle ?? true });
+    const ctx = over.ctx ?? makeCtx({ idle: over.idle ?? true });
     const acks: any[] = [];
     const notes: string[] = [];
     const d = new Deliverer({
@@ -273,6 +273,106 @@ describe("Deliverer", () => {
     expect(m.sent).toHaveLength(0);
     expect(m.acks[1]).toMatchObject({ clientMsgId: "q2", disposition: "command", method: "api" });
     expect(m.ctx.shutdown).toHaveBeenCalledTimes(2);
+  });
+  it("intercepts /model with provider/id argument and updates model", async () => {
+    const m = mk({ gentle: "auto" });
+    m.ctx.modelRegistry.find = vi.fn((p: string, id: string) => (p === "anthropic" && id === "claude-sonnet" ? { provider: p, id } : undefined));
+    await m.d.handle({ clientMsgId: "m1", text: "/model anthropic/claude-sonnet" });
+    expect(m.sent).toHaveLength(0);
+    expect(m.acks[0]).toMatchObject({ clientMsgId: "m1", disposition: "command", method: "api", error: null });
+    expect(m.pi.setModel).toHaveBeenCalledWith({ provider: "anthropic", id: "claude-sonnet" });
+    expect(m.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("anthropic/claude-sonnet"), "info");
+  });
+  it("intercepts /model with modelId argument resolved via getAll", async () => {
+    const m = mk({ gentle: "auto" });
+    m.ctx.modelRegistry.find = vi.fn(() => undefined);
+    m.ctx.modelRegistry.getAll = vi.fn(() => [{ provider: "openai", id: "gpt-4o" }]);
+    await m.d.handle({ clientMsgId: "m2", text: "/model gpt-4o" });
+    expect(m.sent).toHaveLength(0);
+    expect(m.acks[0]).toMatchObject({ clientMsgId: "m2", disposition: "command", method: "api", error: null });
+    expect(m.pi.setModel).toHaveBeenCalledWith({ provider: "openai", id: "gpt-4o" });
+    expect(m.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("openai/gpt-4o"), "info");
+  });
+  it("intercepts /model with nonexistent model and warns", async () => {
+    const m = mk({ gentle: "auto" });
+    m.ctx.modelRegistry.find = vi.fn(() => undefined);
+    m.ctx.modelRegistry.getAll = vi.fn(() => [{ provider: "openai", id: "gpt-4o" }]);
+    await m.d.handle({ clientMsgId: "m3", text: "/model nonexistent-model" });
+    expect(m.sent).toHaveLength(0);
+    expect(m.acks[0]).toMatchObject({ clientMsgId: "m3", disposition: "command", method: "api", error: null });
+    expect(m.pi.setModel).not.toHaveBeenCalled();
+    expect(m.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("nonexistent-model"), "warning");
+  });
+  it("intercepts /model when setModel returns false and warns", async () => {
+    const m = mk({ gentle: "auto" });
+    m.ctx.modelRegistry.find = vi.fn(() => ({ provider: "anthropic", id: "claude-opus" }));
+    m.pi.setModel.mockResolvedValueOnce(false);
+    await m.d.handle({ clientMsgId: "m4", text: "/model anthropic/claude-opus" });
+    expect(m.sent).toHaveLength(0);
+    expect(m.acks[0]).toMatchObject({ clientMsgId: "m4", disposition: "command", method: "api", error: null });
+    expect(m.ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/No se pudo cambiar|API key/), "warning");
+  });
+  it("intercepts /model without arguments and presents interactive select", async () => {
+    const m = mk({ gentle: "auto" });
+    m.ctx.modelRegistry.getAvailable = vi.fn(async () => [
+      { provider: "anthropic", id: "claude-sonnet" },
+      { provider: "openai", id: "gpt-4o" },
+    ]);
+    m.ctx.ui.select.mockResolvedValueOnce("anthropic/claude-sonnet");
+    await m.d.handle({ clientMsgId: "m5", text: "/model" });
+    expect(m.sent).toHaveLength(0);
+    expect(m.acks[0]).toMatchObject({ clientMsgId: "m5", disposition: "command", method: "api", error: null });
+    expect(m.ctx.ui.select).toHaveBeenCalledWith("Seleccionar modelo", ["anthropic/claude-sonnet", "openai/gpt-4o"]);
+    expect(m.pi.setModel).toHaveBeenCalledWith({ provider: "anthropic", id: "claude-sonnet" });
+    expect(m.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("anthropic/claude-sonnet"), "info");
+  });
+  it("intercepts /thinking with valid level and updates thinking level", async () => {
+    const m = mk({ gentle: "auto" });
+    await m.d.handle({ clientMsgId: "th1", text: "/thinking high" });
+    expect(m.sent).toHaveLength(0);
+    expect(m.acks[0]).toMatchObject({ clientMsgId: "th1", disposition: "command", method: "api", error: null });
+    expect(m.pi.setThinkingLevel).toHaveBeenCalledWith("high");
+    expect(m.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("high"), "info");
+
+    // Case-insensitive valid level
+    await m.d.handle({ clientMsgId: "th1-upper", text: "/thinking HIGH" });
+    expect(m.pi.setThinkingLevel).toHaveBeenCalledWith("high");
+  });
+  it("intercepts /thinking with invalid level and warns with valid levels", async () => {
+    const m = mk({ gentle: "auto" });
+    await m.d.handle({ clientMsgId: "th2", text: "/thinking super-deep" });
+    expect(m.sent).toHaveLength(0);
+    expect(m.acks[0]).toMatchObject({ clientMsgId: "th2", disposition: "command", method: "api", error: null });
+    expect(m.pi.setThinkingLevel).not.toHaveBeenCalled();
+    expect(m.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("super-deep"), "warning");
+  });
+  it("intercepts /model without arguments when user cancels select", async () => {
+    const m = mk({ gentle: "auto" });
+    m.ctx.modelRegistry.getAvailable = vi.fn(async () => [{ provider: "anthropic", id: "claude-sonnet" }]);
+    m.ctx.ui.select.mockResolvedValueOnce(undefined);
+    await m.d.handle({ clientMsgId: "m6", text: "/model" });
+    expect(m.pi.setModel).not.toHaveBeenCalled();
+  });
+  it("intercepts /model when modelRegistry is missing", async () => {
+    const m = mk({ gentle: "auto" });
+    delete m.ctx.modelRegistry;
+    await m.d.handle({ clientMsgId: "m7", text: "/model gpt-4o" });
+    expect(m.pi.setModel).not.toHaveBeenCalled();
+    expect(m.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("registro de modelos no está disponible"), "warning");
+  });
+  it("intercepts /model when available and all models are empty", async () => {
+    const m = mk({ gentle: "auto" });
+    m.ctx.modelRegistry.getAvailable = vi.fn(async () => []);
+    m.ctx.modelRegistry.getAll = vi.fn(() => []);
+    await m.d.handle({ clientMsgId: "m8", text: "/model" });
+    expect(m.ctx.ui.select).not.toHaveBeenCalled();
+    expect(m.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("No hay modelos disponibles"), "warning");
+  });
+  it("intercepts /thinking when user cancels select", async () => {
+    const m = mk({ gentle: "auto" });
+    m.ctx.ui.select.mockResolvedValueOnce(undefined);
+    await m.d.handle({ clientMsgId: "th4", text: "/thinking" });
+    expect(m.pi.setThinkingLevel).not.toHaveBeenCalled();
   });
   it("deliveries are serialized in arrival order", async () => {
     const order: string[] = [];
