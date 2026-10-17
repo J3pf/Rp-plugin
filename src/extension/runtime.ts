@@ -199,6 +199,13 @@ export class Runtime {
       sendAck: (ack) => this.conn.send("user.message.ack", ack),
       notify: (m, l) => this.notify(m, l),
       askSelect: (title, options) => this.askSelect(title, options),
+      onThinkingSelected: (level) => {
+        if (this.thinking !== level) {
+          const previousLevel = this.thinking ?? undefined;
+          this.thinking = level;
+          this.forwarder.handle("thinking_level_select", { level, previousLevel });
+        }
+      },
     });
 
     const connOpts: ConstructorParameters<typeof Connection>[0] = {

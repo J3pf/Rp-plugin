@@ -32,6 +32,7 @@ export interface DelivererDeps {
   sendAck: (ack: AckBody) => void;
   notify: (msg: string, level: "info" | "warning") => void;
   askSelect?: (title: string, options: string[]) => Promise<string | undefined>;
+  onThinkingSelected?: (level: string) => void;
 }
 
 /** Order of methods to try for a message. */
@@ -113,7 +114,11 @@ export class Deliverer {
       this.record(msg, "api");
       this.d.sendAck({ clientMsgId: id, disposition: "command", method: "api", error: null });
       const arg = textTrimmed.replace(/^\/thinking\s*/i, "").trim();
-      await handleThinkingCommand(this.d.pi, ctx, arg, { askSelect: this.d.askSelect, onBackground });
+      await handleThinkingCommand(this.d.pi, ctx, arg, {
+        askSelect: this.d.askSelect,
+        onBackground,
+        onThinkingSelected: this.d.onThinkingSelected,
+      });
       return;
     }
     const cfg = this.d.cfg();

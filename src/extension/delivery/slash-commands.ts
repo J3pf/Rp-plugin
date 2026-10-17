@@ -6,6 +6,7 @@ export type ValidThinkingLevel = (typeof VALID_THINKING_LEVELS)[number];
 export interface SlashCommandOptions {
   askSelect?: (title: string, options: string[]) => Promise<string | undefined>;
   onBackground?: (task: Promise<void>) => void;
+  onThinkingSelected?: (level: ValidThinkingLevel) => void;
 }
 
 export async function handleModelCommand(
@@ -128,6 +129,7 @@ export async function handleThinkingCommand(
     if (VALID_THINKING_LEVELS.includes(normalized as ValidThinkingLevel)) {
       try {
         pi.setThinkingLevel(normalized as any);
+        opts?.onThinkingSelected?.(normalized as ValidThinkingLevel);
         ctx.ui?.notify?.(`Nivel de thinking establecido en ${normalized}`, "info");
       } catch (err: any) {
         ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${err?.message ?? String(err)}`, "warning");
@@ -150,6 +152,7 @@ export async function handleThinkingCommand(
     if (VALID_THINKING_LEVELS.includes(normalized as ValidThinkingLevel)) {
       try {
         pi.setThinkingLevel(normalized as any);
+        opts?.onThinkingSelected?.(normalized as ValidThinkingLevel);
         ctx.ui?.notify?.(`Nivel de thinking establecido en ${normalized}`, "info");
       } catch (err: any) {
         ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${err?.message ?? String(err)}`, "warning");
