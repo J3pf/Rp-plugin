@@ -36,23 +36,32 @@ pi install .
 ```
 
 ### Actualización desde una versión previa
-Para evitar que una versión anterior y la nueva carguen a la vez en Pi:
-1. **Instala la nueva versión primero** (para garantizar que una falla de red nunca te deje sin plugin):
+
+#### Caso 1: Actualización de una instalación `git:` existente (lo más común)
+`pi install` actualiza el clon en el directorio del agente, hace checkout del nuevo tag y reemplaza la entrada en `settings.json` automáticamente:
+```bash
+# Para Pi estándar
+pi install git:github.com/J3pf/Rp-plugin@v0.2.3
+
+# Para gentle-shell
+gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.3
+
+# Confirmar actualización y reiniciar sesiones de Pi
+pi list
+```
+> ⚠️ **ADVERTENCIA IMPORTANTE:** **NO** ejecutes `pi remove` con el ref anterior (ej. `pi remove git:github.com/J3pf/Rp-plugin@v0.2.2`). Pi empareja paquetes por repositorio y no por versión/ref; ejecutar `pi remove` **desinstalaría por completo el plugin**.
+
+#### Caso 2: Migración desde una ruta local previa (ej. `./packages/j3pf-pi-rp-0.2.1`)
+`pi remove` aplica únicamente para limpiar entradas locales anteriores y evitar que ambas versiones carguen al mismo tiempo:
+1. **Instala la nueva versión primero** (para no quedar sin plugin si la red falla):
    ```bash
    pi install git:github.com/J3pf/Rp-plugin@v0.2.3
    ```
-2. **Revisa las fuentes instaladas con `pi list` y desinstala la versión anterior**:
+2. **Elimina la ruta local anterior situándote en `~/.pi/agent`**:
    ```bash
    pi list
+   cd ~/.pi/agent && pi remove ./packages/j3pf-pi-rp-0.2.1
    ```
-   - Si la versión anterior se instaló desde git (ej. `@v0.2.1`):
-     ```bash
-     pi remove git:github.com/J3pf/Rp-plugin@v0.2.1
-     ```
-   - Si la versión anterior era una instalación local (ej. `./packages/j3pf-pi-rp-0.2.1` en `settings.json`): las rutas relativas se resuelven contra el directorio del agente, por lo que debes ejecutar `pi remove` desde `~/.pi/agent`:
-     ```bash
-     cd ~/.pi/agent && pi remove ./packages/j3pf-pi-rp-0.2.1
-     ```
 3. **Reinicia tus sesiones de Pi**. Para actualizar el servicio del host en la máquina, ejecuta `rp-host install` (o deja que la auto-reparación lo migre en el siguiente inicio).
 
 ### Emparejamiento

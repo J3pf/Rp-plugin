@@ -56,23 +56,32 @@ pi install .
 ```
 
 ### Actualización desde una versión anterior
-Para evitar que dos versiones del plugin carguen al mismo tiempo en Pi:
+
+#### Caso 1: Actualización de una instalación `git:` existente (lo habitual)
+`pi install` actualiza el clon en el directorio del agente, hace checkout del nuevo tag y actualiza la entrada en `settings.json` automáticamente:
+```bash
+# Para Pi estándar
+pi install git:github.com/J3pf/Rp-plugin@v0.2.3
+
+# Para gentle-shell
+gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.3
+
+# Verificar que la versión activa sea la nueva
+pi list
+```
+> ⚠️ **ADVERTENCIA IMPORTANTE:** **NO** ejecutes `pi remove` con el ref anterior (ej. `pi remove git:github.com/J3pf/Rp-plugin@v0.2.2`). Pi empareja paquetes por repositorio y no por ref; ejecutar `pi remove` **desinstalaría por completo el plugin**.
+
+#### Caso 2: Migración desde una ruta local previa (ej. `./packages/j3pf-pi-rp-0.2.1`)
+`pi remove` aplica únicamente para limpiar entradas locales anteriores y evitar que ambas versiones carguen simultáneamente:
 1. **Instala la nueva versión primero** (de este modo una falla de red o de instalación nunca deja el entorno sin plugin):
    ```bash
    pi install git:github.com/J3pf/Rp-plugin@v0.2.3
    ```
-2. **Revisa las fuentes instaladas con `pi list` y elimina la versión anterior**:
+2. **Revisa las fuentes instaladas con `pi list` y elimina la ruta local anterior situándote en `~/.pi/agent`**:
    ```bash
    pi list
+   cd ~/.pi/agent && pi remove ./packages/j3pf-pi-rp-0.2.1
    ```
-   - Si la versión previa venía de un tag de git (ej. `@v0.2.1`):
-     ```bash
-     pi remove git:github.com/J3pf/Rp-plugin@v0.2.1
-     ```
-   - Si la versión previa era una ruta local (ej. `./packages/j3pf-pi-rp-0.2.1` en `settings.json`): las fuentes relativas se resuelven contra la carpeta del agente, por lo que debes ejecutar `pi remove` desde `~/.pi/agent`:
-     ```bash
-     cd ~/.pi/agent && pi remove ./packages/j3pf-pi-rp-0.2.1
-     ```
 3. **Reinicia las sesiones de Pi**. Para actualizar el servicio `rp-host` en la máquina actual:
    ```bash
    rp-host install   # o dejar que la auto-reparación de Pi lo migre automáticamente
