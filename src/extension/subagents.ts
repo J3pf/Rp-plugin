@@ -2,6 +2,7 @@ import type { SubagentToolCall, SubagentUpdateEvent } from "../shared/protocol.t
 import { safeDurationMs, toEpochMs, truncateBytes } from "../shared/util.ts";
 
 const MAX_SUBAGENT_TASKS = 100;
+const MAX_SUBAGENT_TOOLS = 100;
 const MAX_SUBAGENT_RESULT_BYTES = 4096;
 
 export interface SubagentTrackerDeps {
@@ -106,6 +107,9 @@ export class SubagentTracker {
           name,
           status: "running",
         });
+        while (task.tools.length > MAX_SUBAGENT_TOOLS) {
+          task.tools.shift();
+        }
         task.toolCalls = (task.toolCalls ?? 0) + 1;
         this.deps.emit(this.sanitizeTask(task));
       }

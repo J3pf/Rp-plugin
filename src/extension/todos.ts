@@ -35,18 +35,20 @@ export function parseTodoTasks(details: unknown): TodoTask[] | null {
 
 export function replayTodoBranch(branch: readonly unknown[] | undefined): TodoTask[] {
   if (!Array.isArray(branch)) return [];
-  let tasks: TodoTask[] = [];
-  for (const entry of branch as Array<{
-    type?: string;
-    message?: { role?: string; toolName?: string; isError?: boolean; details?: unknown };
-  }>) {
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i] as
+      | {
+          type?: string;
+          message?: { role?: string; toolName?: string; isError?: boolean; details?: unknown };
+        }
+      | undefined;
     if (entry?.type !== "message") continue;
     const msg = entry.message;
     if (msg?.role !== "toolResult" || msg.toolName !== "todo" || msg.isError === true) continue;
     const parsed = parseTodoTasks(msg.details);
-    if (parsed) tasks = parsed;
+    if (parsed) return parsed;
   }
-  return tasks;
+  return [];
 }
 
 export function redactTodoTasks(tasks: readonly TodoTask[]): TodoTask[] {
