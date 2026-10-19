@@ -55,6 +55,19 @@ export function mapHerdrAgentStatus(rawStatus: string | null | undefined): Agent
   }
 }
 
+export function extractRecentCommandOutput(terminalText: string, commandText?: string): string {
+  if (!commandText) return terminalText;
+  const cmd = commandText.trim();
+  const idx = terminalText.lastIndexOf(cmd);
+  if (idx >= 0) {
+    const lineStart = terminalText.lastIndexOf("\n", idx);
+    const sliceStart = lineStart >= 0 ? lineStart + 1 : idx;
+    const snippet = terminalText.slice(sliceStart).trim();
+    if (snippet) return snippet;
+  }
+  return terminalText;
+}
+
 export function parseHerdrAgentList(stdout: string): HerdrDiscoveredAgent[] {
   const json = parseJson(stdout);
   const list: any[] = Array.isArray(json?.result?.agents)
@@ -422,7 +435,7 @@ export class BridgedAgentSession {
     void this.pollPaneFallback();
   }
 
-  private async pollPaneFallback(): Promise<void> {
+  private async pollPaneFallback(commandText?: string): Promise<void> {
     if (this.disposed || !this.info.paneId || this.d.cfg.redactContent) return;
     try {
       const res = await this.d.runner("herdr", ["pane", "read", "--source", "recent", "--lines", "60", this.info.paneId], {
@@ -433,8 +446,10 @@ export class BridgedAgentSession {
       const parsed = parseJson(res.stdout);
       const rawText = (typeof parsed?.result?.text === "string" ? parsed.result.text : res.stdout).trim();
       const text = rawText.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "").trim();
-      if (!text || text === this.lastTerminalSnapshot) return;
-      this.lastTerminalSnapshot = truncateBytes(text, 16 * 1024).text;
+      if (!text) return;
+      const snippet = extractRecentCommandOutput(text, commandText);
+      if (snippet === this.lastTerminalSnapshot) return;
+      this.lastTerminalSnapshot = truncateBytes(snippet, 16 * 1024).text;
       if (!this.fallbackTurnTs) {
         this.fallbackTurnTs = Date.now();
       }
@@ -485,6 +500,7 @@ export class BridgedAgentSession {
     if (!text) return ack("rejected", "herdr_unavailable");
 
     this.fallbackTurnTs = 0;
+    this.lastTerminalSnapshot = "";
 
     const markWorkingOnDelivery = () => {
       this.optimisticWorkingUntilMs = Date.now() + 8_000;
@@ -507,7 +523,31 @@ export class BridgedAgentSession {
       if (sendRes.code !== 0) return ack("rejected", "herdr_unavailable");
       await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 5_000, env });
       markWorkingOnDelivery();
-      return ack("delivered");
+      ack("delivered");
+
+      if (b.asCommand) {
+        // Local TUI commands (e.g. /usage, /statusline, /help) execute directly in the CLI terminal
+        // without creating entries in transcript.jsonl. If no transcript events arrive within 800ms,
+        // read the output directly from the pane and settle so the mobile chat displays the result.
+        setTimeout(async () => {
+          if (this.disposed) return;
+          if (this.transcriptReader) {
+            const events = this.transcriptReader.pollNewEvents();
+            if (events.length > 0) {
+              for (const ev of events) this.sendEvent(ev);
+              this.syncSessionNameIfChanged();
+              return;
+            }
+          }
+          await this.pollPaneFallback(text);
+          if (this.currentStatus === "idle") {
+            this.optimisticWorkingUntilMs = 0;
+            this.syncStatus();
+            this.sendEvent({ type: "agent_settled", aborted: false });
+          }
+        }, 800);
+      }
+      return;
     } catch {
       return ack("rejected", "herdr_unavailable");
     }

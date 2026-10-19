@@ -12,6 +12,7 @@ import {
 } from "../src/host/agy-transcript.ts";
 import {
   HerdrAgentBridge,
+  extractRecentCommandOutput,
   installAgyHooks,
   parseHerdrAgentList,
   runAgyHook,
@@ -431,5 +432,12 @@ describe("herdr-bridge & PreToolUse gate", () => {
         },
       ],
     });
+  });
+
+  it("extractRecentCommandOutput returns snippet from last command occurrence", () => {
+    const term = "Previous history\nline 2\n> /usage\n  Model: gemini-3.8-flash\n  Tokens: 120";
+    expect(extractRecentCommandOutput(term, "/usage")).toBe("> /usage\n  Model: gemini-3.8-flash\n  Tokens: 120");
+    expect(extractRecentCommandOutput(term, "/nonexistent")).toBe(term);
+    expect(extractRecentCommandOutput(term)).toBe(term);
   });
 });
