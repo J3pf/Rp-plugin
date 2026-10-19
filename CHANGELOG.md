@@ -38,8 +38,11 @@ Special thanks to **Luis Eduardo Chacón Wilches** ([@lchaconw](https://github.c
   - Overrode transitive dependency `basic-ftp` to `^6.2.3` via npm overrides, resolving high-severity advisory GHSA-c475-qrg2-pj4r (CPU denial of service in Unix directory-listing parser).
   - Verified clean production audit: `npm audit --omit=dev` reports 0 vulnerabilities.
 - **Dependency upgrades**:
+  - Upgraded toolchain: `typescript` to `^7.0.2` and `vitest` to `^5.0.5` (aligned with Rp-relay toolchain).
+  - Upgraded Pi SDK devDependencies: `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` to `^1.3.0` (validated against unit and serial E2E test suites), keeping `peerDependencies` as `*` for broad runtime compatibility.
   - Upgraded `gentle-pi` to `^4.3.0`.
   - Upgraded `typebox` to `^1.4.2`.
+  - Maintained `@types/node` on `^22.20.5` strictly aligned with the package engine constraint (`node >= 22.19`).
 
 ### Installation
 ```bash

@@ -34,7 +34,7 @@ Branch: `main` | Status: in_progress
 - T2 (S3) [orchestrator] Review Luis's 4 commits, audit correctness, types, memory bounds, Pi API usage, and add missing tests test-first: done
 - T3 (S4) [orchestrator] Run lint/typecheck/build, unit tests, e2e serially, upgrade outdated stable packages, verify npm audit: done
 - T4 (S5) [orchestrator] Bump version to 0.2.7, write English CHANGELOG and release notes crediting Luis, test isolated scratch HOME install: done
-- T5 (S6) [orchestrator] Report "[PLUGIN 0.2.7 — READY FOR REVIEW]" with HEAD, commits, test counts, outdated/audit output: in_progress
+- T5 (S6) [orchestrator] Report "[PLUGIN 0.2.7 — READY FOR REVIEW]" with HEAD, commits, test counts, outdated/audit output: done
 
 ## Log
 - L1: "[ORCHESTRATOR → Rp-plugin] Release task. Use ODD: create odd/tasks/release-0.2.7.md (Specs quoting the user verbatim, Tasks, Log) + Engram mirror before any write. User decision (verbatim): \"genera releases de todo con los cambios de nosotros y los de luis ASEGURANDO que ningún repo quede con cambios por fuera de las últimas releases y todo en main sin perder cambios\".\nState: latest GitHub release is v0.2.5 (9f98d8c). Tag v0.2.6 exists on origin pointing to d11ff11 but has NO GitHub release. origin/main = 43c2711 has 4 commits by Luis not in any release: d11ff11 feat(delivery) /model and /thinking from mobile, 1993661 fix(delivery) detach interactive selects from delivery queue, 858a07e fix(delivery) emit thinking_level_select, 43c2711 perf(extension) scan todo branch backwards + bound subagent tool history. Your local main = d11ff11 (behind).\n1. `git pull --ff-only` to origin/main.\n2. REVIEW Luis's 4 commits as if they were yours (they ship under our release): correctness, tests present for each behavior (add missing ones test-first, crediting him), no `any`, bounded memory (43c2711 \"bound subagent tool history\": verify the bound and that nothing user-visible is lost), Pi API usage still valid.\n3. Gate: lint/typecheck/build, unit tests, e2e serially (`npx vitest run --no-file-parallelism test/rpc-e2e.test.ts test/tui-e2e.test.ts test/gentle-shell-e2e.test.ts`), explicit timeouts on every command, `npm outdated` → upgrade anything not on latest STABLE (no alpha/beta/rc; read breaking changes; one commit per group), `npm audit --omit=dev`.\n4. Version 0.2.7 (v0.2.6 tag already used; leave it). English CHANGELOG + release notes covering everything since v0.2.5 (mention that v0.2.6 was tagged without a GitHub release and is included here), crediting Luis. Install section: `pi install git:github.com/J3pf/Rp-plugin@v0.2.7` — verify it in an isolated HOME before documenting (HOME=<scratch> pi install …), never touch the real ~/.pi.\n5. Do NOT push/tag/release yet: report \"[PLUGIN 0.2.7 — READY FOR REVIEW]\" with HEAD, commits, measured test counts, outdated/audit output."
@@ -50,3 +50,14 @@ Branch: `main` | Status: in_progress
     - Serial E2E tests: 21 passed (rpc-e2e: 3 passed; tui-e2e: 13 passed; gentle-shell-e2e: 5 passed).
     - Total test suite: 372 passed, 1 skipped.
   - T4: Version bumped to 0.2.7 in package.json & package-lock.json. Created English CHANGELOG.md covering v0.2.7 and noting untagged release v0.2.6, crediting Luis. Updated README.md and docs/INSTALACION.md. Verified isolated install via `pi install .` and `pi install git:github.com/J3pf/Rp-plugin@v0.2.6` in a scratch HOME without touching ~/.pi. (Commit `61007b5`).
+- L3: Toolchain & Pi SDK Upgrades (per Orchestrator Review):
+  - T6: Upgraded toolchain to `typescript@^7.0.2` and `vitest@^5.0.5` (aligned with Rp-relay toolchain). Verified clean build, clean typecheck, and unit tests. Commit `1485341`.
+  - T7: Upgraded `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` to `^1.3.0` in devDependencies, keeping `peerDependencies` as `*` for broad runtime compatibility. Validated against full unit and serial E2E test suites (all 372 tests passing). Commit `f4a10b8`.
+  - T8: Full quality gate:
+    - `npm run build`: cleanly transpiled.
+    - `npm run typecheck`: exit 0.
+    - Unit tests: 16 passed, 1 skipped, 351 passed, 0 failures.
+    - Serial E2E: 21 passed (rpc: 3, tui: 13, gentle-shell: 5).
+    - `npm audit --omit=dev`: found 0 vulnerabilities.
+    - `npm outdated`: only `@types/node` reported (pinned to 22.x LTS aligned with engines `>=22.19`).
+  - T9: Updated `CHANGELOG.md` with dependency upgrade details and `@types/node` rationale. Ready for review.
