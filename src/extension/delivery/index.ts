@@ -8,7 +8,7 @@ import { resolveAttachments, type FetchBlob } from "../attachments.ts";
 import { deliverApi } from "./api.ts";
 import { deliverHerdr } from "./herdr.ts";
 import { deliverInteractive, type InteractiveDeps } from "./interactive.ts";
-import { handleModelCommand, handleThinkingCommand } from "./slash-commands.ts";
+import { handleModelCommand, handleThinkingCommand, type ValidThinkingLevel } from "./slash-commands.ts";
 
 export interface AckBody {
   clientMsgId: string;
@@ -32,7 +32,7 @@ export interface DelivererDeps {
   sendAck: (ack: AckBody) => void;
   notify: (msg: string, level: "info" | "warning") => void;
   askSelect?: (title: string, options: string[]) => Promise<string | undefined>;
-  onThinkingSelected?: (level: string) => void;
+  onThinkingSelected?: (level: ValidThinkingLevel) => void;
 }
 
 /** Order of methods to try for a message. */

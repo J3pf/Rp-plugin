@@ -491,6 +491,18 @@ describe("messages from the phone", () => {
     expect(relay.of("user.message.ack")[0]!.d.disposition).toBe("command");
     expect(t.sent[0]).toEqual({ content: "/gentle:mode normal", opts: { expandPromptTemplates: true } });
   });
+  it("/thinking from mobile emits thinking_level_select over relay with level and previousLevel", async () => {
+    const t = await boot();
+    await waitUntil(() => relay.of("agent.hello").length === 1);
+    expect(lastHello().thinking).toBe("off");
+    relay.push("user.message", { clientMsgId: "cmd-th", text: "/thinking high" });
+    await waitUntil(() => relay.of("user.message.ack").length === 1);
+    expect(relay.of("user.message.ack")[0]!.d.disposition).toBe("command");
+    expect(t.pi.setThinkingLevel).toHaveBeenCalledWith("high");
+    await waitUntil(() => relay.of("agent.event").some((e) => e.d.e?.type === "thinking_level_select"));
+    const thEv = relay.of("agent.event").find((e) => e.d.e?.type === "thinking_level_select")!.d.e;
+    expect(thEv).toEqual({ type: "thinking_level_select", level: "high", previousLevel: "off" });
+  });
   it("attachments: images inline for api, other files saved in the inbox and cited", async () => {
     const inbox = fs.mkdtempSync(path.join(os.tmpdir(), "rpinbox2-"));
     const png = Buffer.from("89504e470d0a1a0a", "hex");

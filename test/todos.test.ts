@@ -113,6 +113,54 @@ describe("replayTodoBranch", () => {
     expect(replayTodoBranch(undefined)).toEqual([]);
     expect(replayTodoBranch([])).toEqual([]);
   });
+
+  it("scans backwards and returns the last valid todo toolResult when earlier todo results exist", () => {
+    const branch = [
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "todo",
+          isError: false,
+          details: { tasks: [{ id: 1, title: "Initial task", status: "pending" }] },
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "bash",
+          isError: false,
+          details: "command output",
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "todo",
+          isError: false,
+          details: {
+            tasks: [
+              { id: 1, title: "Initial task", status: "done" },
+              { id: 2, title: "Next task", status: "in_progress" },
+            ],
+          },
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "user",
+          content: "what is next?",
+        },
+      },
+    ];
+    expect(replayTodoBranch(branch)).toEqual([
+      { id: 1, title: "Initial task", status: "done" },
+      { id: 2, title: "Next task", status: "in_progress" },
+    ]);
+  });
 });
 
 describe("Runtime TODO integration", () => {

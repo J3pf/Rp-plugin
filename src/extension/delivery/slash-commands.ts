@@ -9,6 +9,9 @@ export interface SlashCommandOptions {
   onThinkingSelected?: (level: ValidThinkingLevel) => void;
 }
 
+type ModelItem = Parameters<ExtensionAPI["setModel"]>[0];
+type ThinkingLevelParam = Parameters<ExtensionAPI["setThinkingLevel"]>[0];
+
 export async function handleModelCommand(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -23,7 +26,7 @@ export async function handleModelCommand(
   }
 
   if (query) {
-    let model: any = undefined;
+    let model: ModelItem | undefined = undefined;
     const slashIdx = query.indexOf("/");
     if (slashIdx !== -1) {
       const provider = query.slice(0, slashIdx).trim();
@@ -31,13 +34,13 @@ export async function handleModelCommand(
       model = registry.find?.(provider, modelId);
     }
     if (!model) {
-      const all = (await registry.getAll?.()) ?? [];
+      const all: readonly ModelItem[] = (await registry.getAll?.()) ?? [];
       model =
-        all.find((m: any) => {
+        all.find((m) => {
           const full = `${m.provider}/${m.id}`;
           return full === query || m.id === query;
         }) ??
-        all.find((m: any) => {
+        all.find((m) => {
           const full = `${m.provider}/${m.id}`.toLowerCase();
           const q = query.toLowerCase();
           return full === q || m.id?.toLowerCase() === q;
@@ -59,13 +62,14 @@ export async function handleModelCommand(
           "warning",
         );
       }
-    } catch (err: any) {
-      ctx.ui?.notify?.(`Error al cambiar de modelo: ${err?.message ?? String(err)}`, "warning");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      ctx.ui?.notify?.(`Error al cambiar de modelo: ${message}`, "warning");
     }
     return;
   }
 
-  let available: any[] = [];
+  let available: readonly ModelItem[] = [];
   try {
     available = (await registry.getAvailable?.()) ?? [];
   } catch {
@@ -84,14 +88,14 @@ export async function handleModelCommand(
     return;
   }
 
-  const options = available.map((m: any) => `${m.provider}/${m.id}`);
+  const options = available.map((m) => `${m.provider}/${m.id}`);
   const selectFn = opts?.askSelect ?? ((title: string, items: string[]) => ctx.ui?.select(title, items));
   const interactiveFlow = (async () => {
     const selected = await selectFn("Seleccionar modelo", options);
     if (!selected) return;
 
     const selectedModel = available.find(
-      (m: any) => `${m.provider}/${m.id}` === selected || m.id === selected,
+      (m) => `${m.provider}/${m.id}` === selected || m.id === selected,
     );
     if (!selectedModel) return;
 
@@ -105,8 +109,9 @@ export async function handleModelCommand(
           "warning",
         );
       }
-    } catch (err: any) {
-      ctx.ui?.notify?.(`Error al cambiar de modelo: ${err?.message ?? String(err)}`, "warning");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      ctx.ui?.notify?.(`Error al cambiar de modelo: ${message}`, "warning");
     }
   })();
 
@@ -128,11 +133,12 @@ export async function handleThinkingCommand(
     const normalized = query.toLowerCase();
     if (VALID_THINKING_LEVELS.includes(normalized as ValidThinkingLevel)) {
       try {
-        pi.setThinkingLevel(normalized as any);
+        pi.setThinkingLevel(normalized as ThinkingLevelParam);
         opts?.onThinkingSelected?.(normalized as ValidThinkingLevel);
         ctx.ui?.notify?.(`Nivel de thinking establecido en ${normalized}`, "info");
-      } catch (err: any) {
-        ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${err?.message ?? String(err)}`, "warning");
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${message}`, "warning");
       }
     } else {
       ctx.ui?.notify?.(
@@ -151,11 +157,12 @@ export async function handleThinkingCommand(
     const normalized = selected.trim().toLowerCase();
     if (VALID_THINKING_LEVELS.includes(normalized as ValidThinkingLevel)) {
       try {
-        pi.setThinkingLevel(normalized as any);
+        pi.setThinkingLevel(normalized as ThinkingLevelParam);
         opts?.onThinkingSelected?.(normalized as ValidThinkingLevel);
         ctx.ui?.notify?.(`Nivel de thinking establecido en ${normalized}`, "info");
-      } catch (err: any) {
-        ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${err?.message ?? String(err)}`, "warning");
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${message}`, "warning");
       }
     }
   })();

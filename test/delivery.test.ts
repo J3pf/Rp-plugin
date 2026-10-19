@@ -161,11 +161,21 @@ describe("deliverInteractive", () => {
 });
 
 describe("Deliverer", () => {
-  function mk(over: { cfg?: any; gentle?: string | null; herdr?: any; interactive?: any; idle?: boolean; fetchBlob?: any; ctx?: any } = {}) {
+  function mk(over: {
+    cfg?: any;
+    gentle?: string | null;
+    herdr?: any;
+    interactive?: any;
+    idle?: boolean;
+    fetchBlob?: any;
+    ctx?: any;
+    onThinkingSelected?: (level: any) => void;
+  } = {}) {
     const { pi, sent, entries } = makePi();
     const ctx = over.ctx ?? makeCtx({ idle: over.idle ?? true });
     const acks: any[] = [];
     const notes: string[] = [];
+    const thinkingSelected: string[] = [];
     const d = new Deliverer({
       pi,
       ctx: () => ctx,
@@ -178,8 +188,9 @@ describe("Deliverer", () => {
       interactive: () => over.interactive ?? ({} as any),
       sendAck: (a) => acks.push(a),
       notify: (m) => notes.push(m),
+      onThinkingSelected: over.onThinkingSelected ?? ((l) => thinkingSelected.push(l)),
     });
-    return { d, pi, sent, entries, acks, notes, ctx };
+    return { d, pi, sent, entries, acks, notes, ctx, thinkingSelected };
   }
   it("api delivery acks 'sent' and records the origin entry", async () => {
     const m = mk();
@@ -373,6 +384,16 @@ describe("Deliverer", () => {
     m.ctx.ui.select.mockResolvedValueOnce(undefined);
     await m.d.handle({ clientMsgId: "th4", text: "/thinking" });
     expect(m.pi.setThinkingLevel).not.toHaveBeenCalled();
+    expect(m.thinkingSelected).toEqual([]);
+  });
+  it("notifies onThinkingSelected when /thinking sets a level via arg or select", async () => {
+    const m = mk({ gentle: "auto" });
+    await m.d.handle({ clientMsgId: "th-arg", text: "/thinking high" });
+    expect(m.thinkingSelected).toEqual(["high"]);
+
+    m.ctx.ui.select.mockResolvedValueOnce("medium");
+    await m.d.handle({ clientMsgId: "th-sel", text: "/thinking" });
+    expect(m.thinkingSelected).toEqual(["high", "medium"]);
   });
   it("does not block subsequent deliveries while interactive /model or /thinking select is open", async () => {
     const m = mk({ gentle: "auto" });

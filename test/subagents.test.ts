@@ -353,4 +353,26 @@ describe("Runtime Subagent integration", () => {
     }
     expect(tracker.getSnapshot().length).toBeLessThanOrEqual(100);
   });
+
+  it("bounds child tool calls history to MAX_SUBAGENT_TOOLS (100) while incrementing toolCalls accurately", () => {
+    const emitted: SubagentUpdateEvent[] = [];
+    const tracker = new SubagentTracker({
+      emit: (ev) => emitted.push(ev),
+      now: () => 1000,
+    });
+
+    tracker.onToolStart("subagent_run", { agent: "worker", label: "many tools task" }, "parent_call");
+
+    for (let i = 0; i < 120; i++) {
+      tracker.onToolStart("read", { path: `file_${i}.ts` }, `child_${i}`, "parent_call");
+      tracker.onToolEnd("read", "ok", false, `child_${i}`, 10, "parent_call");
+    }
+
+    const last = emitted.at(-1)!;
+    expect(last.tools).toHaveLength(100);
+    expect(last.toolCalls).toBe(120);
+    // Oldest tool calls (child_0 .. child_19) were shifted out
+    expect(last.tools![0].toolCallId).toBe("child_20");
+    expect(last.tools![99].toolCallId).toBe("child_119");
+  });
 });
