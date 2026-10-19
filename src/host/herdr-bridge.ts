@@ -122,6 +122,7 @@ interface BridgedSessionDeps {
   runner: Runner;
   onLog?: (msg: string) => void;
   connectionFactory?: (o: ConstructorParameters<typeof Connection>[0]) => Connection;
+  startDelayMs?: number;
 }
 
 export class BridgedAgentSession {
@@ -139,11 +140,13 @@ export class BridgedAgentSession {
   private transcriptReader: AgyTranscriptReader | null = null;
   private lastTerminalSnapshot = "";
   private lastStateSeq = -1;
+  private startTimer: NodeJS.Timeout | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
   private watcher: fs.FSWatcher | null = null;
   private watchDebounce: NodeJS.Timeout | null = null;
   private lastSentName = "";
   private currentStatus: AgentStatus;
+  private optimisticWorkingUntilMs = 0;
 
   constructor(
     private info: HerdrDiscoveredAgent,
@@ -182,7 +185,15 @@ export class BridgedAgentSession {
     });
 
     void this.refreshGit();
-    this.conn.start();
+    if (d.startDelayMs && d.startDelayMs > 0) {
+      this.startTimer = setTimeout(() => {
+        this.startTimer = null;
+        if (!this.disposed) this.conn.start();
+      }, d.startDelayMs);
+      this.startTimer.unref?.();
+    } else {
+      this.conn.start();
+    }
     this.startTranscriptPolling();
   }
 
@@ -211,6 +222,9 @@ export class BridgedAgentSession {
 
   private effectiveStatus(): AgentStatus {
     if (this.broker.openCount > 0) return "waiting_input";
+    if (this.currentStatus === "idle" && Date.now() < this.optimisticWorkingUntilMs) {
+      return "working";
+    }
     return this.currentStatus;
   }
 
@@ -233,6 +247,10 @@ export class BridgedAgentSession {
         () => this.d.cfg.redactContent,
       );
       this.setupFileWatcher();
+    }
+
+    if (next.status !== "idle") {
+      this.optimisticWorkingUntilMs = 0;
     }
 
     this.info = { ...this.info, ...next };
@@ -303,7 +321,14 @@ export class BridgedAgentSession {
   private sendSnapshot(direct: boolean): void {
     if (this.transcriptReader) {
       const { entries, truncated } = this.transcriptReader.readSnapshot();
-      const body = { epoch: this.epoch, seq: this.seq, entries, truncated };
+      const lastActivityAt = this.transcriptReader.getLastActivityAt();
+      const body = {
+        epoch: this.epoch,
+        seq: this.seq,
+        entries,
+        truncated,
+        ...(lastActivityAt ? { lastActivityAt } : {}),
+      };
       if (direct) this.conn.sendDirect("agent.snapshot", body);
       else this.conn.send("agent.snapshot", body);
       this.syncSessionNameIfChanged();
@@ -455,16 +480,27 @@ export class BridgedAgentSession {
     text = text.trim();
     if (!text) return ack("rejected", "herdr_unavailable");
 
+    const markWorkingOnDelivery = () => {
+      this.optimisticWorkingUntilMs = Date.now() + 8_000;
+      this.syncStatus();
+      this.sendEvent({ type: "agent_start" });
+      this.pollTranscriptNow();
+    };
+
     const env = this.d.herdrSession ? { HERDR_SESSION: this.d.herdrSession } : {};
     try {
       if (!b.asCommand) {
         const res = await this.d.runner("herdr", ["agent", "prompt", this.info.paneId, text], { timeoutMs: 10_000, env });
-        if (res.code === 0) return ack("delivered");
+        if (res.code === 0) {
+          markWorkingOnDelivery();
+          return ack("delivered");
+        }
       }
       // Fallback (or slash command): send literal text + Enter directly to the Herdr pane
       const sendRes = await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, text], { timeoutMs: 5_000, env });
       if (sendRes.code !== 0) return ack("rejected", "herdr_unavailable");
       await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 5_000, env });
+      markWorkingOnDelivery();
       return ack("delivered");
     } catch {
       return ack("rejected", "herdr_unavailable");
@@ -570,6 +606,8 @@ export class BridgedAgentSession {
   stop(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.startTimer) clearTimeout(this.startTimer);
+    this.startTimer = null;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = null;
     if (this.watchDebounce) clearTimeout(this.watchDebounce);
@@ -666,7 +704,21 @@ export class HerdrAgentBridge {
       if (this.stopped || res.code !== 0) return;
 
       const discovered = parseHerdrAgentList(res.stdout);
+      const activityOf = (item: HerdrDiscoveredAgent): number => {
+        if (item.agent === "agy" && item.sessionId) {
+          try {
+            return fs.statSync(resolveAgyTranscriptPath(item.sessionId)).mtimeMs || 0;
+          } catch {
+            return 0;
+          }
+        }
+        return 0;
+      };
+      // Sort oldest-first so that on initial startup, the most recently active session connects last and gets the highest lastSeenAt
+      discovered.sort((a, b) => activityOf(a) - activityOf(b));
+
       const seenKeys = new Set<string>();
+      let newCount = 0;
 
       for (const item of discovered) {
         const key = sanitizeIdPart(item.sessionId || `pane-${item.paneId}`);
@@ -684,6 +736,8 @@ export class HerdrAgentBridge {
             paneFallback.stop();
             this.sessionsByKey.delete(paneFallbackKey);
           }
+          const startDelayMs = !this.o.connectionFactory ? newCount * 35 : 0;
+          newCount++;
           const session = new BridgedAgentSession(item, {
             relayUrl: this.o.relayUrl,
             machineId: this.o.machineId,
@@ -693,6 +747,7 @@ export class HerdrAgentBridge {
             runner: this.runner,
             onLog: this.o.onLog,
             connectionFactory: this.o.connectionFactory,
+            startDelayMs,
           });
           this.sessionsByKey.set(key, session);
         }

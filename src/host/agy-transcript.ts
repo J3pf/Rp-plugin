@@ -320,6 +320,26 @@ export class AgyTranscriptReader {
     return this.lastTopic;
   }
 
+  /** Return the timestamp (ms) of the most recent conversation entry, or the transcript file mtime. */
+  getLastActivityAt(): number | null {
+    if (this.entries.length > 0) {
+      let maxAt = 0;
+      for (const e of this.entries) {
+        if (typeof e.at === "number" && Number.isFinite(e.at) && e.at > maxAt) {
+          maxAt = e.at;
+        }
+      }
+      if (maxAt > 0) return maxAt;
+    }
+    try {
+      const st = fs.statSync(this.transcriptPath);
+      if (Number.isFinite(st.mtimeMs) && st.mtimeMs > 0) return Math.floor(st.mtimeMs);
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
   /** Load or refresh the transcript from disk and return the current snapshot (capped by count and byte budget). */
   readSnapshot(): { entries: SnapshotEntry[]; truncated: boolean; events: Record<string, unknown>[] } {
     const events = this.pollNewEvents();
