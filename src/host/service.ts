@@ -33,6 +33,10 @@ function isVersionedNodePath(nodePath: string): boolean {
     /(?:^|\/)node-v\d+\.\d+\.\d+[^/]*\/(?:bin\/)?node(?:\.exe)?$/i.test(normalized);
 }
 
+function isNodeBinaryName(nodePath: string): boolean {
+  return /(?:^|[\\/])node(?:\.exe)?$/i.test(nodePath.trim());
+}
+
 export function resolveStableNodePath(env?: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform, execPath?: string): string {
   const searchEnv = env ?? process.env;
   const searchPath = platform === "win32"
@@ -43,11 +47,14 @@ export function resolveStableNodePath(env?: NodeJS.ProcessEnv, platform: NodeJS.
   const directories = searchPath.split(platform === "win32" ? ";" : path.delimiter);
   const candidates: string[] = [];
   const targetExecPath = execPath ?? process.execPath;
+  const targetIsNode = Boolean(targetExecPath && isNodeBinaryName(targetExecPath));
   let realExecPath: string | undefined;
-  try {
-    realExecPath = fs.realpathSync(targetExecPath);
-  } catch {
-    // A missing exec path cannot match a PATH candidate; still try available nodes.
+  if (targetIsNode) {
+    try {
+      realExecPath = fs.realpathSync(targetExecPath);
+    } catch {
+      // A missing exec path cannot match a PATH candidate; still try available nodes.
+    }
   }
 
   for (const rawDir of directories) {
@@ -65,15 +72,15 @@ export function resolveStableNodePath(env?: NodeJS.ProcessEnv, platform: NodeJS.
     }
   }
 
-  if (targetExecPath && !isVersionedNodePath(targetExecPath) && fs.existsSync(targetExecPath)) {
+  if (targetIsNode && !isVersionedNodePath(targetExecPath) && fs.existsSync(targetExecPath)) {
     return targetExecPath;
   }
 
-  return candidates.find((candidate) => !isVersionedNodePath(candidate)) ?? candidates[0] ?? targetExecPath;
+  return candidates.find((candidate) => !isVersionedNodePath(candidate)) ?? candidates[0] ?? (targetIsNode ? targetExecPath : nodeName);
 }
 
 export function isStaleNodePath(installedNodePath: string): boolean {
-  if (!fs.existsSync(installedNodePath) || installedNodePath.includes("/Cellar/node/")) return true;
+  if (!isNodeBinaryName(installedNodePath) || !fs.existsSync(installedNodePath) || installedNodePath.includes("/Cellar/node/")) return true;
   try {
     fs.realpathSync(installedNodePath);
     return false;

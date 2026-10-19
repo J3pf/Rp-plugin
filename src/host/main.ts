@@ -1,10 +1,11 @@
-// rp-host CLI: run | install | uninstall | status | init
+// rp-host CLI: run | install | uninstall | status | init | agy-hook
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../extension/config.ts";
 import { loadHostConfig, writeDefaultHostConfig } from "./config.ts";
 import { HostConnection } from "./connection.ts";
+import { HerdrAgentBridge, installAgyHooks, runAgyHook } from "./herdr-bridge.ts";
 import { HostManager } from "./manager.ts";
 import { inspectService, installService, resolveStableNodePath, uninstallService } from "./service.ts";
 
@@ -17,8 +18,17 @@ Usage: rp-host <command>
   status      Show config, available backends and spawned agents
   doctor      Check service status and diagnose autostart / health
   init        Write a default ~/.config/rp/host.json if missing
+  agy-hook    Antigravity CLI PreToolUse hook entrypoint
 
 Requires the PC to be paired first (/rp pair inside Pi). Config: host.json next to RP's config.json.`;
+
+async function readStdinText(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
 
 export async function main(argv: string[]): Promise<void> {
   const cmd = argv[0] ?? "run";
@@ -29,6 +39,13 @@ export async function main(argv: string[]): Promise<void> {
     case "help":
       console.log(HELP);
       return;
+    case "agy-hook": {
+      const stdinText = await readStdinText();
+      const { cfg } = loadConfig();
+      const decision = await runAgyHook(cfg, stdinText);
+      process.stdout.write(JSON.stringify(decision) + "\n");
+      return;
+    }
     case "init": {
       const { path: p, exists } = loadHostConfig();
       if (exists) console.log(`already exists: ${p}`);
@@ -38,9 +55,16 @@ export async function main(argv: string[]): Promise<void> {
       }
       return;
     }
-    case "install":
+    case "install": {
+      const stableNode = resolveStableNodePath(process.env, process.platform);
+      try {
+        installAgyHooks(stableNode, scriptPath);
+      } catch {
+        /* best effort */
+      }
       console.log(await installService({ nodePath: process.execPath, scriptPath, platform: process.platform }));
       return;
+    }
     case "uninstall":
       console.log(await uninstallService(process.platform));
       return;
@@ -114,9 +138,19 @@ export async function main(argv: string[]): Promise<void> {
         manager,
         onLog: (m) => console.error(`[rp-host] ${m}`),
       });
+      const bridge = new HerdrAgentBridge({
+        relayUrl: cfg.relayUrl,
+        machineId: cfg.machineId,
+        token: cfg.machineToken,
+        cfg,
+        herdrSession: host.herdrSession,
+        onLog: (m) => console.error(`[rp-host] ${m}`),
+      });
       conn.start();
+      bridge.start();
       console.error(`[rp-host] running (roots: ${host.roots.join(", ")})`);
       const stop = () => {
+        bridge.stop();
         conn.stop();
         process.exit(0);
       };

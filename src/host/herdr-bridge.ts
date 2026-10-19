@@ -1,0 +1,868 @@
+// Herdr + Antigravity CLI (agy) bridge for rp-host.
+// Discovers non-Pi agents running in Herdr, bridges their transcripts/panes to Rp-relay,
+// delivers prompts/aborts via Herdr CLI, and serves PreToolUse permission gating for agy.
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { Connection } from "../extension/connection.ts";
+import { resolveInboxDir, type RpConfig } from "../extension/config.ts";
+import { relayBlobFetcher, resolveAttachments } from "../extension/attachments.ts";
+import { routeInbound, pendingAnswers } from "../extension/inbound.ts";
+import { Broker } from "../extension/prompts/broker.ts";
+import { Classifier, promptContext } from "../extension/prompts/classify.ts";
+import { ALLOW, ALLOW_SESSION, DENY, DENY_REASON, compilePatterns, decide } from "../extension/prompts/gate.ts";
+import { pluginVersion } from "../extension/version.ts";
+import { parseJson, pick } from "./backends/herdr.ts";
+import { run as realRun, type Runner } from "./runner.ts";
+import { AgyTranscriptReader, parseAgyArgs, resolveAgyTranscriptPath } from "./agy-transcript.ts";
+import { configDir } from "../shared/platform.ts";
+import {
+  newId,
+  type AgentHelloBody,
+  type AgentStatus,
+  type Envelope,
+  type UserMessageBody,
+  type WelcomeBody,
+} from "../shared/protocol.ts";
+import { errMsg, truncateBytes } from "../shared/util.ts";
+
+export interface HerdrDiscoveredAgent {
+  agent: string;
+  sessionId: string | null;
+  status: AgentStatus;
+  cwd: string;
+  paneId: string;
+  tabId: string | null;
+  workspaceId: string | null;
+  title: string | null;
+  stateChangeSeq: number;
+}
+
+const CONV_RE = /--conversation\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+
+export function mapHerdrAgentStatus(rawStatus: string | null | undefined): AgentStatus {
+  switch (rawStatus) {
+    case "working":
+      return "working";
+    case "blocked":
+      return "waiting_input";
+    case "error":
+      return "error";
+    default:
+      return "idle";
+  }
+}
+
+export function parseHerdrAgentList(stdout: string): HerdrDiscoveredAgent[] {
+  const json = parseJson(stdout);
+  const list: any[] = Array.isArray(json?.result?.agents)
+    ? json.result.agents
+    : Array.isArray(json?.agents)
+      ? json.agents
+      : [];
+  const out: HerdrDiscoveredAgent[] = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const agent = pick(item, ["agent", "kind"]);
+    // Pi and gentle-shell sessions already connect via their native in-process Rp-plugin extension
+    if (!agent || agent === "pi" || agent === "gentle-shell") continue;
+    const paneId = pick(item, ["pane_id", "paneId"]);
+    if (!paneId) continue;
+    const title = pick(item, ["terminal_title_stripped", "terminal_title", "title"]);
+    let sessionId = pick(item, ["agent_session.value", "session_id"]);
+    if (!sessionId && title) {
+      const m = CONV_RE.exec(title);
+      if (m) sessionId = m[1]!;
+    }
+    const cwd = pick(item, ["foreground_cwd", "cwd"]) ?? process.cwd();
+    const rawStatus = pick(item, ["agent_status", "status"]);
+    out.push({
+      agent,
+      sessionId,
+      status: mapHerdrAgentStatus(rawStatus),
+      cwd,
+      paneId,
+      tabId: pick(item, ["tab_id", "tabId"]),
+      workspaceId: pick(item, ["workspace_id", "workspaceId"]),
+      title,
+      stateChangeSeq: typeof item.state_change_seq === "number" ? item.state_change_seq : 0,
+    });
+  }
+  return out;
+}
+
+function safeUser(): string {
+  try {
+    return os.userInfo().username;
+  } catch {
+    return process.env.USER || process.env.USERNAME || "unknown";
+  }
+}
+
+function sanitizeIdPart(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9_.:-]/g, "_").slice(0, 80);
+}
+
+export function gateSocketPath(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string {
+  if (platform === "win32") {
+    const user = sanitizeIdPart(safeUser());
+    return `\\\\.\\pipe\\rp-agy-gate-${user}`;
+  }
+  return path.join(configDir(env, platform), "agy-gate.sock");
+}
+
+interface BridgedSessionDeps {
+  relayUrl: string;
+  machineId: string;
+  token: string;
+  cfg: RpConfig;
+  herdrSession: string | null;
+  runner: Runner;
+  onLog?: (msg: string) => void;
+  connectionFactory?: (o: ConstructorParameters<typeof Connection>[0]) => Connection;
+}
+
+export class BridgedAgentSession {
+  readonly instance = newId();
+  readonly epoch = newId();
+  readonly sessionKey: string;
+  readonly agentId: string;
+  readonly allowed = new Set<string>();
+  readonly broker: Broker;
+  readonly conn: Connection;
+
+  private seq = 0;
+  private disposed = false;
+  private git: { branch: string | null; dirty: boolean } | null = null;
+  private transcriptReader: AgyTranscriptReader | null = null;
+  private lastTerminalSnapshot = "";
+  private lastStateSeq = -1;
+  private pollTimer: NodeJS.Timeout | null = null;
+  private currentStatus: AgentStatus;
+
+  constructor(
+    private info: HerdrDiscoveredAgent,
+    private d: BridgedSessionDeps,
+    transcriptOverride?: string,
+  ) {
+    const rawKey = info.sessionId || `pane-${info.paneId}`;
+    this.sessionKey = sanitizeIdPart(rawKey);
+    this.agentId = `${d.machineId}:herdr:${this.sessionKey}`;
+    this.currentStatus = info.status;
+
+    if (info.agent === "agy" && info.sessionId) {
+      const tPath = transcriptOverride ?? resolveAgyTranscriptPath(info.sessionId);
+      this.transcriptReader = new AgyTranscriptReader(tPath, () => this.d.cfg.redactContent);
+    }
+
+    this.broker = new Broker({
+      agentId: this.agentId,
+      send: (t, body) => this.conn.send(t, body),
+      hasUI: false,
+      classifier: new Classifier(),
+      herdr: null,
+      onChange: () => this.syncStatus(),
+    });
+
+    const makeConn = d.connectionFactory ?? ((o) => new Connection(o));
+    this.conn = makeConn({
+      relayUrl: d.relayUrl,
+      token: d.token,
+      agentId: this.agentId,
+      instance: this.instance,
+      makeHello: () => this.makeHello(),
+      onWelcome: (w) => this.onWelcome(w),
+      onMessage: (env) => this.onRelayMessage(env),
+      onLog: (m) => d.onLog?.(`[${this.info.agent}:${this.info.paneId}] ${m}`),
+    });
+
+    void this.refreshGit();
+    this.conn.start();
+    this.startTranscriptPolling();
+  }
+
+  get conversationId(): string | null {
+    return this.info.sessionId;
+  }
+
+  get paneId(): string {
+    return this.info.paneId;
+  }
+
+  private sessionDisplayName(): string {
+    const base = path.basename(this.info.cwd || "") || this.info.paneId;
+    return `${base} (${this.info.agent})`;
+  }
+
+  private effectiveStatus(): AgentStatus {
+    if (this.broker.openCount > 0) return "waiting_input";
+    return this.currentStatus;
+  }
+
+  private syncStatus(): void {
+    if (this.disposed) return;
+    this.conn.send("agent.status", { status: this.effectiveStatus() });
+  }
+
+  updateFromHerdr(next: HerdrDiscoveredAgent): void {
+    const prevCwd = this.info.cwd;
+    const prevStatus = this.effectiveStatus();
+    const seqChanged = next.stateChangeSeq !== this.lastStateSeq;
+    this.lastStateSeq = next.stateChangeSeq;
+
+    if (!this.info.sessionId && next.sessionId && next.agent === "agy") {
+      this.info.sessionId = next.sessionId;
+      this.transcriptReader = new AgyTranscriptReader(
+        resolveAgyTranscriptPath(next.sessionId),
+        () => this.d.cfg.redactContent,
+      );
+    }
+
+    this.info = { ...this.info, ...next };
+    this.currentStatus = next.status;
+
+    if (prevCwd !== next.cwd) {
+      void this.refreshGit();
+    }
+    if (this.effectiveStatus() !== prevStatus) {
+      this.syncStatus();
+      if (this.effectiveStatus() === "working") {
+        this.sendEvent({ type: "agent_start" });
+      } else if (prevStatus === "working" && this.effectiveStatus() === "idle") {
+        this.pollTranscriptNow();
+        this.sendEvent({ type: "agent_settled", aborted: false });
+      }
+    } else if (seqChanged) {
+      this.pollTranscriptNow();
+    }
+  }
+
+  makeHello(): AgentHelloBody {
+    const subagents = this.transcriptReader?.getSubagents() ?? [];
+    return {
+      agentId: this.agentId,
+      kind: this.info.agent,
+      instance: this.instance,
+      epoch: this.epoch,
+      pi: { version: this.info.agent, mode: "tui" },
+      plugin: { version: pluginVersion(), features: ["attachments", "statuses", "deliver_herdr", "gate"] },
+      session: {
+        id: this.sessionKey,
+        file: this.transcriptReader?.transcriptPath ?? null,
+        name: this.sessionDisplayName(),
+      },
+      host: { hostname: os.hostname(), user: safeUser(), pid: process.pid, os: process.platform },
+      launcher: this.info.agent,
+      herdr: {
+        paneId: this.info.paneId,
+        tabId: this.info.tabId,
+        workspaceId: this.info.workspaceId,
+        session: this.d.herdrSession,
+      },
+      gentle: null,
+      transport: this.conn?.transportName ?? "ws",
+      redacted: this.d.cfg.redactContent,
+      cwd: this.info.cwd,
+      spawnId: null,
+      git: this.git ?? { branch: null, dirty: false },
+      model: this.info.agent === "agy" ? { provider: "google", id: "antigravity" } : { provider: this.info.agent, id: "default" },
+      thinking: null,
+      status: this.effectiveStatus(),
+      openPrompts: this.broker.openPrompts(),
+      todos: null,
+      ...(subagents.length > 0 ? { subagents } : {}),
+    };
+  }
+
+  private onWelcome(w: WelcomeBody): void {
+    this.sendSnapshot(true);
+    this.conn.sendDirect("agent.status", { status: this.effectiveStatus() });
+    this.conn.needsSnapshot = false;
+    for (const p of pendingAnswers(w)) this.broker.handleAnswer(p.promptId, p.answer);
+  }
+
+  private sendSnapshot(direct: boolean): void {
+    if (this.transcriptReader) {
+      const { entries, truncated } = this.transcriptReader.readSnapshot();
+      const body = { epoch: this.epoch, seq: this.seq, entries, truncated };
+      if (direct) this.conn.sendDirect("agent.snapshot", body);
+      else this.conn.send("agent.snapshot", body);
+      return;
+    }
+    const body = {
+      epoch: this.epoch,
+      seq: this.seq,
+      entries: this.lastTerminalSnapshot
+        ? [
+            {
+              eid: "pane:latest",
+              kind: "assistant" as const,
+              at: Date.now(),
+              msg: {
+                role: "assistant",
+                timestamp: Date.now(),
+                content: [{ type: "text", text: "```text\n" + this.lastTerminalSnapshot + "\n```" }],
+              },
+            },
+          ]
+        : [],
+      truncated: false,
+    };
+    if (direct) this.conn.sendDirect("agent.snapshot", body);
+    else this.conn.send("agent.snapshot", body);
+  }
+
+  private sendEvent(e: Record<string, unknown>): void {
+    if (this.disposed) return;
+    this.seq += 1;
+    this.conn.send("agent.event", { epoch: this.epoch, seq: this.seq, e });
+  }
+
+  private startTranscriptPolling(): void {
+    this.pollTimer = setInterval(() => this.pollTranscriptNow(), 1200);
+    this.pollTimer.unref?.();
+  }
+
+  pollTranscriptNow(): void {
+    if (this.disposed) return;
+    if (this.transcriptReader) {
+      const events = this.transcriptReader.pollNewEvents();
+      for (const ev of events) {
+        this.sendEvent(ev);
+      }
+      return;
+    }
+    void this.pollPaneFallback();
+  }
+
+  private async pollPaneFallback(): Promise<void> {
+    if (this.disposed || !this.info.paneId || this.d.cfg.redactContent) return;
+    try {
+      const res = await this.d.runner("herdr", ["pane", "read", "--source", "recent", "--lines", "60", this.info.paneId], {
+        timeoutMs: 3_000,
+        env: this.d.herdrSession ? { HERDR_SESSION: this.d.herdrSession } : {},
+      });
+      if (res.code !== 0) return;
+      const parsed = parseJson(res.stdout);
+      const text = (typeof parsed?.result?.text === "string" ? parsed.result.text : res.stdout).trim();
+      if (!text || text === this.lastTerminalSnapshot) return;
+      this.lastTerminalSnapshot = truncateBytes(text, 16 * 1024).text;
+      const now = Date.now();
+      this.sendEvent({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          timestamp: now,
+          content: [{ type: "text", text: "```text\n" + this.lastTerminalSnapshot + "\n```" }],
+        },
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private onRelayMessage(env: Envelope): void {
+    routeInbound(env, {
+      userMessage: (b) => void this.handleUserMessage(b),
+      abort: () => void this.handleAbort(),
+      promptAnswer: (id, answer) => void this.broker.handleAnswer(id, answer),
+      promptCancel: (id) => this.broker.handleCancel(id),
+      resync: () => this.sendSnapshot(false),
+      error: (code, message) => this.d.onLog?.(`[${this.agentId}] relay error ${code}: ${message}`),
+    });
+  }
+
+  private async handleUserMessage(b: UserMessageBody): Promise<void> {
+    const ack = (status: "delivered" | "rejected", error: "agent_blocked" | "herdr_unavailable" | null = null) =>
+      this.conn.send("user.message.ack", {
+        clientMsgId: b.clientMsgId,
+        disposition: status === "delivered" ? (b.asCommand ? "command" : "typed") : "rejected",
+        ...(status === "delivered" ? { method: "herdr" as const } : {}),
+        ...(error ? { error } : {}),
+      });
+
+    let text = b.text ?? "";
+    if (b.attachments?.length) {
+      const att = await resolveAttachments(b.attachments, {
+        inboxDir: resolveInboxDir(this.d.cfg),
+        fetchBlob: relayBlobFetcher(this.d.relayUrl, this.d.token),
+        sessionId: this.sessionKey,
+        inlineImages: false,
+      });
+      if (att.lines.length) text = (text ? text + "\n\n" : "") + att.lines.join("\n");
+    }
+    text = text.trim();
+    if (!text) return ack("rejected", "herdr_unavailable");
+
+    const env = this.d.herdrSession ? { HERDR_SESSION: this.d.herdrSession } : {};
+    try {
+      if (!b.asCommand) {
+        const res = await this.d.runner("herdr", ["agent", "prompt", this.info.paneId, text], { timeoutMs: 10_000, env });
+        if (res.code === 0) return ack("delivered");
+      }
+      // Fallback (or slash command): send literal text + Enter directly to the Herdr pane
+      const sendRes = await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, text], { timeoutMs: 5_000, env });
+      if (sendRes.code !== 0) return ack("rejected", "herdr_unavailable");
+      await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 5_000, env });
+      return ack("delivered");
+    } catch {
+      return ack("rejected", "herdr_unavailable");
+    }
+  }
+
+  private async handleAbort(): Promise<void> {
+    if (!this.info.paneId) return;
+    const env = this.d.herdrSession ? { HERDR_SESSION: this.d.herdrSession } : {};
+    try {
+      await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Escape"], { timeoutMs: 3_000, env });
+      await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "C-c"], { timeoutMs: 3_000, env });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Ask the mobile phone to approve/deny a PreToolUse tool execution in agy. */
+  async requestGateApproval(req: {
+    toolName: string;
+    command: string;
+    danger: "low" | "medium" | "high";
+    key: string;
+    signal: AbortSignal;
+  }): Promise<{ decision: "allow" | "deny" | "ask"; reason?: string }> {
+    if (this.allowed.has(req.key)) return { decision: "allow" };
+    if (this.conn.state !== "connected") {
+      return { decision: "ask", reason: "RP: sin conexión al relay; confirmar en terminal" };
+    }
+
+    const summary = req.command.length > 120 ? req.command.slice(0, 119) + "…" : req.command;
+    const title = `⚠ ${req.toolName}: ${summary}`;
+    const choice = await promptContext.run(
+      {
+        category: "permission",
+        danger: req.danger,
+        tool: { name: req.toolName, args: { command: req.command } },
+        message: req.command,
+        source: { extension: "rp", tool: "agy-gate" },
+      },
+      () =>
+        this.broker.race<string | undefined>(
+          {
+            kind: "select",
+            title,
+            options: [ALLOW, ALLOW_SESSION, DENY, DENY_REASON],
+            opts: { timeout: 270_000, signal: req.signal },
+          },
+          null,
+        ),
+    );
+
+    if (choice === ALLOW) return { decision: "allow" };
+    if (choice === ALLOW_SESSION) {
+      this.allowed.add(req.key);
+      return { decision: "allow" };
+    }
+    if (choice === DENY_REASON) {
+      const reason = await promptContext.run(
+        { category: "question", danger: "low", source: { extension: "rp", tool: "agy-gate" } },
+        () =>
+          this.broker.race<string | undefined>(
+            {
+              kind: "input",
+              title: "Motivo de la denegación",
+              placeholder: "Explica por qué se deniega",
+              opts: { timeout: 60_000, signal: req.signal },
+            },
+            null,
+          ),
+      );
+      return {
+        decision: "deny",
+        reason: reason?.trim() ? `Denegado desde RP móvil: ${reason.trim()}` : "Denegado desde RP móvil",
+      };
+    }
+    if (choice === DENY) {
+      return { decision: "deny", reason: "Denegado desde RP móvil" };
+    }
+    // Timeout or cancelled: let agy ask in terminal
+    return { decision: "ask", reason: "RP: sin respuesta en móvil; confirmar en terminal" };
+  }
+
+  private refreshGit(): Promise<void> {
+    const cwd = this.info.cwd;
+    if (!cwd) return Promise.resolve();
+    return new Promise((resolve) => {
+      execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeout: 2_000 }, (err, stdout) => {
+        if (this.disposed) return resolve();
+        if (err) {
+          this.git = { branch: null, dirty: false };
+          return resolve();
+        }
+        const branch = stdout.trim() || null;
+        execFile("git", ["status", "--porcelain", "-uno"], { cwd, timeout: 2_000 }, (err2, stdout2) => {
+          if (!this.disposed) this.git = { branch, dirty: !err2 && stdout2.trim().length > 0 };
+          resolve();
+        });
+      });
+    });
+  }
+
+  stop(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    this.pollTimer = null;
+    this.broker.shutdown();
+    this.conn.stop();
+  }
+}
+
+export interface HerdrBridgeOptions {
+  relayUrl: string;
+  machineId: string;
+  token: string;
+  cfg: RpConfig;
+  herdrSession: string | null;
+  runner?: Runner;
+  pollIntervalMs?: number;
+  socketPath?: string;
+  onLog?: (msg: string) => void;
+  connectionFactory?: (o: ConstructorParameters<typeof Connection>[0]) => Connection;
+}
+
+export class HerdrAgentBridge {
+  private sessionsByKey = new Map<string, BridgedAgentSession>();
+  private missingPolls = new Map<string, number>();
+  private pollTimer: NodeJS.Timeout | null = null;
+  private pollPromise: Promise<void> | null = null;
+  private stopped = false;
+  private gateServer: net.Server | null = null;
+  private runner: Runner;
+  private sockPath: string;
+
+  constructor(private o: HerdrBridgeOptions) {
+    this.runner = o.runner ?? realRun;
+    this.sockPath = o.socketPath ?? gateSocketPath();
+  }
+
+  start(): void {
+    this.startGateServer();
+    void this.poll();
+    const interval = this.o.pollIntervalMs ?? 3_000;
+    this.pollTimer = setInterval(() => void this.poll(), interval);
+    this.pollTimer.unref?.();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    this.pollTimer = null;
+    if (this.gateServer) {
+      try {
+        this.gateServer.close();
+      } catch {
+        /* ignore */
+      }
+      this.gateServer = null;
+    }
+    if (process.platform !== "win32" && fs.existsSync(this.sockPath)) {
+      try {
+        fs.unlinkSync(this.sockPath);
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const s of this.sessionsByKey.values()) s.stop();
+    this.sessionsByKey.clear();
+  }
+
+  getActiveSessions(): BridgedAgentSession[] {
+    return [...this.sessionsByKey.values()];
+  }
+
+  async poll(): Promise<void> {
+    if (this.stopped) return;
+    if (this.pollPromise) return this.pollPromise;
+    this.pollPromise = this.runPoll().finally(() => {
+      this.pollPromise = null;
+    });
+    return this.pollPromise;
+  }
+
+  private async runPoll(): Promise<void> {
+    try {
+      const env = this.o.herdrSession ? { HERDR_SESSION: this.o.herdrSession } : {};
+      const res = await this.runner("herdr", ["agent", "list"], { timeoutMs: 5_000, env });
+      if (this.stopped || res.code !== 0) return;
+
+      const discovered = parseHerdrAgentList(res.stdout);
+      const seenKeys = new Set<string>();
+
+      for (const item of discovered) {
+        const key = sanitizeIdPart(item.sessionId || `pane-${item.paneId}`);
+        seenKeys.add(key);
+        this.missingPolls.delete(key);
+
+        const existing = this.sessionsByKey.get(key);
+        if (existing) {
+          existing.updateFromHerdr(item);
+        } else {
+          // If an on-demand session was created by paneId first and now got a sessionId, migrate it
+          const paneFallbackKey = sanitizeIdPart(`pane-${item.paneId}`);
+          const paneFallback = key !== paneFallbackKey ? this.sessionsByKey.get(paneFallbackKey) : undefined;
+          if (paneFallback) {
+            paneFallback.stop();
+            this.sessionsByKey.delete(paneFallbackKey);
+          }
+          const session = new BridgedAgentSession(item, {
+            relayUrl: this.o.relayUrl,
+            machineId: this.o.machineId,
+            token: this.o.token,
+            cfg: this.o.cfg,
+            herdrSession: this.o.herdrSession,
+            runner: this.runner,
+            onLog: this.o.onLog,
+            connectionFactory: this.o.connectionFactory,
+          });
+          this.sessionsByKey.set(key, session);
+        }
+      }
+
+      for (const [key, session] of this.sessionsByKey.entries()) {
+        if (seenKeys.has(key)) continue;
+        const misses = (this.missingPolls.get(key) ?? 0) + 1;
+        if (misses >= 2) {
+          session.stop();
+          this.sessionsByKey.delete(key);
+          this.missingPolls.delete(key);
+        } else {
+          this.missingPolls.set(key, misses);
+        }
+      }
+    } catch (e) {
+      this.o.onLog?.(`herdr bridge poll error: ${errMsg(e)}`);
+    }
+  }
+
+  private startGateServer(): void {
+    try {
+      if (process.platform !== "win32") {
+        fs.mkdirSync(path.dirname(this.sockPath), { recursive: true });
+        if (fs.existsSync(this.sockPath)) fs.unlinkSync(this.sockPath);
+      }
+      const server = net.createServer((socket) => {
+        const ac = new AbortController();
+        socket.on("close", () => ac.abort());
+        socket.on("error", () => ac.abort());
+
+        let buf = "";
+        socket.on("data", (chunk) => {
+          buf += chunk.toString("utf8");
+          const nl = buf.indexOf("\n");
+          if (nl < 0) return;
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          void this.handleGateSocketRequest(line, ac.signal).then((resp) => {
+            if (!socket.destroyed) {
+              socket.end(JSON.stringify(resp) + "\n");
+            }
+          });
+        });
+      });
+      server.on("error", (e) => this.o.onLog?.(`gate socket error: ${errMsg(e)}`));
+      server.listen(this.sockPath, () => {
+        if (process.platform !== "win32") {
+          try {
+            fs.chmodSync(this.sockPath, 0o600);
+          } catch {
+            /* ignore */
+          }
+        }
+      });
+      server.unref?.();
+      this.gateServer = server;
+    } catch (e) {
+      this.o.onLog?.(`failed to start gate socket: ${errMsg(e)}`);
+    }
+  }
+
+  private async handleGateSocketRequest(
+    rawLine: string,
+    signal: AbortSignal,
+  ): Promise<{ decision: "allow" | "deny" | "ask"; reason?: string }> {
+    let req: any;
+    try {
+      req = JSON.parse(rawLine);
+    } catch {
+      return { decision: "allow" };
+    }
+    const conversationId = typeof req?.conversationId === "string" ? req.conversationId : "";
+    const command = typeof req?.command === "string" ? req.command : "";
+    if (!conversationId || !command) return { decision: "allow" };
+
+    const key = sanitizeIdPart(conversationId);
+    let session = this.sessionsByKey.get(key);
+    if (!session) {
+      const cwd = Array.isArray(req.workspacePaths) && typeof req.workspacePaths[0] === "string" ? req.workspacePaths[0] : process.cwd();
+      session = new BridgedAgentSession(
+        {
+          agent: "agy",
+          sessionId: conversationId,
+          status: "working",
+          cwd,
+          paneId: typeof req.paneId === "string" ? req.paneId : "",
+          tabId: null,
+          workspaceId: null,
+          title: null,
+          stateChangeSeq: 0,
+        },
+        {
+          relayUrl: this.o.relayUrl,
+          machineId: this.o.machineId,
+          token: this.o.token,
+          cfg: this.o.cfg,
+          herdrSession: this.o.herdrSession,
+          runner: this.runner,
+          onLog: this.o.onLog,
+          connectionFactory: this.o.connectionFactory,
+        },
+        typeof req.transcriptPath === "string" ? req.transcriptPath : undefined,
+      );
+      this.sessionsByKey.set(key, session);
+    }
+
+    return session.requestGateApproval({
+      toolName: "bash",
+      command,
+      danger: req.danger === "high" || req.danger === "medium" ? req.danger : "high",
+      key: typeof req.allowKey === "string" ? req.allowKey : `bash:${command}`,
+      signal,
+    });
+  }
+}
+
+/**
+ * Executed by Antigravity CLI on `PreToolUse` (`rp-host agy-hook PreToolUse`).
+ * MUST write exactly one JSON object to stdout and exit 0.
+ */
+export async function runAgyHook(
+  cfg: RpConfig,
+  stdinText: string,
+  sockPath = gateSocketPath(),
+): Promise<{ decision: "allow" | "deny" | "ask"; reason?: string }> {
+  if (!cfg.enabled) return { decision: "allow" };
+  let payload: any;
+  try {
+    payload = JSON.parse(stdinText);
+  } catch {
+    return { decision: "allow" };
+  }
+  const rawToolName = String(payload?.toolCall?.name ?? "");
+  if (rawToolName !== "run_command") return { decision: "allow" };
+
+  const args = parseAgyArgs(payload?.toolCall?.args ?? payload?.toolCall?.arguments);
+  const command = String(args.CommandLine ?? args.command ?? "").trim();
+  if (!command) return { decision: "allow" };
+
+  const mode = cfg.gate.mode === "auto-detect" ? "dangerous" : cfg.gate.mode;
+  if (mode === "off") return { decision: "allow" };
+
+  const patterns = compilePatterns(cfg.gate.dangerousPatterns);
+  const dec = decide(mode, cfg.gate, patterns, "bash", { command });
+  if (!dec.ask) return { decision: "allow" };
+
+  const conversationId = typeof payload?.conversationId === "string" ? payload.conversationId : "";
+  if (!conversationId) return { decision: "ask", reason: "RP: comando peligroso detectado" };
+
+  return new Promise((resolve) => {
+    const client = net.createConnection(sockPath);
+    let settled = false;
+    const finish = (res: { decision: "allow" | "deny" | "ask"; reason?: string }) => {
+      if (settled) return;
+      settled = true;
+      try {
+        client.destroy();
+      } catch {
+        /* ignore */
+      }
+      resolve(res);
+    };
+
+    const timer = setTimeout(() => finish({ decision: "ask", reason: "RP: tiempo de espera agotado; confirmar en terminal" }), 280_000);
+    timer.unref?.();
+
+    client.on("error", () => {
+      clearTimeout(timer);
+      finish({ decision: "ask", reason: "RP: comando peligroso detectado (rp-host inactivo)" });
+    });
+
+    client.on("connect", () => {
+      const req = {
+        conversationId,
+        workspacePaths: payload?.workspacePaths,
+        transcriptPath: payload?.transcriptPath,
+        paneId: process.env.HERDR_PANE_ID ?? "",
+        command,
+        danger: dec.danger,
+        allowKey: dec.key,
+      };
+      client.write(JSON.stringify(req) + "\n");
+    });
+
+    let buf = "";
+    client.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\n");
+      if (nl < 0) return;
+      clearTimeout(timer);
+      try {
+        const parsed = JSON.parse(buf.slice(0, nl).trim());
+        if (parsed?.decision === "allow" || parsed?.decision === "deny" || parsed?.decision === "ask") {
+          finish(parsed);
+          return;
+        }
+      } catch {
+        /* fallthrough */
+      }
+      finish({ decision: "ask", reason: "RP: comando peligroso detectado" });
+    });
+
+    client.on("close", () => {
+      clearTimeout(timer);
+      finish({ decision: "ask", reason: "RP: comando peligroso detectado" });
+    });
+  });
+}
+
+/** Install or update the rp-gate PreToolUse hook inside ~/.gemini/config/hooks.json without touching other hooks. */
+export function installAgyHooks(nodePath: string, scriptPath: string, home = os.homedir()): string {
+  const hooksFile = path.join(home, ".gemini", "config", "hooks.json");
+  let current: Record<string, unknown> = {};
+  try {
+    current = JSON.parse(fs.readFileSync(hooksFile, "utf8"));
+    if (!current || typeof current !== "object" || Array.isArray(current)) current = {};
+  } catch {
+    current = {};
+  }
+
+  current["rp-gate"] = {
+    enabled: true,
+    PreToolUse: [
+      {
+        matcher: "run_command",
+        hooks: [
+          {
+            type: "command",
+            command: `'${nodePath.replace(/'/g, "'\\''")}' '${scriptPath.replace(/'/g, "'\\''")}' agy-hook PreToolUse`,
+            timeout: 300,
+          },
+        ],
+      },
+    ],
+  };
+
+  fs.mkdirSync(path.dirname(hooksFile), { recursive: true });
+  fs.writeFileSync(hooksFile, JSON.stringify(current, null, 2) + "\n", { mode: 0o644 });
+  return hooksFile;
+}
