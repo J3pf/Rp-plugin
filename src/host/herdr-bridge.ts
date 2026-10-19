@@ -152,6 +152,8 @@ export class BridgedAgentSession {
   private git: { branch: string | null; dirty: boolean } | null = null;
   private transcriptReader: AgyTranscriptReader | null = null;
   private lastTerminalSnapshot = "";
+  private lastTerminalSnapshotTs = 0;
+  private initialFallbackDone = false;
   private lastStateSeq = -1;
   private startTimer: NodeJS.Timeout | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
@@ -348,24 +350,26 @@ export class BridgedAgentSession {
       this.syncSessionNameIfChanged();
       return;
     }
+    const entryAt = this.lastTerminalSnapshotTs || null;
     const body = {
       epoch: this.epoch,
       seq: this.seq,
-      entries: this.lastTerminalSnapshot
+      entries: this.lastTerminalSnapshot && entryAt
         ? [
             {
               eid: "pane:latest",
               kind: "assistant" as const,
-              at: Date.now(),
+              at: entryAt,
               msg: {
                 role: "assistant",
-                timestamp: Date.now(),
+                timestamp: entryAt,
                 content: [{ type: "text", text: "```text\n" + this.lastTerminalSnapshot + "\n```" }],
               },
             },
           ]
         : [],
       truncated: false,
+      ...(entryAt ? { lastActivityAt: entryAt } : {}),
     };
     if (direct) this.conn.sendDirect("agent.snapshot", body);
     else this.conn.send("agent.snapshot", body);
@@ -450,8 +454,13 @@ export class BridgedAgentSession {
       const snippet = extractRecentCommandOutput(text, commandText);
       if (snippet === this.lastTerminalSnapshot) return;
       this.lastTerminalSnapshot = truncateBytes(snippet, 16 * 1024).text;
+      if (!this.initialFallbackDone) {
+        this.initialFallbackDone = true;
+        return;
+      }
+      this.lastTerminalSnapshotTs = Date.now();
       if (!this.fallbackTurnTs) {
-        this.fallbackTurnTs = Date.now();
+        this.fallbackTurnTs = this.lastTerminalSnapshotTs;
       }
       this.sendEvent({
         type: "message_end",
@@ -501,6 +510,8 @@ export class BridgedAgentSession {
 
     this.fallbackTurnTs = 0;
     this.lastTerminalSnapshot = "";
+    this.lastTerminalSnapshotTs = Date.now();
+    this.initialFallbackDone = true;
 
     const markWorkingOnDelivery = () => {
       this.optimisticWorkingUntilMs = Date.now() + 8_000;
