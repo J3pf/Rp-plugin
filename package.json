@@ -48,14 +48,17 @@
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
+  "overrides": {
+    "basic-ftp": "^6.2.3"
+  },
   "devDependencies": {
     "@earendil-works/pi-ai": "1.2.0",
     "@earendil-works/pi-coding-agent": "1.2.0",
     "@types/node": "^22.20.5",
     "@types/ws": "^8.18.2",
-    "gentle-pi": "^4.2.0",
+    "gentle-pi": "^4.3.0",
     "tsx": "^4.23.15",
-    "typebox": "*",
+    "typebox": "^1.4.2",
     "typescript": "^5.9.3",
     "vitest": "^3.2.7"
   }
