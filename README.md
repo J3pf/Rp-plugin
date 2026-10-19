@@ -13,19 +13,19 @@ para lanzar agentes nuevos desde el móvil (en herdr, tmux o Windows Terminal).
 ### Desde la release oficial de GitHub (Recomendado)
 ```bash
 # Pi estándar (~/.pi/agent)
-pi install git:github.com/J3pf/Rp-plugin@v0.2.6
+pi install git:github.com/J3pf/Rp-plugin@v0.2.7
 
 # gentle-shell (~/.gentle-shell/agent) — verificado: reenvía git: a su entorno aislado
-gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.6
+gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.7
 ```
 
 ### Alternativa offline (desde tarball de la release)
-Pi registra la ruta local de la carpeta donde se instala; para evitar perder el paquete si se limpian carpetas temporales o de descargas, descomprime el `.tgz` en una ubicación permanente (ej. `~/.pi/agent/packages/j3pf-pi-rp-0.2.6`):
+Pi registra la ruta local de la carpeta donde se instala; para evitar perder el paquete si se limpian carpetas temporales o de descargas, descomprime el `.tgz` en una ubicación permanente (ej. `~/.pi/agent/packages/j3pf-pi-rp-0.2.7`):
 ```bash
-mkdir -p ~/.pi/agent/packages/j3pf-pi-rp-0.2.6
-tar -xzf j3pf-pi-rp-0.2.6.tgz -C ~/.pi/agent/packages/j3pf-pi-rp-0.2.6 --strip-components=1
-cd ~/.pi/agent/packages/j3pf-pi-rp-0.2.6 && npm install --omit=dev
-cd ~/.pi/agent && pi install ./packages/j3pf-pi-rp-0.2.6
+mkdir -p ~/.pi/agent/packages/j3pf-pi-rp-0.2.7
+tar -xzf j3pf-pi-rp-0.2.7.tgz -C ~/.pi/agent/packages/j3pf-pi-rp-0.2.7 --strip-components=1
+cd ~/.pi/agent/packages/j3pf-pi-rp-0.2.7 && npm install --omit=dev
+cd ~/.pi/agent && pi install ./packages/j3pf-pi-rp-0.2.7
 ```
 
 ### O desde código fuente local
@@ -41,10 +41,10 @@ pi install .
 `pi install` actualiza el clon en el directorio del agente, hace checkout del nuevo tag y reemplaza la entrada en `settings.json` automáticamente:
 ```bash
 # Para Pi estándar
-pi install git:github.com/J3pf/Rp-plugin@v0.2.6
+pi install git:github.com/J3pf/Rp-plugin@v0.2.7
 
 # Para gentle-shell
-gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.6
+gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.7
 
 # Confirmar actualización y reiniciar sesiones de Pi
 pi list
@@ -55,7 +55,7 @@ pi list
 `pi remove` aplica únicamente para limpiar entradas locales anteriores y evitar que ambas versiones carguen al mismo tiempo:
 1. **Instala la nueva versión primero** (para no quedar sin plugin si la red falla):
    ```bash
-   pi install git:github.com/J3pf/Rp-plugin@v0.2.6
+   pi install git:github.com/J3pf/Rp-plugin@v0.2.7
    ```
 2. **Elimina la ruta local anterior situándote en `~/.pi/agent`**:
    ```bash
