@@ -454,7 +454,7 @@ export class AgyTranscriptReader {
         return;
       }
       const firstLine = extracted.text.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
-      if (firstLine) {
+      if (!this.lastTopic && firstLine) {
         this.lastTopic = firstLine.length > 42 ? firstLine.slice(0, 41) + "…" : firstLine;
       }
       const contentBlocks: unknown[] = [{ type: "text", text: truncateBytes(extracted.text, LIMITS.resultMaxBytes).text }];

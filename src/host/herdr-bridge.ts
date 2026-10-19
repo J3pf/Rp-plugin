@@ -147,6 +147,7 @@ export class BridgedAgentSession {
   private lastSentName = "";
   private currentStatus: AgentStatus;
   private optimisticWorkingUntilMs = 0;
+  private fallbackTurnTs = 0;
 
   constructor(
     private info: HerdrDiscoveredAgent,
@@ -430,15 +431,18 @@ export class BridgedAgentSession {
       });
       if (res.code !== 0) return;
       const parsed = parseJson(res.stdout);
-      const text = (typeof parsed?.result?.text === "string" ? parsed.result.text : res.stdout).trim();
+      const rawText = (typeof parsed?.result?.text === "string" ? parsed.result.text : res.stdout).trim();
+      const text = rawText.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "").trim();
       if (!text || text === this.lastTerminalSnapshot) return;
       this.lastTerminalSnapshot = truncateBytes(text, 16 * 1024).text;
-      const now = Date.now();
+      if (!this.fallbackTurnTs) {
+        this.fallbackTurnTs = Date.now();
+      }
       this.sendEvent({
         type: "message_end",
         message: {
           role: "assistant",
-          timestamp: now,
+          timestamp: this.fallbackTurnTs,
           content: [{ type: "text", text: "```text\n" + this.lastTerminalSnapshot + "\n```" }],
         },
       });
@@ -479,6 +483,8 @@ export class BridgedAgentSession {
     }
     text = text.trim();
     if (!text) return ack("rejected", "herdr_unavailable");
+
+    this.fallbackTurnTs = 0;
 
     const markWorkingOnDelivery = () => {
       this.optimisticWorkingUntilMs = Date.now() + 8_000;

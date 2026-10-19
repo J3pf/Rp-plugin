@@ -338,7 +338,7 @@ describe("HostConnection protocol", () => {
     const hello = await waitUntil(() => relay.of("host.hello")[0]);
     expect(relay.conns[0]!.path).toBe("/ws/host");
     expect(relay.conns[0]!.headers.authorization).toBe("Bearer tok");
-    expect(hello.d).toMatchObject({ machineId: "MACH1", roots: [root], backends: { tmux: "3.4", herdr: null, wt: false, console: false }, defaultBackend: "tmux", launchers: ["gentle-shell", "pi", "agy"], defaultLauncher: "gentle-shell" });
+    expect(hello.d).toMatchObject({ machineId: "MACH1", roots: [root], backends: { tmux: "3.4", herdr: null, wt: false, console: false }, defaultBackend: "tmux", launchers: ["gentle-shell", "pi", "agy", "claude", "codex"], defaultLauncher: "gentle-shell" });
 
     const ask = async (t: string, d: any) => {
       const before = relay.all.length;

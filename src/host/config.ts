@@ -19,7 +19,7 @@ export interface HostConfig {
 export const DEFAULT_HOST_CONFIG: HostConfig = {
   roots: ["~/proyectos"],
   backend: "auto",
-  launchers: { "gentle-shell": "gentle-shell", pi: "pi", agy: "agy" },
+  launchers: { "gentle-shell": "gentle-shell", pi: "pi", agy: "agy", claude: "claude", codex: "codex" },
   defaultLauncher: "gentle-shell",
   herdrSession: null,
   quotaEnabled: true,
