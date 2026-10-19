@@ -140,6 +140,9 @@ export class BridgedAgentSession {
   private lastTerminalSnapshot = "";
   private lastStateSeq = -1;
   private pollTimer: NodeJS.Timeout | null = null;
+  private watcher: fs.FSWatcher | null = null;
+  private watchDebounce: NodeJS.Timeout | null = null;
+  private lastSentName = "";
   private currentStatus: AgentStatus;
 
   constructor(
@@ -193,7 +196,17 @@ export class BridgedAgentSession {
 
   private sessionDisplayName(): string {
     const base = path.basename(this.info.cwd || "") || this.info.paneId;
+    const topic = this.transcriptReader?.getSessionTopic();
+    if (topic) return `${base} · ${topic}`;
     return `${base} (${this.info.agent})`;
+  }
+
+  private syncSessionNameIfChanged(): void {
+    const nextName = this.sessionDisplayName();
+    if (nextName && nextName !== this.lastSentName) {
+      this.lastSentName = nextName;
+      this.sendEvent({ type: "session_info_changed", name: nextName });
+    }
   }
 
   private effectiveStatus(): AgentStatus {
@@ -204,6 +217,7 @@ export class BridgedAgentSession {
   private syncStatus(): void {
     if (this.disposed) return;
     this.conn.send("agent.status", { status: this.effectiveStatus() });
+    this.scheduleNextPoll();
   }
 
   updateFromHerdr(next: HerdrDiscoveredAgent): void {
@@ -218,6 +232,7 @@ export class BridgedAgentSession {
         resolveAgyTranscriptPath(next.sessionId),
         () => this.d.cfg.redactContent,
       );
+      this.setupFileWatcher();
     }
 
     this.info = { ...this.info, ...next };
@@ -241,6 +256,8 @@ export class BridgedAgentSession {
 
   makeHello(): AgentHelloBody {
     const subagents = this.transcriptReader?.getSubagents() ?? [];
+    const name = this.sessionDisplayName();
+    this.lastSentName = name;
     return {
       agentId: this.agentId,
       kind: this.info.agent,
@@ -251,7 +268,7 @@ export class BridgedAgentSession {
       session: {
         id: this.sessionKey,
         file: this.transcriptReader?.transcriptPath ?? null,
-        name: this.sessionDisplayName(),
+        name,
       },
       host: { hostname: os.hostname(), user: safeUser(), pid: process.pid, os: process.platform },
       launcher: this.info.agent,
@@ -289,6 +306,7 @@ export class BridgedAgentSession {
       const body = { epoch: this.epoch, seq: this.seq, entries, truncated };
       if (direct) this.conn.sendDirect("agent.snapshot", body);
       else this.conn.send("agent.snapshot", body);
+      this.syncSessionNameIfChanged();
       return;
     }
     const body = {
@@ -320,18 +338,59 @@ export class BridgedAgentSession {
     this.conn.send("agent.event", { epoch: this.epoch, seq: this.seq, e });
   }
 
-  private startTranscriptPolling(): void {
-    this.pollTimer = setInterval(() => this.pollTranscriptNow(), 1200);
+  private setupFileWatcher(): void {
+    if (this.watcher || !this.transcriptReader) return;
+    const dir = path.dirname(this.transcriptReader.transcriptPath);
+    if (!fs.existsSync(dir)) return;
+    try {
+      this.watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
+        if (this.disposed) return;
+        if (filename && filename !== "transcript.jsonl") return;
+        if (this.watchDebounce) return;
+        this.watchDebounce = setTimeout(() => {
+          this.watchDebounce = null;
+          this.pollTranscriptNow();
+        }, 150);
+        this.watchDebounce.unref?.();
+      });
+      this.watcher.on("error", () => {
+        try {
+          this.watcher?.close();
+        } catch {
+          /* ignore */
+        }
+        this.watcher = null;
+      });
+    } catch {
+      /* fallback to timer */
+    }
+  }
+
+  private scheduleNextPoll(): void {
+    if (this.disposed) return;
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    const delayMs = this.effectiveStatus() === "working" ? 900 : 4_500;
+    this.pollTimer = setTimeout(() => {
+      this.pollTranscriptNow();
+      this.scheduleNextPoll();
+    }, delayMs);
     this.pollTimer.unref?.();
+  }
+
+  private startTranscriptPolling(): void {
+    this.setupFileWatcher();
+    this.scheduleNextPoll();
   }
 
   pollTranscriptNow(): void {
     if (this.disposed) return;
     if (this.transcriptReader) {
+      if (!this.watcher) this.setupFileWatcher();
       const events = this.transcriptReader.pollNewEvents();
       for (const ev of events) {
         this.sendEvent(ev);
       }
+      if (events.length > 0) this.syncSessionNameIfChanged();
       return;
     }
     void this.pollPaneFallback();
@@ -511,8 +570,18 @@ export class BridgedAgentSession {
   stop(): void {
     if (this.disposed) return;
     this.disposed = true;
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = null;
+    if (this.watchDebounce) clearTimeout(this.watchDebounce);
+    this.watchDebounce = null;
+    if (this.watcher) {
+      try {
+        this.watcher.close();
+      } catch {
+        /* ignore */
+      }
+      this.watcher = null;
+    }
     this.broker.shutdown();
     this.conn.stop();
   }

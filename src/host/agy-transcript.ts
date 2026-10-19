@@ -275,7 +275,23 @@ interface PendingTool {
   subagentSpec?: { role: string; typeName: string; prompt: string };
 }
 
-export const MAX_SNAPSHOT_BYTES = 600 * 1024;
+export const MAX_SNAPSHOT_BYTES = 220 * 1024;
+
+function compactSnapshotEntry(entry: SnapshotEntry, isRecent: boolean): SnapshotEntry {
+  if (isRecent || entry.kind !== "tool_result" || !entry.msg || typeof entry.msg !== "object") return entry;
+  const msg = entry.msg as Record<string, unknown>;
+  const content = Array.isArray(msg.content) ? msg.content : null;
+  if (!content || content.length === 0) return entry;
+  const first = content[0] as Record<string, unknown> | undefined;
+  if (!first || first.type !== "text" || typeof first.text !== "string" || first.text.length <= 1024) return entry;
+  return {
+    ...entry,
+    msg: {
+      ...msg,
+      content: [{ type: "text", text: truncateBytes(first.text, 1024).text }],
+    },
+  };
+}
 
 /**
  * Stateful incremental reader for an agy `transcript.jsonl` file.
@@ -288,6 +304,7 @@ export class AgyTranscriptReader {
   private pendingTools: PendingTool[] = [];
   private entries: SnapshotEntry[] = [];
   private subagents = new Map<string, SubagentUpdateEvent>();
+  private lastTopic: string | null = null;
 
   constructor(
     readonly transcriptPath: string,
@@ -298,14 +315,20 @@ export class AgyTranscriptReader {
     return [...this.subagents.values()];
   }
 
+  getSessionTopic(): string | null {
+    if (this.redact()) return null;
+    return this.lastTopic;
+  }
+
   /** Load or refresh the transcript from disk and return the current snapshot (capped by count and byte budget). */
   readSnapshot(): { entries: SnapshotEntry[]; truncated: boolean; events: Record<string, unknown>[] } {
     const events = this.pollNewEvents();
     const picked: SnapshotEntry[] = [];
     let bytesUsed = 0;
     let truncated = false;
+    const recentThreshold = Math.max(0, this.entries.length - 12);
     for (let i = this.entries.length - 1; i >= 0; i--) {
-      const entry = this.entries[i]!;
+      const entry = compactSnapshotEntry(this.entries[i]!, i >= recentThreshold);
       const entryBytes = Buffer.byteLength(JSON.stringify(entry), "utf8") + 2;
       if (picked.length >= SNAPSHOT_LIMIT || (picked.length > 0 && bytesUsed + entryBytes > MAX_SNAPSHOT_BYTES)) {
         truncated = true;
@@ -409,6 +432,10 @@ export class AgyTranscriptReader {
         this.entries.push({ eid, kind: "compaction", at, msg: isRedacted ? {} : { summary: extracted.text } });
         outEvents.push({ type: "session_compact", ...(isRedacted ? {} : { summary: extracted.text }) });
         return;
+      }
+      const firstLine = extracted.text.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+      if (firstLine) {
+        this.lastTopic = firstLine.length > 42 ? firstLine.slice(0, 41) + "…" : firstLine;
       }
       const contentBlocks: unknown[] = [{ type: "text", text: truncateBytes(extracted.text, LIMITS.resultMaxBytes).text }];
       if (Array.isArray(step.media)) {
