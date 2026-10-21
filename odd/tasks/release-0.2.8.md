@@ -48,7 +48,8 @@ Branch: `main` | Status: in_progress
 - T3 (S3) [inline] Protocol compatibility: verify messages emitted by host with relay main (e161067) and Rp-app main: done
 - T4 (S4) [inline] Quality gate: lint, typecheck, build, unit tests, serial e2e, npm outdated, npm audit --omit=dev: done (d516764)
 - T5 (S5) [inline] Bump 0.2.8 everywhere, author English CHANGELOG and release notes crediting Luis, test isolated scratch HOME install: done (12e2421)
-- T6 (S1-S5) [inline] Final verification and report "[PLUGIN 0.2.8 — READY FOR REVIEW]": done
+- T6 (S1-S5) [inline] Final verification and report "[PLUGIN 0.2.8 — READY FOR REVIEW]": done (235e4db)
+- T7 (S6) [inline] Eliminate fixed wall-clock sleeps in test/herdr-bridge.test.ts (vi.waitFor), verify gentle-ai-sync test, run unit tests 10x under load (0 failures), and re-run serial e2e: done (d4255a1)
 
 ## Log
 - L1: "si nada puede quedar fuera de la release"
@@ -60,3 +61,10 @@ Branch: `main` | Status: in_progress
   - Serial E2E tests: 3 test files passed, 21 passed (0 failed) in 157.57s (rpc: 3/3, tui: 13/13, gentle-shell: 5/5).
   - `npm audit --omit=dev`: 0 vulnerabilities.
   - `npm outdated`: only `@types/node` reported (pinned to 22.x LTS aligned with engines `>=22.19`).
+- L4: Orchestrator review feedback: independent gate on git-archive failed 1 of 3 runs at test/herdr-bridge.test.ts:384 due to fixed sleeps (setTimeout). Required: eliminate all 6 fixed sleeps in test/herdr-bridge.test.ts using vi.waitFor / await session.pollTranscriptNow(), run unit tests 10x under load (0 failures), run test/gentle-ai-sync.test.ts with GENTLE_AI_BIN, re-run serial e2e, and commit in separate test: commit.
+- L5: Flakiness elimination and load gate evidence:
+  - Replaced all 6 fixed `setTimeout` sleeps in `test/herdr-bridge.test.ts` with `vi.waitFor` and `await session.pollTranscriptNow()`.
+  - Tested `test/gentle-ai-sync.test.ts` with `GENTLE_AI_BIN=/home/linuxbrew/.linuxbrew/bin/gentle-ai`: 1/1 passed (47.91s).
+  - 10× unit suite runs under concurrent vitest load (Job 5): 10/10 runs passed with 0 failures (363 tests passed per run).
+  - Serial E2E tests (Job 6): 3/3 test files passed, 21 passed (0 failed) in 176.96s.
+  - Separate test commit: `d4255a1`.
