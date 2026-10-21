@@ -71,7 +71,7 @@ describe("Connection over WebSocket", () => {
     conn!.start();
     await waitUntil(() => conn!.connected);
     relay.closeAll(1011);
-    await waitUntil(() => relay.of("agent.hello").length === 2);
+    await waitUntil(() => conn!.connected && relay.of("agent.hello").length === 2);
     conn!.send("agent.event", { seq: 1, note: "sent while relay is down" });
     await relay.stop();
     await waitUntil(() => !conn!.connected);
