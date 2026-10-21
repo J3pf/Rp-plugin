@@ -47,8 +47,8 @@ Branch: `main` | Status: in_progress
 - T2 (S2) [inline] Add missing tests for new behavior (launchers, transcript activity timestamp, slash command output capture, no fake timestamps on initial poll): done (123e95d)
 - T3 (S3) [inline] Protocol compatibility: verify messages emitted by host with relay main (e161067) and Rp-app main: done
 - T4 (S4) [inline] Quality gate: lint, typecheck, build, unit tests, serial e2e, npm outdated, npm audit --omit=dev: done (d516764)
-- T5 (S5) [inline] Bump 0.2.8 everywhere, author English CHANGELOG and release notes crediting Luis, test isolated scratch HOME install: in_progress
-- T6 (S1-S5) [inline] Final verification and report "[PLUGIN 0.2.8 — READY FOR REVIEW]": pending
+- T5 (S5) [inline] Bump 0.2.8 everywhere, author English CHANGELOG and release notes crediting Luis, test isolated scratch HOME install: done (12e2421)
+- T6 (S1-S5) [inline] Final verification and report "[PLUGIN 0.2.8 — READY FOR REVIEW]": done
 
 ## Log
 - L1: "si nada puede quedar fuera de la release"
