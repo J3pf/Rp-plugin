@@ -68,3 +68,7 @@ Branch: `main` | Status: in_progress
   - 10× unit suite runs under concurrent vitest load (Job 5): 10/10 runs passed with 0 failures (363 tests passed per run).
   - Serial E2E tests (Job 6): 3/3 test files passed, 21 passed (0 failed) in 176.96s.
   - Separate test commit: `d4255a1`.
+- L6: Orchestrator review feedback on d4255a1:
+  - Fixed production antipattern: `pollTranscriptNow()` wrapped in `try/catch` logging to `this.d.onLog`, returning a Promise that never rejects. All 5 internal callers explicitly use `void this.pollTranscriptNow();` to eliminate floating promises and prevent unhandled rejections if `pollNewEvents` throws. Added RED test `it("does not produce an unhandled rejection if transcript reader throws during polling")` in `test/herdr-bridge.test.ts`. Commit `4d53a31`.
+  - Justified `connection.test.ts` 5s→10s bump: purely load tolerance under CPU starvation; reconnect backoff is 20ms, but added `mk({ wsFailuresBeforeLongPoll: 10 })` to prevent premature fallback to long-poll during the 60ms restart gap, and added `this.server.closeAllConnections?.()` in `FakeRelay.stop()` to eliminate lingering keep-alive sockets.
+  - 10× unit suite runs (Job 12): 10/10 consecutive runs passed with 0 failures (364 tests passed per run).
