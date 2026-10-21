@@ -1,6 +1,6 @@
 {
   "name": "@j3pf/pi-rp",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Pi package: connects Pi sessions to the RP relay (mobile monitoring, questions, authorizations).",
   "type": "module",
   "keywords": [

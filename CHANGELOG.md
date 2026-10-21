@@ -5,6 +5,49 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8] - 2026-10-21
+
+Special thanks to **Luis Eduardo Chacón Wilches** ([@lchaconw](https://github.com/lchaconw)) for core architecture and implementation of the Herdr agent bridge, Antigravity CLI transcript bridge, PreToolUse permission gate, and Claude/Codex launcher integrations.
+
+### Added
+- **Herdr non-Pi agent bridge (`src/host/herdr-bridge.ts`)**:
+  - Automatically discovers non-Pi agents (`agy`, `claude`, `codex`) running inside Herdr terminal panes and bridges them to Rp-relay.
+  - Proxies messages, prompts, and aborts (Escape + Ctrl-C) to Herdr panes without stealing focus.
+  - Periodic polling of Herdr pane output with ANSI escape code stripping, extracting recent command output and settling agent status when terminal slash commands complete.
+- **Antigravity CLI (`agy`) transcript reader (`src/host/agy-transcript.ts`)**:
+  - Real-time incremental streaming reader for Antigravity `transcript.jsonl` and `transcript_full.jsonl`.
+  - Normalizes protojson tool calls (`run_command` -> `bash`, `view_file` -> `read`, `write_to_file` -> `write`, `replace_file_content` -> `edit`, `invoke_subagent` -> `subagent_run`) to canonical Rp-app tool cards.
+  - File watcher (`fs.watch`) on transcript directories with debouncing for immediate change notification.
+  - Extracts conversation topics from user requests and appends them to session display titles.
+  - Preserves exact transcript activity timestamps (`lastActivityAt`) to keep mobile last seen times synchronized without fake timestamps.
+- **PreToolUse permission gate (`rp-host agy-hook PreToolUse`)**:
+  - Antigravity CLI PreToolUse hook integration via local IPC (Unix domain socket / Windows named pipe).
+  - Evaluates bash command safety against dangerous pattern filters; routes dangerous commands to mobile for approval (`ALLOW`, `ALLOW_SESSION`, `DENY`, `DENY_REASON`).
+  - Automated hook registration in `~/.gemini/config/hooks.json` via `rp-host install`.
+- **Expanded launchers**:
+  - Added `agy`, `claude`, and `codex` to default launchers in `host.json`, allowing the mobile app to launch non-Pi agents.
+
+### Fixed
+- **PreToolUse security hardening**:
+  - Enforced fail-closed behavior across all gate endpoints: malformed JSON, unparseable arguments, missing session IDs, or socket errors reject/prompt in terminal (`decision: "ask"`), eliminating fail-open auto-approve bypasses.
+  - Cross-OS path quoting in `installAgyHooks` for Windows (`win32`), using double quotes to handle paths with spaces.
+  - Bounded `readStdinText` in `rp-host agy-hook` to 2MB to prevent memory exhaustion DoS.
+- **Resource lifecycle and leak prevention**:
+  - Tracked and cleanly destroyed active client sockets connected to `gateServer` upon `bridge.stop()`.
+  - Cleared slash command fallback timers and unref'd timeout handles upon session disposal.
+  - Avoided synthetic `Date.now()` timestamps on initial terminal snapshot, deferring `message_end` until actual command execution.
+
+### Installation
+```bash
+# Standard Pi (~/.pi/agent)
+pi install git:github.com/J3pf/Rp-plugin@v0.2.8
+
+# gentle-shell (~/.gentle-shell/agent)
+gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.8
+```
+
+---
+
 ## [0.2.7] - 2026-10-19
 
 > **Note on v0.2.6:** Tag `v0.2.6` was created on git commit `d11ff11` without an associated GitHub release. Release `v0.2.7` encompasses all improvements from `v0.2.6` along with subsequent stability, performance, and security enhancements.

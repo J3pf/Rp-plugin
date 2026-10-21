@@ -19,25 +19,25 @@ Guía práctica y completa para instalar, emparejar y operar `@j3pf/pi-rp` en cu
 
 ```bash
 # Para Pi estándar (~/.pi/agent)
-pi install git:github.com/J3pf/Rp-plugin@v0.2.7
+pi install git:github.com/J3pf/Rp-plugin@v0.2.8
 
 # Para gentle-shell (~/.gentle-shell/agent) — verificado: gentle-shell reenvía la fuente git: a su home aislado
-gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.7
+gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.8
 ```
 
 ### Método B: Desde Tarball de la Release (Alternativa Offline)
-Pi registra la ruta local donde reside el paquete. Para evitar que la instalación quede huérfana si se borran directorios temporales o de descargas, descomprime el tarball en una carpeta permanente del agente (por ejemplo `~/.pi/agent/packages/j3pf-pi-rp-0.2.7`):
+Pi registra la ruta local donde reside el paquete. Para evitar que la instalación quede huérfana si se borran directorios temporales o de descargas, descomprime el tarball en una carpeta permanente del agente (por ejemplo `~/.pi/agent/packages/j3pf-pi-rp-0.2.8`):
 
 ```bash
 # 1. Crear carpeta permanente y descomprimir el tarball de la release
-mkdir -p ~/.pi/agent/packages/j3pf-pi-rp-0.2.7
-tar -xzf j3pf-pi-rp-0.2.7.tgz -C ~/.pi/agent/packages/j3pf-pi-rp-0.2.7 --strip-components=1
+mkdir -p ~/.pi/agent/packages/j3pf-pi-rp-0.2.8
+tar -xzf j3pf-pi-rp-0.2.8.tgz -C ~/.pi/agent/packages/j3pf-pi-rp-0.2.8 --strip-components=1
 
 # 2. Instalar dependencias de producción
-cd ~/.pi/agent/packages/j3pf-pi-rp-0.2.7 && npm install --omit=dev
+cd ~/.pi/agent/packages/j3pf-pi-rp-0.2.8 && npm install --omit=dev
 
 # 3. Registrar el paquete en Pi desde la carpeta del agente
-cd ~/.pi/agent && pi install ./packages/j3pf-pi-rp-0.2.7
+cd ~/.pi/agent && pi install ./packages/j3pf-pi-rp-0.2.8
 ```
 
 ### Método C: Desde Código Fuente (Desarrollo / Clon Local)
@@ -61,10 +61,10 @@ pi install .
 `pi install` actualiza el clon en el directorio del agente, hace checkout del nuevo tag y actualiza la entrada en `settings.json` automáticamente:
 ```bash
 # Para Pi estándar
-pi install git:github.com/J3pf/Rp-plugin@v0.2.7
+pi install git:github.com/J3pf/Rp-plugin@v0.2.8
 
 # Para gentle-shell
-gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.7
+gentle-shell install git:github.com/J3pf/Rp-plugin@v0.2.8
 
 # Verificar que la versión activa sea la nueva
 pi list
@@ -75,7 +75,7 @@ pi list
 `pi remove` aplica únicamente para limpiar entradas locales anteriores y evitar que ambas versiones carguen simultáneamente:
 1. **Instala la nueva versión primero** (de este modo una falla de red o de instalación nunca deja el entorno sin plugin):
    ```bash
-   pi install git:github.com/J3pf/Rp-plugin@v0.2.7
+   pi install git:github.com/J3pf/Rp-plugin@v0.2.8
    ```
 2. **Revisa las fuentes instaladas con `pi list` y elimina la ruta local anterior situándote en `~/.pi/agent`**:
    ```bash
