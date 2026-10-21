@@ -317,6 +317,16 @@ describe("HostManager", () => {
     await expect(mgr.spawn({ cwd: path.join(root, "proj"), sessionId: "bad; rm -rf /" })).rejects.toThrow(/invalid sessionId/);
     await mgr.kill(rec.spawnId);
   });
+  it("resolves and spawns agy, claude, and codex launchers", async () => {
+    const { mgr, f, root } = mk("linux", linuxTmux, { launchers: DEFAULT_HOST_CONFIG.launchers });
+    for (const launcher of ["agy", "claude", "codex"] as const) {
+      const rec = await mgr.spawn({ cwd: path.join(root, "proj"), launcher });
+      expect(rec.backend).toBe("tmux");
+      const lastCall = f.calls.filter((c) => c.args[0] === "new-session").at(-1);
+      expect(lastCall?.args.at(-1)).toBe(launcher);
+      await mgr.kill(rec.spawnId);
+    }
+  });
 });
 
 describe("HostConnection protocol", () => {

@@ -187,6 +187,36 @@ describe("agy-transcript", () => {
     expect(snap.entries[2]!.kind).toBe("tool_result");
     expect((snap.entries[2]!.msg as any).toolCallId).toBe("agy:1:0");
   });
+
+  it("computes getLastActivityAt from entries or mtime and attaches to snapshot", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-activity-"));
+    tmpDirs.push(dir);
+    const tPath = path.join(dir, "transcript.jsonl");
+
+    // File doesn't exist yet
+    const readerMissing = new AgyTranscriptReader(tPath);
+    expect(readerMissing.getLastActivityAt()).toBeNull();
+
+    // Empty file: falls back to stat mtime
+    fs.writeFileSync(tPath, "");
+    const stat = fs.statSync(tPath);
+    const readerEmpty = new AgyTranscriptReader(tPath);
+    expect(readerEmpty.getLastActivityAt()).toBe(Math.floor(stat.mtimeMs));
+
+    // File with entries: returns highest timestamp
+    const t1 = 1729000000000;
+    const t2 = 1729000050000;
+    const steps = [
+      { step_index: 0, type: "USER_INPUT", created_at: new Date(t1).toISOString(), content: "<USER_REQUEST>Hola</USER_REQUEST>" },
+      { step_index: 1, type: "PLANNER_RESPONSE", created_at: new Date(t2).toISOString(), content: "Mundo" },
+    ];
+    fs.writeFileSync(tPath, steps.map((s) => JSON.stringify(s)).join("\n") + "\n");
+    const readerWithEntries = new AgyTranscriptReader(tPath);
+    const snap = readerWithEntries.readSnapshot();
+    expect(snap.entries.length).toBe(2);
+    // created_at + step_index offset
+    expect(readerWithEntries.getLastActivityAt()).toBe(t2 + 1);
+  });
 });
 
 describe("herdr-bridge & PreToolUse gate", () => {
@@ -516,5 +546,190 @@ describe("herdr-bridge & PreToolUse gate", () => {
     expect(extractRecentCommandOutput(term, "/usage")).toBe("> /usage\n  Model: gemini-3.8-flash\n  Tokens: 120");
     expect(extractRecentCommandOutput(term, "/nonexistent")).toBe(term);
     expect(extractRecentCommandOutput(term)).toBe(term);
+  });
+
+  it("captures slash command output via pane fallback and settles without infinite thinking", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-slash-cmd-"));
+    tmpDirs.push(dir);
+    const sockPath = path.join(dir, "agy-gate.sock");
+    const transports = new Map<string, FakeTransport>();
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+
+    const runner = async (cmd: string, args: string[]) => {
+      calls.push({ cmd, args });
+      if (cmd === "herdr" && args[0] === "agent" && args[1] === "list") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            result: {
+              agents: [
+                {
+                  agent: "claude",
+                  pane_id: "wS:p2",
+                  cwd: dir,
+                  agent_status: "idle",
+                  state_change_seq: 1,
+                },
+              ],
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (cmd === "herdr" && args[0] === "pane" && args[1] === "read") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            result: {
+              text: "Previous logs\n> /usage\n  Claude 3.7 Sonnet: 450 tokens\n",
+            },
+          }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    };
+
+    const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+    const bridge = new HerdrAgentBridge({
+      relayUrl: "https://relay.example.com",
+      machineId: "M1",
+      token: "T1",
+      cfg,
+      herdrSession: null,
+      runner,
+      socketPath: sockPath,
+      pollIntervalMs: 60_000,
+      connectionFactory: (opts) =>
+        new Connection({
+          ...opts,
+          transportFactory: (_name, handlers) => {
+            const t = new FakeTransport("ws", handlers);
+            transports.set(opts.agentId, t);
+            return t;
+          },
+        }),
+    });
+
+    bridge.start();
+    try {
+      await bridge.poll();
+      const t = transports.get("M1:herdr:pane-wS:p2");
+      expect(t).toBeDefined();
+      t!.open();
+      t!.receive({ v: 1, id: "w1", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+
+      // Deliver slash command with asCommand: true
+      t!.receive({
+        v: 1,
+        id: "m2",
+        t: "user.message",
+        ts: Date.now(),
+        d: { clientMsgId: "c2", text: "/usage", asCommand: true },
+      });
+
+      // Verify immediate send-text + send-keys Enter and ack
+      await new Promise((r) => setTimeout(r, 40));
+      expect(calls).toContainEqual({ cmd: "herdr", args: ["pane", "send-text", "wS:p2", "/usage"] });
+      expect(calls).toContainEqual({ cmd: "herdr", args: ["pane", "send-keys", "wS:p2", "Enter"] });
+      expect(t!.sent.some((e) => e.t === "user.message.ack" && (e.d as any).disposition === "command")).toBe(true);
+
+      // Wait 900ms for the slash command fallback timer to fire
+      await new Promise((r) => setTimeout(r, 900));
+
+      // Should have polled pane and emitted message_end with snippet and settled
+      const msgEnd = t!.sent.find((e) => e.t === "agent.event" && (e.d as any).e?.type === "message_end");
+      expect(msgEnd).toBeDefined();
+      const content = ((msgEnd!.d as any).e.message.content[0] as any).text;
+      expect(content).toContain("> /usage\n  Claude 3.7 Sonnet: 450 tokens");
+
+      const settled = t!.sent.find((e) => e.t === "agent.event" && (e.d as any).e?.type === "agent_settled");
+      expect(settled).toBeDefined();
+    } finally {
+      bridge.stop();
+    }
+  });
+
+  it("avoids fake timestamps on initial terminal snapshot and defers message_end on initial poll", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-no-fake-ts-"));
+    tmpDirs.push(dir);
+    const sockPath = path.join(dir, "agy-gate.sock");
+    const transports = new Map<string, FakeTransport>();
+
+    const runner = async (cmd: string, args: string[]) => {
+      if (cmd === "herdr" && args[0] === "agent" && args[1] === "list") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            result: {
+              agents: [
+                {
+                  agent: "codex",
+                  pane_id: "wS:p3",
+                  cwd: dir,
+                  agent_status: "idle",
+                  state_change_seq: 1,
+                },
+              ],
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (cmd === "herdr" && args[0] === "pane" && args[1] === "read") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ result: { text: "Existing terminal contents\n" } }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    };
+
+    const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+    const bridge = new HerdrAgentBridge({
+      relayUrl: "https://relay.example.com",
+      machineId: "M1",
+      token: "T1",
+      cfg,
+      herdrSession: null,
+      runner,
+      socketPath: sockPath,
+      pollIntervalMs: 60_000,
+      connectionFactory: (opts) =>
+        new Connection({
+          ...opts,
+          transportFactory: (_name, handlers) => {
+            const t = new FakeTransport("ws", handlers);
+            transports.set(opts.agentId, t);
+            return t;
+          },
+        }),
+    });
+
+    bridge.start();
+    try {
+      await bridge.poll();
+      const t = transports.get("M1:herdr:pane-wS:p3");
+      expect(t).toBeDefined();
+      t!.open();
+      t!.receive({ v: 1, id: "w1", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+
+      // The initial snapshot must NOT have fake timestamps or entries before any turn
+      const snapshotEnv = t!.sent.find((e) => e.t === "agent.snapshot");
+      expect(snapshotEnv).toBeDefined();
+      expect((snapshotEnv!.d as any).entries).toEqual([]);
+      expect((snapshotEnv!.d as any).lastActivityAt).toBeUndefined();
+
+      // Trigger poll now - initial poll must establish baseline without emitting message_end
+      const session = bridge.getActiveSessions()[0]!;
+      session.pollTranscriptNow();
+      await new Promise((r) => setTimeout(r, 40));
+
+      const initialMessageEnd = t!.sent.find((e) => e.t === "agent.event" && (e.d as any).e?.type === "message_end");
+      expect(initialMessageEnd).toBeUndefined();
+    } finally {
+      bridge.stop();
+    }
   });
 });
