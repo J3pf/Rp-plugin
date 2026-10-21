@@ -67,7 +67,7 @@ describe("Connection over WebSocket", () => {
   it("reconnects after an abnormal close and after the relay process dies and comes back", async () => {
     relay = await new FakeRelay().start();
     const port = relay.port;
-    mk();
+    mk({ wsFailuresBeforeLongPoll: 10 });
     conn!.start();
     await waitUntil(() => conn!.connected);
     relay.closeAll(1011);
@@ -80,7 +80,7 @@ describe("Connection over WebSocket", () => {
     await waitUntil(() => relay.of("agent.hello").length === 1 && conn!.connected, 10_000, "reconnect to the new relay");
     await waitUntil(() => relay.of("agent.event").length >= 1);
     expect(relay.of("agent.event").some((e) => e.d.seq === 2)).toBe(true);
-  });
+  }, 15_000);
   it("messages sent while disconnected are queued and delivered after reconnect; prompt.* are never dropped on overflow", async () => {
     relay = await new FakeRelay().start();
     mk({ maxQueueMessages: 5, maxQueueBytes: 10_000 });

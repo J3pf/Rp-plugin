@@ -281,11 +281,11 @@ export class BridgedAgentSession {
       if (this.effectiveStatus() === "working") {
         this.sendEvent({ type: "agent_start" });
       } else if (prevStatus === "working" && this.effectiveStatus() === "idle") {
-        this.pollTranscriptNow();
+        void this.pollTranscriptNow();
         this.sendEvent({ type: "agent_settled", aborted: false });
       }
     } else if (seqChanged) {
-      this.pollTranscriptNow();
+      void this.pollTranscriptNow();
     }
   }
 
@@ -393,7 +393,7 @@ export class BridgedAgentSession {
         if (this.watchDebounce) return;
         this.watchDebounce = setTimeout(() => {
           this.watchDebounce = null;
-          this.pollTranscriptNow();
+          void this.pollTranscriptNow();
         }, 150);
         this.watchDebounce.unref?.();
       });
@@ -415,7 +415,7 @@ export class BridgedAgentSession {
     if (this.pollTimer) clearTimeout(this.pollTimer);
     const delayMs = this.effectiveStatus() === "working" ? 900 : 4_500;
     this.pollTimer = setTimeout(() => {
-      this.pollTranscriptNow();
+      void this.pollTranscriptNow();
       this.scheduleNextPoll();
     }, delayMs);
     this.pollTimer.unref?.();
@@ -428,16 +428,20 @@ export class BridgedAgentSession {
 
   async pollTranscriptNow(): Promise<void> {
     if (this.disposed) return;
-    if (this.transcriptReader) {
-      if (!this.watcher) this.setupFileWatcher();
-      const events = this.transcriptReader.pollNewEvents();
-      for (const ev of events) {
-        this.sendEvent(ev);
+    try {
+      if (this.transcriptReader) {
+        if (!this.watcher) this.setupFileWatcher();
+        const events = this.transcriptReader.pollNewEvents();
+        for (const ev of events) {
+          this.sendEvent(ev);
+        }
+        if (events.length > 0) this.syncSessionNameIfChanged();
+        return;
       }
-      if (events.length > 0) this.syncSessionNameIfChanged();
-      return;
+      await this.pollPaneFallback();
+    } catch (e) {
+      this.d.onLog?.(`poll transcript error: ${errMsg(e)}`);
     }
-    await this.pollPaneFallback();
   }
 
   private async pollPaneFallback(commandText?: string): Promise<void> {
@@ -518,7 +522,7 @@ export class BridgedAgentSession {
       this.optimisticWorkingUntilMs = Date.now() + 8_000;
       this.syncStatus();
       this.sendEvent({ type: "agent_start" });
-      this.pollTranscriptNow();
+      void this.pollTranscriptNow();
     };
 
     const env = this.d.herdrSession ? { HERDR_SESSION: this.d.herdrSession } : {};

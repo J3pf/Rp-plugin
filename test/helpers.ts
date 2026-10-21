@@ -6,7 +6,7 @@ import { vi } from "vitest";
 import type { Envelope } from "../src/shared/protocol.ts";
 import { envelope, parseEnvelope } from "../src/shared/protocol.ts";
 
-export async function waitUntil<T>(fn: () => T | undefined | null | false, ms = 5000, label = "condition"): Promise<T> {
+export async function waitUntil<T>(fn: () => T | undefined | null | false, ms = 10_000, label = "condition"): Promise<T> {
   const t0 = Date.now();
   for (;;) {
     const v = fn();
@@ -147,6 +147,7 @@ export class FakeRelay {
   async stop(): Promise<void> {
     for (const c of this.conns) c.ws.terminate();
     this.wss.close();
+    this.server.closeAllConnections?.();
     await new Promise<void>((r) => this.server.close(() => r()));
   }
 

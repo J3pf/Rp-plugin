@@ -12,6 +12,7 @@ import {
   parseAgyArgs,
 } from "../src/host/agy-transcript.ts";
 import {
+  BridgedAgentSession,
   HerdrAgentBridge,
   extractRecentCommandOutput,
   installAgyHooks,
@@ -735,6 +736,63 @@ describe("herdr-bridge & PreToolUse gate", () => {
       expect(initialMessageEnd).toBeUndefined();
     } finally {
       bridge.stop();
+    }
+  });
+
+  it("does not produce an unhandled rejection if transcript reader throws during polling", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-throw-transcript-"));
+    tmpDirs.push(dir);
+
+    let unhandled: any = null;
+    const onUnhandled = (reason: any) => {
+      unhandled = reason;
+    };
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+      const logs: string[] = [];
+      const session = new BridgedAgentSession(
+        {
+          agent: "agy",
+          sessionId: "conv-throw",
+          status: "idle",
+          cwd: dir,
+          paneId: "wS:p9",
+          tabId: null,
+          workspaceId: null,
+          title: null,
+          stateChangeSeq: 1,
+        },
+        {
+          relayUrl: "https://relay.example.com",
+          machineId: "M1",
+          token: "T1",
+          cfg,
+          herdrSession: null,
+          runner: async () => ({ code: 0, stdout: "{}", stderr: "" }),
+          onLog: (m) => logs.push(m),
+        },
+      );
+
+      const brokenReader = (session as any).transcriptReader;
+      brokenReader.pollNewEvents = () => {
+        throw new Error("simulated disk error in pollNewEvents");
+      };
+
+      // Call pollTranscriptNow() without await
+      session.pollTranscriptNow();
+
+      // Give event loop ticks to see if unhandledRejection is triggered
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(unhandled).toBeNull();
+      expect(logs.some((l) => l.includes("simulated disk error"))).toBe(true);
+
+      session.stop();
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
     }
   });
 });

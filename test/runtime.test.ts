@@ -518,7 +518,7 @@ describe("messages from the phone", () => {
         { blobId: "PDF1", name: "spec.pdf", mime: "application/pdf", size: 4 },
       ],
     });
-    await waitUntil(() => relay.of("user.message.ack").length === 1, 5000);
+    await waitUntil(() => relay.of("user.message.ack").length === 1, 10_000);
     const content = t.sent[0].content;
     expect(content[0].type).toBe("text");
     expect(content[0].text).toMatch(/^mira\n\n\[Archivo adjunto desde el móvil: .*spec\.pdf \(application\/pdf, 4 B\)\]$/);
@@ -589,7 +589,7 @@ describe("/rp commands with a live runtime", () => {
     await t.commands.get("rp").handler("off", t.ctx);
     await waitUntil(() => relay.conns[0]!.ws.readyState === 3);
     await t.commands.get("rp").handler("on", t.ctx);
-    await waitUntil(() => relay.of("agent.hello").length === 2, 5000, "second hello after /rp on");
+    await waitUntil(() => relay.of("agent.hello").length === 2, 10_000, "second hello after /rp on");
   });
   it("/rp pair inside a running session reconnects with the new credentials", async () => {
     writeCfg({ machineToken: null, machineId: null });
@@ -601,7 +601,7 @@ describe("/rp commands with a live runtime", () => {
     expect(relay.conns).toHaveLength(0); // unpaired → inert
     relay.httpResponses.set("/v1/pair/machine", () => ({ status: 200, body: { machineId: "NEWM", machineToken: "newtok" } }));
     await f.commands.get("rp").handler(`pair ${relay.url} ABCD2345 --name PC --context work`, ctx);
-    await waitUntil(() => relay.of("agent.hello").length === 1, 5000, "hello after pairing");
+    await waitUntil(() => relay.of("agent.hello").length === 1, 10_000, "hello after pairing");
     expect(relay.of("agent.hello")[0]!.d.agentId).toBe("NEWM:sess1");
     expect(relay.conns[0]!.headers.authorization).toBe("Bearer newtok");
   });

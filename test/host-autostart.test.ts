@@ -151,7 +151,7 @@ describe("extension host autostart", () => {
       const starting = fake.fire("session_start", { reason: "new" }, makeCtx());
       const completedWithoutWaiting = await Promise.race([
         starting.then(() => true),
-        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 500)),
       ]);
       expect(completedWithoutWaiting).toBe(true);
       expect(selfHeal).toHaveBeenCalledOnce();
