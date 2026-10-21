@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -432,6 +433,82 @@ describe("herdr-bridge & PreToolUse gate", () => {
         },
       ],
     });
+
+    // Test Windows quoting
+    const winPath = installAgyHooks("C:\\Program Files\\nodejs\\node.exe", "C:\\opt\\rp\\bin\\rp-host.mjs", dir, "win32");
+    const winContent = JSON.parse(fs.readFileSync(winPath, "utf8"));
+    expect(winContent["rp-gate"].PreToolUse[0].hooks[0].command).toBe(
+      '"C:\\Program Files\\nodejs\\node.exe" "C:\\opt\\rp\\bin\\rp-host.mjs" agy-hook PreToolUse',
+    );
+  });
+
+  it("fails closed on malformed input, missing command, or broken socket request", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-bridge-failclose-"));
+    tmpDirs.push(dir);
+    const sockPath = path.join(dir, "agy-gate.sock");
+    const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+
+    // Malformed JSON stdin to runAgyHook fails closed
+    const badJsonRes = await runAgyHook(cfg, "not valid json {", sockPath);
+    expect(badJsonRes.decision).toBe("ask");
+
+    // run_command with empty / unparseable command fails closed
+    const emptyCmdRes = await runAgyHook(
+      cfg,
+      JSON.stringify({
+        conversationId: "conv-fail",
+        toolCall: { name: "run_command", args: {} },
+      }),
+      sockPath,
+    );
+    expect(emptyCmdRes.decision).toBe("ask");
+
+    // Start a bridge to test socket fail-closed behavior
+    const bridge = new HerdrAgentBridge({
+      relayUrl: "https://relay.example.com",
+      machineId: "M1",
+      token: "T1",
+      cfg,
+      herdrSession: null,
+      runner: async () => ({ code: 0, stdout: '{"result":{"agents":[]}}', stderr: "" }),
+      socketPath: sockPath,
+      pollIntervalMs: 60_000,
+    });
+    bridge.start();
+
+    try {
+      // Connect directly to the gate socket and send malformed line
+      const client = net.createConnection(sockPath);
+      const respPromise = new Promise<any>((resolve) => {
+        let buf = "";
+        client.on("data", (chunk) => {
+          buf += chunk.toString("utf8");
+          const nl = buf.indexOf("\n");
+          if (nl >= 0) resolve(JSON.parse(buf.slice(0, nl).trim()));
+        });
+      });
+      client.write("broken json line\n");
+      const resp = await respPromise;
+      expect(resp.decision).toBe("ask");
+      client.destroy();
+
+      // Send JSON missing conversationId or command
+      const client2 = net.createConnection(sockPath);
+      const respPromise2 = new Promise<any>((resolve) => {
+        let buf = "";
+        client2.on("data", (chunk) => {
+          buf += chunk.toString("utf8");
+          const nl = buf.indexOf("\n");
+          if (nl >= 0) resolve(JSON.parse(buf.slice(0, nl).trim()));
+        });
+      });
+      client2.write(JSON.stringify({ conversationId: "", command: "" }) + "\n");
+      const resp2 = await respPromise2;
+      expect(resp2.decision).toBe("ask");
+      client2.destroy();
+    } finally {
+      bridge.stop();
+    }
   });
 
   it("extractRecentCommandOutput returns snippet from last command occurrence", () => {

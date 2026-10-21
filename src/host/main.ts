@@ -22,10 +22,14 @@ Usage: rp-host <command>
 
 Requires the PC to be paired first (/rp pair inside Pi). Config: host.json next to RP's config.json.`;
 
-async function readStdinText(): Promise<string> {
+async function readStdinText(maxBytes = 2 * 1024 * 1024): Promise<string> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of process.stdin) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    total += buf.length;
+    chunks.push(buf);
+    if (total >= maxBytes) break;
   }
   return Buffer.concat(chunks).toString("utf8");
 }

@@ -163,6 +163,7 @@ export class BridgedAgentSession {
   private currentStatus: AgentStatus;
   private optimisticWorkingUntilMs = 0;
   private fallbackTurnTs = 0;
+  private commandTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private info: HerdrDiscoveredAgent,
@@ -540,7 +541,9 @@ export class BridgedAgentSession {
         // Local TUI commands (e.g. /usage, /statusline, /help) execute directly in the CLI terminal
         // without creating entries in transcript.jsonl. If no transcript events arrive within 800ms,
         // read the output directly from the pane and settle so the mobile chat displays the result.
-        setTimeout(async () => {
+        if (this.commandTimer) clearTimeout(this.commandTimer);
+        this.commandTimer = setTimeout(async () => {
+          this.commandTimer = null;
           if (this.disposed) return;
           if (this.transcriptReader) {
             const events = this.transcriptReader.pollNewEvents();
@@ -557,6 +560,7 @@ export class BridgedAgentSession {
             this.sendEvent({ type: "agent_settled", aborted: false });
           }
         }, 800);
+        this.commandTimer.unref?.();
       }
       return;
     } catch {
@@ -583,6 +587,7 @@ export class BridgedAgentSession {
     key: string;
     signal: AbortSignal;
   }): Promise<{ decision: "allow" | "deny" | "ask"; reason?: string }> {
+    if (this.disposed) return { decision: "ask", reason: "RP: sesión cerrada; confirmar en terminal" };
     if (this.allowed.has(req.key)) return { decision: "allow" };
     if (this.conn.state !== "connected") {
       return { decision: "ask", reason: "RP: sin conexión al relay; confirmar en terminal" };
@@ -590,55 +595,59 @@ export class BridgedAgentSession {
 
     const summary = req.command.length > 120 ? req.command.slice(0, 119) + "…" : req.command;
     const title = `⚠ ${req.toolName}: ${summary}`;
-    const choice = await promptContext.run(
-      {
-        category: "permission",
-        danger: req.danger,
-        tool: { name: req.toolName, args: { command: req.command } },
-        message: req.command,
-        source: { extension: "rp", tool: "agy-gate" },
-      },
-      () =>
-        this.broker.race<string | undefined>(
-          {
-            kind: "select",
-            title,
-            options: [ALLOW, ALLOW_SESSION, DENY, DENY_REASON],
-            opts: { timeout: 270_000, signal: req.signal },
-          },
-          null,
-        ),
-    );
-
-    if (choice === ALLOW) return { decision: "allow" };
-    if (choice === ALLOW_SESSION) {
-      this.allowed.add(req.key);
-      return { decision: "allow" };
-    }
-    if (choice === DENY_REASON) {
-      const reason = await promptContext.run(
-        { category: "question", danger: "low", source: { extension: "rp", tool: "agy-gate" } },
+    try {
+      const choice = await promptContext.run(
+        {
+          category: "permission",
+          danger: req.danger,
+          tool: { name: req.toolName, args: { command: req.command } },
+          message: req.command,
+          source: { extension: "rp", tool: "agy-gate" },
+        },
         () =>
           this.broker.race<string | undefined>(
             {
-              kind: "input",
-              title: "Motivo de la denegación",
-              placeholder: "Explica por qué se deniega",
-              opts: { timeout: 60_000, signal: req.signal },
+              kind: "select",
+              title,
+              options: [ALLOW, ALLOW_SESSION, DENY, DENY_REASON],
+              opts: { timeout: 270_000, signal: req.signal },
             },
             null,
           ),
       );
-      return {
-        decision: "deny",
-        reason: reason?.trim() ? `Denegado desde RP móvil: ${reason.trim()}` : "Denegado desde RP móvil",
-      };
+
+      if (choice === ALLOW) return { decision: "allow" };
+      if (choice === ALLOW_SESSION) {
+        this.allowed.add(req.key);
+        return { decision: "allow" };
+      }
+      if (choice === DENY_REASON) {
+        const reason = await promptContext.run(
+          { category: "question", danger: "low", source: { extension: "rp", tool: "agy-gate" } },
+          () =>
+            this.broker.race<string | undefined>(
+              {
+                kind: "input",
+                title: "Motivo de la denegación",
+                placeholder: "Explica por qué se deniega",
+                opts: { timeout: 60_000, signal: req.signal },
+              },
+              null,
+            ),
+        );
+        return {
+          decision: "deny",
+          reason: reason?.trim() ? `Denegado desde RP móvil: ${reason.trim()}` : "Denegado desde RP móvil",
+        };
+      }
+      if (choice === DENY) {
+        return { decision: "deny", reason: "Denegado desde RP móvil" };
+      }
+      // Timeout or cancelled: let agy ask in terminal
+      return { decision: "ask", reason: "RP: sin respuesta en móvil; confirmar en terminal" };
+    } catch (e) {
+      return { decision: "ask", reason: `RP: error procesando autorización (${errMsg(e)}); confirmar en terminal` };
     }
-    if (choice === DENY) {
-      return { decision: "deny", reason: "Denegado desde RP móvil" };
-    }
-    // Timeout or cancelled: let agy ask in terminal
-    return { decision: "ask", reason: "RP: sin respuesta en móvil; confirmar en terminal" };
   }
 
   private refreshGit(): Promise<void> {
@@ -663,6 +672,8 @@ export class BridgedAgentSession {
   stop(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.commandTimer) clearTimeout(this.commandTimer);
+    this.commandTimer = null;
     if (this.startTimer) clearTimeout(this.startTimer);
     this.startTimer = null;
     if (this.pollTimer) clearTimeout(this.pollTimer);
@@ -702,6 +713,7 @@ export class HerdrAgentBridge {
   private pollPromise: Promise<void> | null = null;
   private stopped = false;
   private gateServer: net.Server | null = null;
+  private clientSockets = new Set<net.Socket>();
   private runner: Runner;
   private sockPath: string;
 
@@ -730,6 +742,14 @@ export class HerdrAgentBridge {
       }
       this.gateServer = null;
     }
+    for (const socket of this.clientSockets) {
+      try {
+        socket.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.clientSockets.clear();
     if (process.platform !== "win32" && fs.existsSync(this.sockPath)) {
       try {
         fs.unlinkSync(this.sockPath);
@@ -833,9 +853,16 @@ export class HerdrAgentBridge {
         if (fs.existsSync(this.sockPath)) fs.unlinkSync(this.sockPath);
       }
       const server = net.createServer((socket) => {
+        this.clientSockets.add(socket);
         const ac = new AbortController();
-        socket.on("close", () => ac.abort());
-        socket.on("error", () => ac.abort());
+        socket.on("close", () => {
+          this.clientSockets.delete(socket);
+          ac.abort();
+        });
+        socket.on("error", () => {
+          this.clientSockets.delete(socket);
+          ac.abort();
+        });
 
         let buf = "";
         socket.on("data", (chunk) => {
@@ -876,11 +903,13 @@ export class HerdrAgentBridge {
     try {
       req = JSON.parse(rawLine);
     } catch {
-      return { decision: "allow" };
+      return { decision: "ask", reason: "RP: solicitud de autorización inválida (JSON malformado)" };
     }
     const conversationId = typeof req?.conversationId === "string" ? req.conversationId : "";
     const command = typeof req?.command === "string" ? req.command : "";
-    if (!conversationId || !command) return { decision: "allow" };
+    if (!conversationId || !command) {
+      return { decision: "ask", reason: "RP: solicitud de autorización incompleta" };
+    }
 
     const key = sanitizeIdPart(conversationId);
     let session = this.sessionsByKey.get(key);
@@ -913,13 +942,17 @@ export class HerdrAgentBridge {
       this.sessionsByKey.set(key, session);
     }
 
-    return session.requestGateApproval({
-      toolName: "bash",
-      command,
-      danger: req.danger === "high" || req.danger === "medium" ? req.danger : "high",
-      key: typeof req.allowKey === "string" ? req.allowKey : `bash:${command}`,
-      signal,
-    });
+    try {
+      return await session.requestGateApproval({
+        toolName: "bash",
+        command,
+        danger: req.danger === "high" || req.danger === "medium" ? req.danger : "high",
+        key: typeof req.allowKey === "string" ? req.allowKey : `bash:${command}`,
+        signal,
+      });
+    } catch (e) {
+      return { decision: "ask", reason: `RP: error procesando autorización (${errMsg(e)}); confirmar en terminal` };
+    }
   }
 }
 
@@ -937,14 +970,14 @@ export async function runAgyHook(
   try {
     payload = JSON.parse(stdinText);
   } catch {
-    return { decision: "allow" };
+    return { decision: "ask", reason: "RP: entrada de hook inválida (JSON malformado)" };
   }
   const rawToolName = String(payload?.toolCall?.name ?? "");
   if (rawToolName !== "run_command") return { decision: "allow" };
 
   const args = parseAgyArgs(payload?.toolCall?.args ?? payload?.toolCall?.arguments);
-  const command = String(args.CommandLine ?? args.command ?? "").trim();
-  if (!command) return { decision: "allow" };
+  const command = String(args.CommandLine ?? args.command ?? args.commandLine ?? args.cmd ?? "").trim();
+  if (!command) return { decision: "ask", reason: "RP: comando no identificado; confirmar en terminal" };
 
   const mode = cfg.gate.mode === "auto-detect" ? "dangerous" : cfg.gate.mode;
   if (mode === "off") return { decision: "allow" };
@@ -1017,7 +1050,12 @@ export async function runAgyHook(
 }
 
 /** Install or update the rp-gate PreToolUse hook inside ~/.gemini/config/hooks.json without touching other hooks. */
-export function installAgyHooks(nodePath: string, scriptPath: string, home = os.homedir()): string {
+export function installAgyHooks(
+  nodePath: string,
+  scriptPath: string,
+  home = os.homedir(),
+  platform: NodeJS.Platform = process.platform,
+): string {
   const hooksFile = path.join(home, ".gemini", "config", "hooks.json");
   let current: Record<string, unknown> = {};
   try {
@@ -1027,6 +1065,10 @@ export function installAgyHooks(nodePath: string, scriptPath: string, home = os.
     current = {};
   }
 
+  const hookCommand = platform === "win32"
+    ? `"${nodePath.replace(/"/g, '""')}" "${scriptPath.replace(/"/g, '""')}" agy-hook PreToolUse`
+    : `'${nodePath.replace(/'/g, "'\\''")}' '${scriptPath.replace(/'/g, "'\\''")}' agy-hook PreToolUse`;
+
   current["rp-gate"] = {
     enabled: true,
     PreToolUse: [
@@ -1035,7 +1077,7 @@ export function installAgyHooks(nodePath: string, scriptPath: string, home = os.
         hooks: [
           {
             type: "command",
-            command: `'${nodePath.replace(/'/g, "'\\''")}' '${scriptPath.replace(/'/g, "'\\''")}' agy-hook PreToolUse`,
+            command: hookCommand,
             timeout: 300,
           },
         ],
