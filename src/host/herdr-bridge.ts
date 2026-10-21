@@ -426,7 +426,7 @@ export class BridgedAgentSession {
     this.scheduleNextPoll();
   }
 
-  pollTranscriptNow(): void {
+  async pollTranscriptNow(): Promise<void> {
     if (this.disposed) return;
     if (this.transcriptReader) {
       if (!this.watcher) this.setupFileWatcher();
@@ -437,7 +437,7 @@ export class BridgedAgentSession {
       if (events.length > 0) this.syncSessionNameIfChanged();
       return;
     }
-    void this.pollPaneFallback();
+    await this.pollPaneFallback();
   }
 
   private async pollPaneFallback(commandText?: string): Promise<void> {

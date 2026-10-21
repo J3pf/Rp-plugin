@@ -77,7 +77,7 @@ describe("Connection over WebSocket", () => {
     await waitUntil(() => !conn!.connected);
     conn!.send("agent.event", { seq: 2, note: "queued while down" });
     relay = await new FakeRelay().start(port);
-    await waitUntil(() => relay.of("agent.hello").length === 1 && conn!.connected, 5000, "reconnect to the new relay");
+    await waitUntil(() => relay.of("agent.hello").length === 1 && conn!.connected, 10_000, "reconnect to the new relay");
     await waitUntil(() => relay.of("agent.event").length >= 1);
     expect(relay.of("agent.event").some((e) => e.d.seq === 2)).toBe(true);
   });

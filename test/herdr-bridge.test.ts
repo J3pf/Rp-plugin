@@ -2,7 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG, type RpConfig } from "../src/extension/config.ts";
 import { ALLOW, ALLOW_SESSION, DENY } from "../src/extension/prompts/gate.ts";
 import {
@@ -354,9 +354,10 @@ describe("herdr-bridge & PreToolUse gate", () => {
         ts: Date.now(),
         d: { clientMsgId: "c1", text: "Hola agy" },
       });
-      await new Promise((r) => setTimeout(r, 30));
-      expect(calls).toContainEqual({ cmd: "herdr", args: ["agent", "prompt", "wS:p1", "Hola agy"] });
-      expect(t!.sent.some((e) => e.t === "user.message.ack" && (e.d as any).disposition === "typed")).toBe(true);
+      await vi.waitFor(() => {
+        expect(calls).toContainEqual({ cmd: "herdr", args: ["agent", "prompt", "wS:p1", "Hola agy"] });
+        expect(t!.sent.some((e) => e.t === "user.message.ack" && (e.d as any).disposition === "typed")).toBe(true);
+      }, { timeout: 3_000, interval: 10 });
 
       // Fast-path PreToolUse: safe command returns allow immediately
       const safeRes = await runAgyHook(
@@ -379,10 +380,12 @@ describe("herdr-bridge & PreToolUse gate", () => {
         sockPath,
       );
 
-      await new Promise((r) => setTimeout(r, 40));
-      const promptEnv = t!.sent.find((e) => e.t === "prompt.open");
-      expect(promptEnv).toBeDefined();
-      const promptId = (promptEnv!.d as any).promptId as string;
+      await vi.waitFor(() => {
+        const promptEnv = t!.sent.find((e) => e.t === "prompt.open");
+        expect(promptEnv).toBeDefined();
+      }, { timeout: 3_000, interval: 10 });
+      const promptEnv = t!.sent.find((e) => e.t === "prompt.open")!;
+      const promptId = (promptEnv.d as any).promptId as string;
 
       // Simulate user tapping "Permitir siempre en esta sesión" (option index "1" -> ALLOW_SESSION) on phone
       t!.receive({
@@ -416,9 +419,12 @@ describe("herdr-bridge & PreToolUse gate", () => {
         }),
         sockPath,
       );
-      await new Promise((r) => setTimeout(r, 40));
-      const denyPrompt = t!.sent.filter((e) => e.t === "prompt.open").at(-1);
-      expect(denyPrompt).toBeDefined();
+      await vi.waitFor(() => {
+        const denyPrompt = t!.sent.filter((e) => e.t === "prompt.open").at(-1);
+        expect(denyPrompt).toBeDefined();
+        expect((denyPrompt!.d as any).promptId).not.toBe(promptId);
+      }, { timeout: 3_000, interval: 10 });
+      const denyPrompt = t!.sent.filter((e) => e.t === "prompt.open").at(-1)!;
       t!.receive({
         v: 1,
         id: "pa2",
@@ -629,22 +635,22 @@ describe("herdr-bridge & PreToolUse gate", () => {
       });
 
       // Verify immediate send-text + send-keys Enter and ack
-      await new Promise((r) => setTimeout(r, 40));
-      expect(calls).toContainEqual({ cmd: "herdr", args: ["pane", "send-text", "wS:p2", "/usage"] });
-      expect(calls).toContainEqual({ cmd: "herdr", args: ["pane", "send-keys", "wS:p2", "Enter"] });
-      expect(t!.sent.some((e) => e.t === "user.message.ack" && (e.d as any).disposition === "command")).toBe(true);
+      await vi.waitFor(() => {
+        expect(calls).toContainEqual({ cmd: "herdr", args: ["pane", "send-text", "wS:p2", "/usage"] });
+        expect(calls).toContainEqual({ cmd: "herdr", args: ["pane", "send-keys", "wS:p2", "Enter"] });
+        expect(t!.sent.some((e) => e.t === "user.message.ack" && (e.d as any).disposition === "command")).toBe(true);
+      }, { timeout: 3_000, interval: 10 });
 
-      // Wait 900ms for the slash command fallback timer to fire
-      await new Promise((r) => setTimeout(r, 900));
+      // Wait for the slash command fallback timer to fire and settle
+      await vi.waitFor(() => {
+        const msgEnd = t!.sent.find((e) => e.t === "agent.event" && (e.d as any).e?.type === "message_end");
+        expect(msgEnd).toBeDefined();
+        const content = ((msgEnd!.d as any).e.message.content[0] as any).text;
+        expect(content).toContain("> /usage\n  Claude 3.7 Sonnet: 450 tokens");
 
-      // Should have polled pane and emitted message_end with snippet and settled
-      const msgEnd = t!.sent.find((e) => e.t === "agent.event" && (e.d as any).e?.type === "message_end");
-      expect(msgEnd).toBeDefined();
-      const content = ((msgEnd!.d as any).e.message.content[0] as any).text;
-      expect(content).toContain("> /usage\n  Claude 3.7 Sonnet: 450 tokens");
-
-      const settled = t!.sent.find((e) => e.t === "agent.event" && (e.d as any).e?.type === "agent_settled");
-      expect(settled).toBeDefined();
+        const settled = t!.sent.find((e) => e.t === "agent.event" && (e.d as any).e?.type === "agent_settled");
+        expect(settled).toBeDefined();
+      }, { timeout: 4_000, interval: 25 });
     } finally {
       bridge.stop();
     }
@@ -723,8 +729,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
 
       // Trigger poll now - initial poll must establish baseline without emitting message_end
       const session = bridge.getActiveSessions()[0]!;
-      session.pollTranscriptNow();
-      await new Promise((r) => setTimeout(r, 40));
+      await session.pollTranscriptNow();
 
       const initialMessageEnd = t!.sent.find((e) => e.t === "agent.event" && (e.d as any).e?.type === "message_end");
       expect(initialMessageEnd).toBeUndefined();
