@@ -79,3 +79,9 @@ Branch: `main` | Status: in_progress
     - 100/100 consecutive runs of `reconnects after an abnormal close` passed with 0 failures (Job 15).
     - 10/10 consecutive full unit runs passed with 0 failures (Job 16, 364 tests per run).
     - Full serial E2E passed cleanly: 21/21 passed (Job 17, 118.06s).
+- L8: Publication evidence for v0.2.8:
+  - Main pushed to origin at `adcdf99a31078afc0de1f397189ca6a9816af36b`.
+  - Annotated tag `v0.2.8` created and pushed (`82efcc4ad3da5336d6ce059847ebc36df2881884`).
+  - Clean git archive asset `j3pf-pi-rp-0.2.8.tgz` packed; sha256: `1180edc631d62991c7ce2af2c73d502356a20221942ea798a972997d16a3f875`.
+  - GitHub release created: `https://github.com/J3pf/Rp-plugin/releases/tag/v0.2.8`.
+  - Verified: downloaded asset sha256 matched, and guarded scratch HOME install `pi install git:github.com/J3pf/Rp-plugin@v0.2.8` loaded cleanly.
