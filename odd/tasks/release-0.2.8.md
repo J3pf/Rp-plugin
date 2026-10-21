@@ -72,3 +72,10 @@ Branch: `main` | Status: in_progress
   - Fixed production antipattern: `pollTranscriptNow()` wrapped in `try/catch` logging to `this.d.onLog`, returning a Promise that never rejects. All 5 internal callers explicitly use `void this.pollTranscriptNow();` to eliminate floating promises and prevent unhandled rejections if `pollNewEvents` throws. Added RED test `it("does not produce an unhandled rejection if transcript reader throws during polling")` in `test/herdr-bridge.test.ts`. Commit `4d53a31`.
   - Justified `connection.test.ts` 5s→10s bump: purely load tolerance under CPU starvation; reconnect backoff is 20ms, but added `mk({ wsFailuresBeforeLongPoll: 10 })` to prevent premature fallback to long-poll during the 60ms restart gap, and added `this.server.closeAllConnections?.()` in `FakeRelay.stop()` to eliminate lingering keep-alive sockets.
   - 10× unit suite runs (Job 12): 10/10 consecutive runs passed with 0 failures (364 tests passed per run).
+- L7: Orchestrator review feedback on connection.test.ts failure on plain run 4:
+  - Root cause analysis: at line 75, `waitUntil(() => relay.of("agent.hello").length === 2)` only verified that Relay 1 received the second hello, but did not assert that `agent.welcome` arrived back at `conn`. Consequently, `conn.connected` was still false. When `relay.stop()` was invoked, `waitUntil(() => !conn!.connected)` satisfied immediately (0ms) rather than awaiting socket teardown. `conn` was still mid-reconnect with Relay 1, flushed queued events into Relay 1's terminating socket (which closed with 1006), and then reconnected to Relay 2 with an empty queue, starving line 81.
+  - Fix: `await waitUntil(() => conn!.connected && relay.of("agent.hello").length === 2);` ensures the full handshake completes before `relay.stop()`. Commit `aa46152`.
+  - Evidence:
+    - 100/100 consecutive runs of `reconnects after an abnormal close` passed with 0 failures (Job 15).
+    - 10/10 consecutive full unit runs passed with 0 failures (Job 16, 364 tests per run).
+    - Full serial E2E passed cleanly: 21/21 passed (Job 17, 118.06s).
