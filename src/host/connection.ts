@@ -7,6 +7,7 @@ import { backoffDelay, errMsg } from "../shared/util.ts";
 import type { HostConfig } from "./config.ts";
 import type { HostManager } from "./manager.ts";
 import { HostError, listDirs } from "./validate.ts";
+import { gitDiff, gitDiscard } from "./git.ts";
 
 export interface HostConnectionOptions {
   relayUrl: string;
@@ -192,6 +193,14 @@ export class HostConnection {
       switch (env.t) {
         case "host.list_dirs":
           return reply("host.dirs", listDirs(this.o.cfg, String(d.path ?? "")));
+        case "host.git_diff": {
+          const res = await gitDiff(this.o.cfg, String(d.cwd ?? ""), typeof d.path === "string" ? d.path : undefined);
+          return reply("host.git_diff.result", res);
+        }
+        case "host.git_discard": {
+          const res = await gitDiscard(this.o.cfg, String(d.cwd ?? ""), String(d.path ?? ""));
+          return reply("host.git_discard.result", res);
+        }
         case "host.herdr_layout":
           return reply("host.herdr_layout.result", await this.o.manager.herdrLayout());
         case "host.spawn": {

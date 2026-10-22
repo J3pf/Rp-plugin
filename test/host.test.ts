@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeHostConfig, writeDefaultHostConfig, DEFAULT_HOST_CONFIG } from "../src/host/config.ts";
 import { HostError, listDirs, resolveLauncher, resolveWithinRoots, sanitizeLabel, splitCommand, validateSpawnId } from "../src/host/validate.ts";
+import { gitDiff, gitDiscard } from "../src/host/git.ts";
 import { HerdrBackend, parseJson, pick, PANE_PATHS } from "../src/host/backends/herdr.ts";
 import { TmuxBackend, parseTmuxVersion, tmuxSupportsEnv, tmuxSessionName } from "../src/host/backends/tmux.ts";
 import { WindowsTerminalBackend, ConsoleBackend, wtArgs, consoleArgs, killScript } from "../src/host/backends/windows.ts";
@@ -941,6 +943,49 @@ Statut: Inconnu
       await expect(installService({ ...spec, home }, fakeRun({ systemctl: () => ({ code: 1, stderr: "no bus" }) }).run)).rejects.toThrow(/no bus/);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("computes diff and discards changes cleanly", async () => {
+    const dir = tmp();
+    try {
+      execSync("git init", { cwd: dir });
+      execSync('git config user.email "test@test.com" && git config user.name "Test"', { cwd: dir });
+      fs.writeFileSync(path.join(dir, "file.txt"), "hello\nworld\n");
+      execSync("git add file.txt && git commit -m initial", { cwd: dir });
+
+      const cfg = normalizeHostConfig({ roots: [dir] });
+
+      // Clean status
+      const diff1 = await gitDiff(cfg, dir);
+      expect(diff1.files.length).toBe(0);
+
+      // Modify tracked file
+      fs.writeFileSync(path.join(dir, "file.txt"), "hello\nnew world\n");
+      // Add untracked file
+      fs.writeFileSync(path.join(dir, "new.txt"), "fresh\n");
+
+      const diff2 = await gitDiff(cfg, dir);
+      expect(diff2.files.length).toBe(2);
+      const mod = diff2.files.find((f) => f.path === "file.txt");
+      expect(mod?.status).toBe("modified");
+      expect(mod?.patch).toContain("+new world");
+      const added = diff2.files.find((f) => f.path === "new.txt");
+      expect(added?.status).toBe("added");
+      expect(added?.patch).toContain("+fresh");
+
+      // Discard untracked
+      await gitDiscard(cfg, dir, "new.txt");
+      expect(fs.existsSync(path.join(dir, "new.txt"))).toBe(false);
+
+      // Discard modified
+      await gitDiscard(cfg, dir, "file.txt");
+      expect(fs.readFileSync(path.join(dir, "file.txt"), "utf8")).toBe("hello\nworld\n");
+
+      const cleanDiff = await gitDiff(cfg, dir);
+      expect(cleanDiff.files.length).toBe(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });
