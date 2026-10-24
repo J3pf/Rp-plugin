@@ -10,6 +10,7 @@ import {
   extractAgyUserText,
   normalizeAgyToolCall,
   parseAgyArgs,
+  resolveAgyTranscriptPath,
 } from "../src/host/agy-transcript.ts";
 import {
   BridgedAgentSession,
@@ -217,6 +218,14 @@ describe("agy-transcript", () => {
     expect(snap.entries.length).toBe(2);
     // created_at + step_index offset
     expect(readerWithEntries.getLastActivityAt()).toBe(t2 + 1);
+  });
+
+  it("rejects path traversal in resolveAgyTranscriptPath", () => {
+    expect(() => resolveAgyTranscriptPath("../etc/passwd", "/tmp/home")).toThrow(/invalid conversationId/);
+    expect(() => resolveAgyTranscriptPath("conv/../../secret", "/tmp/home")).toThrow(/invalid conversationId/);
+    expect(resolveAgyTranscriptPath("conv-123", "/tmp/home")).toBe(
+      path.join("/tmp/home", ".gemini", "antigravity-cli", "brain", "conv-123", ".system_generated", "logs", "transcript.jsonl"),
+    );
   });
 });
 
@@ -488,6 +497,27 @@ describe("herdr-bridge & PreToolUse gate", () => {
     // Malformed JSON stdin to runAgyHook fails closed
     const badJsonRes = await runAgyHook(cfg, "not valid json {", sockPath);
     expect(badJsonRes.decision).toBe("ask");
+
+    // Disabled config or gate.mode === "off" returns "ask" instead of auto-allowing run_command
+    const disabledRes = await runAgyHook(
+      { ...cfg, enabled: false },
+      JSON.stringify({
+        conversationId: "conv-disabled",
+        toolCall: { name: "run_command", args: { CommandLine: '"sudo rm -rf /tmp/test"' } },
+      }),
+      sockPath,
+    );
+    expect(disabledRes.decision).toBe("ask");
+
+    const offModeRes = await runAgyHook(
+      { ...cfg, gate: { ...cfg.gate, mode: "off" } },
+      JSON.stringify({
+        conversationId: "conv-off",
+        toolCall: { name: "run_command", args: { CommandLine: '"sudo rm -rf /tmp/test"' } },
+      }),
+      sockPath,
+    );
+    expect(offModeRes.decision).toBe("ask");
 
     // run_command with empty / unparseable command fails closed
     const emptyCmdRes = await runAgyHook(

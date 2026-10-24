@@ -7,6 +7,12 @@ import { SNAPSHOT_LIMIT } from "../extension/snapshot.ts";
 import { LIMITS } from "../extension/forwarder.ts";
 import type { SubagentUpdateEvent } from "../shared/protocol.ts";
 import { truncateBytes } from "../shared/util.ts";
+import { isInside } from "./validate.ts";
+
+const MAX_SUBAGENTS = 100;
+const MAX_POLL_DELTA_BYTES = 2 * 1024 * 1024;
+const MAX_REMAINDER_BYTES = 1024 * 1024;
+const SAFE_CONV_ID_RE = /^[0-9a-zA-Z_][0-9a-zA-Z_-]{0,127}$/;
 
 export interface AgyToolCallRaw {
   id?: string | null;
@@ -233,7 +239,15 @@ function stepTimestampMs(step: AgyStepRaw, stepIndex: number): number {
 
 /** Resolve the default path to an agy conversation's transcript.jsonl. */
 export function resolveAgyTranscriptPath(conversationId: string, home = os.homedir()): string {
-  return path.join(home, ".gemini", "antigravity-cli", "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
+  if (typeof conversationId !== "string" || !SAFE_CONV_ID_RE.test(conversationId)) {
+    throw new Error("invalid conversationId");
+  }
+  const brainRoot = path.resolve(home, ".gemini", "antigravity-cli", "brain");
+  const resolved = path.resolve(brainRoot, conversationId, ".system_generated", "logs", "transcript.jsonl");
+  if (!isInside(brainRoot, resolved)) {
+    throw new Error("transcript path escapes brain directory");
+  }
+  return resolved;
 }
 
 /** Read a specific step_index from transcript_full.jsonl when truncated_fields is present. */
@@ -241,6 +255,7 @@ function readFullStep(transcriptPath: string, stepIndex: number): AgyStepRaw | n
   const fullPath = path.join(path.dirname(transcriptPath), "transcript_full.jsonl");
   try {
     const stat = fs.statSync(fullPath);
+    if (!stat.isFile()) return null;
     const tailBytes = Math.min(stat.size, 512 * 1024);
     const fd = fs.openSync(fullPath, "r");
     try {
@@ -248,14 +263,15 @@ function readFullStep(transcriptPath: string, stepIndex: number): AgyStepRaw | n
       fs.readSync(fd, buf, 0, tailBytes, stat.size - tailBytes);
       const text = buf.toString("utf8");
       const lines = text.split("\n");
-      for (let i = lines.length - 1; i >= 0; i--) {
+      const minIdx = tailBytes < stat.size ? 1 : 0;
+      for (let i = lines.length - 1; i >= minIdx; i--) {
         const line = lines[i]!.trim();
         if (!line.startsWith("{")) continue;
         try {
           const parsed = JSON.parse(line) as AgyStepRaw;
           if (parsed.step_index === stepIndex) return parsed;
         } catch {
-          /* ignore partial first line */
+          /* ignore partial line */
         }
       }
     } finally {
@@ -369,6 +385,7 @@ export class AgyTranscriptReader {
     } catch {
       return [];
     }
+    if (!stat.isFile()) return [];
 
     // If file was truncated/replaced, reset state
     if (stat.size < this.offset) {
@@ -380,9 +397,17 @@ export class AgyTranscriptReader {
       this.subagents.clear();
     }
 
+    let midLineSeek = false;
     // On first read of a large file (>512 KB), seek to the last 512 KB so startup is fast and light
     if (this.offset === 0 && stat.size > 512 * 1024) {
       this.offset = stat.size - 512 * 1024;
+      this.remainder = "";
+      midLineSeek = true;
+    } else if (stat.size - this.offset > MAX_POLL_DELTA_BYTES) {
+      // Cap single-poll read size to prevent OOM on sudden multi-MB bursts
+      this.offset = stat.size - MAX_POLL_DELTA_BYTES;
+      this.remainder = "";
+      midLineSeek = true;
     }
 
     const deltaBytes = stat.size - this.offset;
@@ -401,6 +426,13 @@ export class AgyTranscriptReader {
 
     const lines = chunk.split("\n");
     this.remainder = lines.pop() ?? "";
+    if (Buffer.byteLength(this.remainder, "utf8") > MAX_REMAINDER_BYTES) {
+      this.remainder = "";
+    }
+    if (midLineSeek && lines.length > 0) {
+      // Discard first partial line after seeking into the middle of the file
+      lines.shift();
+    }
 
     const liveEvents: Record<string, unknown>[] = [];
     for (let li = 0; li < lines.length; li++) {
@@ -528,7 +560,7 @@ export class AgyTranscriptReader {
             startedAt: at,
             tools: [],
           };
-          this.subagents.set(norm.toolCallId, sub);
+          this.setSubagent(norm.toolCallId, sub);
           outEvents.push(sub as unknown as Record<string, unknown>);
         }
       }
@@ -574,9 +606,26 @@ export class AgyTranscriptReader {
               ? { error: truncateBytes(rawOut, 4096).text }
               : { result: truncateBytes(rawOut, 4096).text }),
         };
-        this.subagents.set(pending.toolCallId, finished);
+        this.setSubagent(pending.toolCallId, finished);
         outEvents.push(finished as unknown as Record<string, unknown>);
       }
+    }
+  }
+
+  private setSubagent(taskId: string, sub: SubagentUpdateEvent): void {
+    this.subagents.delete(taskId);
+    this.subagents.set(taskId, sub);
+    while (this.subagents.size > MAX_SUBAGENTS) {
+      let victim: string | undefined;
+      for (const [id, s] of this.subagents) {
+        if (s.status !== "running") {
+          victim = id;
+          break;
+        }
+      }
+      if (!victim) victim = this.subagents.keys().next().value;
+      if (!victim) break;
+      this.subagents.delete(victim);
     }
   }
 }

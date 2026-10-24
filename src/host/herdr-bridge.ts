@@ -12,7 +12,7 @@ import { relayBlobFetcher, resolveAttachments } from "../extension/attachments.t
 import { routeInbound, pendingAnswers } from "../extension/inbound.ts";
 import { Broker } from "../extension/prompts/broker.ts";
 import { Classifier, promptContext } from "../extension/prompts/classify.ts";
-import { ALLOW, ALLOW_SESSION, DENY, DENY_REASON, compilePatterns, decide } from "../extension/prompts/gate.ts";
+import { ALLOW, ALLOW_SESSION, DENY, DENY_REASON, allowKey, compilePatterns, decide } from "../extension/prompts/gate.ts";
 import { pluginVersion } from "../extension/version.ts";
 import { parseJson, pick } from "./backends/herdr.ts";
 import { run as realRun, type Runner } from "./runner.ts";
@@ -26,7 +26,7 @@ import {
   type UserMessageBody,
   type WelcomeBody,
 } from "../shared/protocol.ts";
-import { errMsg, truncateBytes } from "../shared/util.ts";
+import { LruSet, errMsg, safeUser, truncateBytes } from "../shared/util.ts";
 
 export interface HerdrDiscoveredAgent {
   agent: string;
@@ -82,12 +82,15 @@ export function parseHerdrAgentList(stdout: string): HerdrDiscoveredAgent[] {
     // Pi and gentle-shell sessions already connect via their native in-process Rp-plugin extension
     if (!agent || agent === "pi" || agent === "gentle-shell") continue;
     const paneId = pick(item, ["pane_id", "paneId"]);
-    if (!paneId) continue;
+    if (!paneId || paneId.startsWith("-")) continue;
     const title = pick(item, ["terminal_title_stripped", "terminal_title", "title"]);
     let sessionId = pick(item, ["agent_session.value", "session_id"]);
     if (!sessionId && title) {
       const m = CONV_RE.exec(title);
       if (m) sessionId = m[1]!;
+    }
+    if (sessionId && !/^[0-9a-zA-Z_][0-9a-zA-Z_-]{0,127}$/.test(sessionId)) {
+      sessionId = null;
     }
     const cwd = pick(item, ["foreground_cwd", "cwd"]) ?? process.cwd();
     const rawStatus = pick(item, ["agent_status", "status"]);
@@ -104,14 +107,6 @@ export function parseHerdrAgentList(stdout: string): HerdrDiscoveredAgent[] {
     });
   }
   return out;
-}
-
-function safeUser(): string {
-  try {
-    return os.userInfo().username;
-  } catch {
-    return process.env.USER || process.env.USERNAME || "unknown";
-  }
 }
 
 function sanitizeIdPart(raw: string): string {
@@ -143,7 +138,7 @@ export class BridgedAgentSession {
   readonly epoch = newId();
   readonly sessionKey: string;
   readonly agentId: string;
-  readonly allowed = new Set<string>();
+  readonly allowed = new LruSet(1000);
   readonly broker: Broker;
   readonly conn: Connection;
 
@@ -176,8 +171,13 @@ export class BridgedAgentSession {
     this.currentStatus = info.status;
 
     if (info.agent === "agy" && info.sessionId) {
-      const tPath = transcriptOverride ?? resolveAgyTranscriptPath(info.sessionId);
-      this.transcriptReader = new AgyTranscriptReader(tPath, () => this.d.cfg.redactContent);
+      try {
+        const canonical = resolveAgyTranscriptPath(info.sessionId);
+        const tPath = transcriptOverride && path.resolve(transcriptOverride) === canonical ? canonical : canonical;
+        this.transcriptReader = new AgyTranscriptReader(tPath, () => this.d.cfg.redactContent);
+      } catch {
+        this.transcriptReader = null;
+      }
     }
 
     this.broker = new Broker({
@@ -223,6 +223,7 @@ export class BridgedAgentSession {
   }
 
   private sessionDisplayName(): string {
+    if (this.d.cfg.redactContent) return "[redacted]";
     const base = path.basename(this.info.cwd || "") || this.info.paneId;
     const topic = this.transcriptReader?.getSessionTopic();
     if (topic) return `${base} · ${topic}`;
@@ -258,12 +259,14 @@ export class BridgedAgentSession {
     this.lastStateSeq = next.stateChangeSeq;
 
     if (!this.info.sessionId && next.sessionId && next.agent === "agy") {
-      this.info.sessionId = next.sessionId;
-      this.transcriptReader = new AgyTranscriptReader(
-        resolveAgyTranscriptPath(next.sessionId),
-        () => this.d.cfg.redactContent,
-      );
-      this.setupFileWatcher();
+      try {
+        const tPath = resolveAgyTranscriptPath(next.sessionId);
+        this.info.sessionId = next.sessionId;
+        this.transcriptReader = new AgyTranscriptReader(tPath, () => this.d.cfg.redactContent);
+        this.setupFileWatcher();
+      } catch {
+        /* ignore invalid sessionId */
+      }
     }
 
     if (next.status !== "idle") {
@@ -337,7 +340,7 @@ export class BridgedAgentSession {
 
   private sendSnapshot(direct: boolean): void {
     if (this.transcriptReader) {
-      const { entries, truncated } = this.transcriptReader.readSnapshot();
+      const { entries, truncated, events } = this.transcriptReader.readSnapshot();
       const lastActivityAt = this.transcriptReader.getLastActivityAt();
       const body = {
         epoch: this.epoch,
@@ -346,8 +349,17 @@ export class BridgedAgentSession {
         truncated,
         ...(lastActivityAt ? { lastActivityAt } : {}),
       };
-      if (direct) this.conn.sendDirect("agent.snapshot", body);
-      else this.conn.send("agent.snapshot", body);
+      if (direct) {
+        this.conn.sendDirect("agent.snapshot", body);
+        for (const ev of events) {
+          if (ev.type === "subagent_update") this.sendEvent(ev);
+        }
+      } else {
+        this.conn.send("agent.snapshot", body);
+        for (const ev of events) {
+          this.sendEvent(ev);
+        }
+      }
       this.syncSessionNameIfChanged();
       return;
     }
@@ -355,20 +367,21 @@ export class BridgedAgentSession {
     const body = {
       epoch: this.epoch,
       seq: this.seq,
-      entries: this.lastTerminalSnapshot && entryAt
-        ? [
-            {
-              eid: "pane:latest",
-              kind: "assistant" as const,
-              at: entryAt,
-              msg: {
-                role: "assistant",
-                timestamp: entryAt,
-                content: [{ type: "text", text: "```text\n" + this.lastTerminalSnapshot + "\n```" }],
+      entries:
+        !this.d.cfg.redactContent && this.lastTerminalSnapshot && entryAt
+          ? [
+              {
+                eid: "pane:latest",
+                kind: "assistant" as const,
+                at: entryAt,
+                msg: {
+                  role: "assistant",
+                  timestamp: entryAt,
+                  content: [{ type: "text", text: "```text\n" + this.lastTerminalSnapshot + "\n```" }],
+                },
               },
-            },
-          ]
-        : [],
+            ]
+          : [],
       truncated: false,
       ...(entryAt ? { lastActivityAt: entryAt } : {}),
     };
@@ -526,16 +539,20 @@ export class BridgedAgentSession {
     };
 
     const env = this.d.herdrSession ? { HERDR_SESSION: this.d.herdrSession } : {};
+    const textArgs = text.startsWith("-") ? ["--", text] : [text];
     try {
       if (!b.asCommand) {
-        const res = await this.d.runner("herdr", ["agent", "prompt", this.info.paneId, text], { timeoutMs: 10_000, env });
+        const res = await this.d.runner("herdr", ["agent", "prompt", this.info.paneId, ...textArgs], { timeoutMs: 10_000, env });
         if (res.code === 0) {
           markWorkingOnDelivery();
           return ack("delivered");
         }
+        if (/agent_blocked|blocked/i.test(`${res.stderr} ${res.stdout}`) || this.currentStatus === "waiting_input") {
+          return ack("rejected", "agent_blocked");
+        }
       }
       // Fallback (or slash command): send literal text + Enter directly to the Herdr pane
-      const sendRes = await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, text], { timeoutMs: 5_000, env });
+      const sendRes = await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, ...textArgs], { timeoutMs: 5_000, env });
       if (sendRes.code !== 0) return ack("rejected", "herdr_unavailable");
       await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 5_000, env });
       markWorkingOnDelivery();
@@ -593,19 +610,20 @@ export class BridgedAgentSession {
   }): Promise<{ decision: "allow" | "deny" | "ask"; reason?: string }> {
     if (this.disposed) return { decision: "ask", reason: "RP: sesión cerrada; confirmar en terminal" };
     if (this.allowed.has(req.key)) return { decision: "allow" };
-    if (this.conn.state !== "connected") {
+    if (!this.conn.connected && !(await this.conn.whenConnected(this.d.cfg.gate.approverWaitMs))) {
       return { decision: "ask", reason: "RP: sin conexión al relay; confirmar en terminal" };
     }
 
-    const summary = req.command.length > 120 ? req.command.slice(0, 119) + "…" : req.command;
+    const displayCmd = this.d.cfg.redactContent ? "[redacted]" : req.command;
+    const summary = displayCmd.length > 120 ? displayCmd.slice(0, 119) + "…" : displayCmd;
     const title = `⚠ ${req.toolName}: ${summary}`;
     try {
       const choice = await promptContext.run(
         {
           category: "permission",
           danger: req.danger,
-          tool: { name: req.toolName, args: { command: req.command } },
-          message: req.command,
+          tool: { name: req.toolName, args: this.d.cfg.redactContent ? { redacted: true } : { command: req.command } },
+          message: displayCmd,
           source: { extension: "rp", tool: "agy-gate" },
         },
         () =>
@@ -713,6 +731,7 @@ export interface HerdrBridgeOptions {
 export class HerdrAgentBridge {
   private sessionsByKey = new Map<string, BridgedAgentSession>();
   private missingPolls = new Map<string, number>();
+  private gateCreatedAt = new Map<string, number>();
   private pollTimer: NodeJS.Timeout | null = null;
   private pollPromise: Promise<void> | null = null;
   private stopped = false;
@@ -763,6 +782,8 @@ export class HerdrAgentBridge {
     }
     for (const s of this.sessionsByKey.values()) s.stop();
     this.sessionsByKey.clear();
+    this.missingPolls.clear();
+    this.gateCreatedAt.clear();
   }
 
   getActiveSessions(): BridgedAgentSession[] {
@@ -830,17 +851,26 @@ export class HerdrAgentBridge {
             connectionFactory: this.o.connectionFactory,
             startDelayMs,
           });
+          if (paneFallback) {
+            for (const k of paneFallback.allowed.keys()) session.allowed.add(k);
+          }
           this.sessionsByKey.set(key, session);
         }
       }
 
       for (const [key, session] of this.sessionsByKey.entries()) {
-        if (seenKeys.has(key)) continue;
+        if (seenKeys.has(key)) {
+          this.gateCreatedAt.delete(key);
+          continue;
+        }
+        const gateAge = Date.now() - (this.gateCreatedAt.get(key) ?? 0);
+        if (session.broker.openCount > 0 || gateAge < 30_000) continue;
         const misses = (this.missingPolls.get(key) ?? 0) + 1;
         if (misses >= 2) {
           session.stop();
           this.sessionsByKey.delete(key);
           this.missingPolls.delete(key);
+          this.gateCreatedAt.delete(key);
         } else {
           this.missingPolls.set(key, misses);
         }
@@ -853,12 +883,13 @@ export class HerdrAgentBridge {
   private startGateServer(): void {
     try {
       if (process.platform !== "win32") {
-        fs.mkdirSync(path.dirname(this.sockPath), { recursive: true });
+        fs.mkdirSync(path.dirname(this.sockPath), { recursive: true, mode: 0o700 });
         if (fs.existsSync(this.sockPath)) fs.unlinkSync(this.sockPath);
       }
       const server = net.createServer((socket) => {
         this.clientSockets.add(socket);
         const ac = new AbortController();
+        socket.setTimeout(300_000, () => socket.destroy());
         socket.on("close", () => {
           this.clientSockets.delete(socket);
           ac.abort();
@@ -870,6 +901,10 @@ export class HerdrAgentBridge {
 
         let buf = "";
         socket.on("data", (chunk) => {
+          if (buf.length + chunk.length > 256 * 1024) {
+            socket.destroy();
+            return;
+          }
           buf += chunk.toString("utf8");
           const nl = buf.indexOf("\n");
           if (nl < 0) return;
@@ -911,7 +946,7 @@ export class HerdrAgentBridge {
     }
     const conversationId = typeof req?.conversationId === "string" ? req.conversationId : "";
     const command = typeof req?.command === "string" ? req.command : "";
-    if (!conversationId || !command) {
+    if (!conversationId || !/^[0-9a-zA-Z_][0-9a-zA-Z_-]{0,127}$/.test(conversationId) || !command) {
       return { decision: "ask", reason: "RP: solicitud de autorización incompleta" };
     }
 
@@ -944,14 +979,20 @@ export class HerdrAgentBridge {
         typeof req.transcriptPath === "string" ? req.transcriptPath : undefined,
       );
       this.sessionsByKey.set(key, session);
+      this.gateCreatedAt.set(key, Date.now());
     }
+
+    const mode = this.o.cfg.gate.mode === "auto-detect" || this.o.cfg.gate.mode === "off" ? "dangerous" : this.o.cfg.gate.mode;
+    const dec = decide(mode, this.o.cfg.gate, compilePatterns(this.o.cfg.gate.dangerousPatterns), "bash", { command });
+    const serverDanger = dec.danger === "high" || req.danger === "high" ? "high" : req.danger === "medium" || dec.danger === "medium" ? "medium" : "high";
+    const serverKey = serverDanger === "high" ? `bash:${command.trim()}` : allowKey("bash", { command });
 
     try {
       return await session.requestGateApproval({
         toolName: "bash",
         command,
-        danger: req.danger === "high" || req.danger === "medium" ? req.danger : "high",
-        key: typeof req.allowKey === "string" ? req.allowKey : `bash:${command}`,
+        danger: serverDanger,
+        key: serverKey,
         signal,
       });
     } catch (e) {
@@ -969,7 +1010,7 @@ export async function runAgyHook(
   stdinText: string,
   sockPath = gateSocketPath(),
 ): Promise<{ decision: "allow" | "deny" | "ask"; reason?: string }> {
-  if (!cfg.enabled) return { decision: "allow" };
+  if (!cfg.enabled) return { decision: "ask" };
   let payload: any;
   try {
     payload = JSON.parse(stdinText);
@@ -984,7 +1025,7 @@ export async function runAgyHook(
   if (!command) return { decision: "ask", reason: "RP: comando no identificado; confirmar en terminal" };
 
   const mode = cfg.gate.mode === "auto-detect" ? "dangerous" : cfg.gate.mode;
-  if (mode === "off") return { decision: "allow" };
+  if (mode === "off") return { decision: "ask" };
 
   const patterns = compilePatterns(cfg.gate.dangerousPatterns);
   const dec = decide(mode, cfg.gate, patterns, "bash", { command });
@@ -1089,7 +1130,7 @@ export function installAgyHooks(
     ],
   };
 
-  fs.mkdirSync(path.dirname(hooksFile), { recursive: true });
-  fs.writeFileSync(hooksFile, JSON.stringify(current, null, 2) + "\n", { mode: 0o644 });
+  fs.mkdirSync(path.dirname(hooksFile), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(hooksFile, JSON.stringify(current, null, 2) + "\n", { mode: 0o600 });
   return hooksFile;
 }

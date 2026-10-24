@@ -83,6 +83,9 @@ export class LruSet {
   clear(): void {
     this.set.clear();
   }
+  keys(): IterableIterator<string> {
+    return this.set.keys();
+  }
   get size(): number {
     return this.set.size;
   }
