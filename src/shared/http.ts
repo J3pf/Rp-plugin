@@ -31,10 +31,16 @@ export interface HttpOptions {
   maxBytes?: number;
 }
 
+const DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+
 export async function httpRequest(url: string, opts: HttpOptions = {}): Promise<HttpResult> {
   const u = new URL(url);
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error(`Unsupported HTTP protocol: ${u.protocol}`);
+  }
   const lib = u.protocol === "https:" ? https : http;
   const agent = await getProxyAgent();
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
   const headers: Record<string, string> = { ...(opts.headers ?? {}) };
   let payload: Buffer | undefined;
   if (opts.body !== undefined) {
@@ -62,7 +68,7 @@ export async function httpRequest(url: string, opts: HttpOptions = {}): Promise<
         let size = 0;
         res.on("data", (c: Buffer) => {
           size += c.length;
-          if (opts.maxBytes && size > opts.maxBytes) {
+          if (maxBytes > 0 && size > maxBytes) {
             req.destroy(new Error("response too large"));
             return;
           }
@@ -104,12 +110,35 @@ export async function httpRequest(url: string, opts: HttpOptions = {}): Promise<
   });
 }
 
+function buildRelayEndpointUrl(relayUrl: string, targetPath: string, wantWs: boolean): string {
+  const u = new URL(relayUrl);
+  if (u.protocol !== "http:" && u.protocol !== "https:" && u.protocol !== "ws:" && u.protocol !== "wss:") {
+    throw new Error(`Unsupported relay URL protocol: ${u.protocol}`);
+  }
+  const secure = u.protocol === "https:" || u.protocol === "wss:";
+  u.protocol = wantWs ? (secure ? "wss:" : "ws:") : (secure ? "https:" : "http:");
+  u.search = "";
+  u.hash = "";
+  const basePath = u.pathname.replace(/\/+$/, "");
+  const qIdx = targetPath.indexOf("?");
+  const pathPart = qIdx >= 0 ? targetPath.slice(0, qIdx) : targetPath;
+  const queryPart = qIdx >= 0 ? targetPath.slice(qIdx) : "";
+  if (!pathPart) {
+    u.pathname = basePath || "/";
+    u.search = queryPart;
+    const out = u.toString();
+    return !basePath && !queryPart ? out.replace(/\/$/, "") : out;
+  }
+  const suffix = pathPart.startsWith("/") ? pathPart : `/${pathPart}`;
+  u.pathname = `${basePath}${suffix}`;
+  u.search = queryPart;
+  return u.toString();
+}
+
 export function toHttpUrl(relayUrl: string, path: string): string {
-  const base = relayUrl.replace(/\/+$/, "").replace(/^ws(s?):\/\//, "http$1://");
-  return base + path;
+  return buildRelayEndpointUrl(relayUrl, path, false);
 }
 
 export function toWsUrl(relayUrl: string, path: string): string {
-  const base = relayUrl.replace(/\/+$/, "").replace(/^http(s?):\/\//, "ws$1://");
-  return base + path;
+  return buildRelayEndpointUrl(relayUrl, path, true);
 }

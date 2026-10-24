@@ -30,15 +30,17 @@ describe("SubagentTracker", () => {
     // Child tool run
     tracker.onToolStart("read", { path: "src/auth.ts" }, "child_tool_1", "call_1");
     expect(emitted).toHaveLength(2);
-    expect(emitted[1].tools).toEqual([
+    expect(emitted[1].tools).toEqual(["read"]);
+    expect(emitted[1].toolCalls).toBe(1);
+    expect(tracker.getTaskToolCalls("call_1")).toEqual([
       { toolCallId: "child_tool_1", name: "read", status: "running" },
     ]);
-    expect(emitted[1].toolCalls).toBe(1);
 
     // Child tool end
     tracker.onToolEnd("read", "file contents", false, "child_tool_1", 50, "call_1");
     expect(emitted).toHaveLength(3);
-    expect(emitted[2].tools![0]).toEqual({
+    expect(emitted[2].tools).toEqual(["read"]);
+    expect(tracker.getTaskToolCalls("call_1")[0]).toEqual({
       toolCallId: "child_tool_1",
       name: "read",
       status: "completed",
@@ -219,7 +221,7 @@ describe("SubagentTracker", () => {
     expect(last.agent).toBe("sdd-apply");
     expect(last.model).toBe("claude-3-5-sonnet");
     expect(last.thinking).toBe("high");
-    expect(last.tokens).toBe(2100);
+    expect(last.tokens).toEqual({ total: 2100 });
     expect(last.turns).toBe(2);
   });
 });
@@ -364,15 +366,18 @@ describe("Runtime Subagent integration", () => {
     tracker.onToolStart("subagent_run", { agent: "worker", label: "many tools task" }, "parent_call");
 
     for (let i = 0; i < 120; i++) {
-      tracker.onToolStart("read", { path: `file_${i}.ts` }, `child_${i}`, "parent_call");
-      tracker.onToolEnd("read", "ok", false, `child_${i}`, 10, "parent_call");
+      tracker.onToolStart(`read_${i}`, { path: `file_${i}.ts` }, `child_${i}`, "parent_call");
+      tracker.onToolEnd(`read_${i}`, "ok", false, `child_${i}`, 10, "parent_call");
     }
 
     const last = emitted.at(-1)!;
     expect(last.tools).toHaveLength(100);
     expect(last.toolCalls).toBe(120);
     // Oldest tool calls (child_0 .. child_19) were shifted out
-    expect(last.tools![0].toolCallId).toBe("child_20");
-    expect(last.tools![99].toolCallId).toBe("child_119");
+    expect(last.tools![0]).toBe("read_20");
+    expect(last.tools![99]).toBe("read_119");
+    const toolCalls = tracker.getTaskToolCalls("parent_call");
+    expect(toolCalls[0]?.toolCallId).toBe("child_20");
+    expect(toolCalls[99]?.toolCallId).toBe("child_119");
   });
 });

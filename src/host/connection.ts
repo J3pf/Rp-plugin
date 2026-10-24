@@ -174,7 +174,7 @@ export class HostConnection {
       hostname: os.hostname(),
       roots: this.o.cfg.roots,
       backends: { herdr: rep.herdr, tmux: rep.tmux, wt: rep.wt, console: rep.console },
-      defaultBackend: def,
+      ...(def ? { defaultBackend: def } : {}),
       launchers: Object.keys(this.o.cfg.launchers),
       defaultLauncher: this.o.cfg.defaultLauncher,
     };
@@ -215,7 +215,7 @@ export class HostConnection {
           return reply("host.spawned", {
             spawnId: rec.spawnId,
             backend: rec.backend,
-            herdr: rec.herdr ? { workspaceId: rec.herdr.workspaceId, paneId: rec.herdr.paneId } : null,
+            herdr: rec.herdr?.paneId ? { workspaceId: rec.herdr.workspaceId ?? "", paneId: rec.herdr.paneId } : null,
             tmuxSession: rec.tmuxSession,
           });
         }

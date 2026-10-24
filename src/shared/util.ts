@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import os from "node:os";
 
 export function sha256(buf: Buffer | string): string {
   return createHash("sha256").update(buf).digest("hex");
@@ -64,20 +65,42 @@ export function preview(s: string, max = 140): string {
   return flat.length > max ? flat.slice(0, max - 1) + "…" : flat;
 }
 
-/** Bounded set remembering the last N keys (insertion order). */
+/** Bounded LRU set remembering the last N keys (refreshes recency on both `has` and `add`). */
 export class LruSet {
   private set = new Set<string>();
   constructor(private max: number) {}
   has(k: string): boolean {
-    return this.set.has(k);
+    if (!this.set.has(k)) return false;
+    this.set.delete(k);
+    this.set.add(k);
+    return true;
   }
   add(k: string): void {
     this.set.delete(k);
     this.set.add(k);
     if (this.set.size > this.max) this.set.delete(this.set.values().next().value as string);
   }
+  clear(): void {
+    this.set.clear();
+  }
   get size(): number {
     return this.set.size;
+  }
+}
+
+export function splitCommand(command: string): string[] {
+  const out: string[] = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(command))) out.push(m[1] ?? m[2] ?? m[3]!);
+  return out;
+}
+
+export function safeUser(): string {
+  try {
+    return os.userInfo().username;
+  } catch {
+    return process.env.USER ?? process.env.USERNAME ?? "unknown";
   }
 }
 

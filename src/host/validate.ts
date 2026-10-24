@@ -2,6 +2,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { HostConfig } from "./config.ts";
+import { splitCommand } from "../shared/util.ts";
+
+export { splitCommand };
 
 export class HostError extends Error {
   constructor(public code: "bad_request" | "not_found" | "conflict" | "internal", message: string) {
@@ -9,7 +12,7 @@ export class HostError extends Error {
   }
 }
 
-function isInside(root: string, target: string, platform: NodeJS.Platform = process.platform): boolean {
+export function isInside(root: string, target: string, platform: NodeJS.Platform = process.platform): boolean {
   const p = platform === "win32" ? path.win32 : path.posix;
   const r = platform === "win32" ? root.toLowerCase() : root;
   const t = platform === "win32" ? target.toLowerCase() : target;
@@ -73,14 +76,6 @@ export function sanitizeLabel(name: string | undefined, fallback: string): strin
     .trim()
     .slice(0, 60);
   return cleaned || fallback;
-}
-
-export function splitCommand(command: string): string[] {
-  const out: string[] = [];
-  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(command))) out.push(m[1] ?? m[2] ?? m[3]!);
-  return out;
 }
 
 export function validateSpawnId(id: unknown): string {

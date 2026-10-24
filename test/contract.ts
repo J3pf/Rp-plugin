@@ -74,6 +74,27 @@ export const isCommEvent = (v: unknown) =>
     : "delivered" in v && (v.delivered === null || typeof v.delivered === "boolean")) &&
   isNum(v.at);
 
+export const isSubagentUpdateEvent = (v: unknown) =>
+  isObj(v) &&
+  v.type === "subagent_update" &&
+  isStr(v.taskId) &&
+  isStr(v.agent) &&
+  typeof v.label === "string" &&
+  isStr(v.status) &&
+  (!("tokens" in v) ||
+    v.tokens === undefined ||
+    v.tokens === null ||
+    (isObj(v.tokens) && Object.values(v.tokens).every((x) => x === undefined || isNum(x)))) &&
+  (!("tools" in v) ||
+    v.tools === undefined ||
+    v.tools === null ||
+    arrayOf((t) => typeof t === "string")(v.tools));
+
+export const isTodoUpdateEvent = (v: unknown) =>
+  isObj(v) &&
+  v.type === "todo_update" &&
+  arrayOf((t) => isObj(t) && (isNum(t.id) || isStr(t.id)) && typeof t.title === "string" && isStr(t.status))(v.tasks);
+
 export const promptOpenShape: Shape = {
   promptId: isStr,
   agentId: (v) => isStr(v) && String(v).includes(":"),
@@ -100,14 +121,14 @@ export const validators: Record<string, (d: any) => string[]> = {
       d,
       {
         agentId: (v) => isStr(v) && String(v).includes(":"),
-        kind: oneOf("pi"),
+        kind: oneOf("pi", "agy", "codex", "claude", "opencode", "gemini", "qwen", "copilot", "cursor", "shell"),
         instance: isStr,
         epoch: isStr,
         pi: (v) => isObj(v) && isStr(v.version) && oneOf("tui", "rpc", "json", "print")(v.mode),
         plugin: (v) => isObj(v) && isStr(v.version) && arrayOf(isStr)(v.features),
         session: (v) => isObj(v) && isStr(v.id) && nullable((x) => typeof x === "string")(v.file ?? null) && nullable((x) => typeof x === "string")(v.name ?? null),
         host: (v) => isObj(v) && isStr(v.hostname) && typeof v.user === "string" && isNum(v.pid) && isStr(v.os),
-        launcher: oneOf("pi", "gentle-shell"),
+        launcher: isStr,
         herdr: nullable((v) => isObj(v) && isStr(v.paneId)),
         gentle: nullable((v) => isObj(v) && oneOf("normal", "auto", "yolo", "unknown")(v.mode)),
         transport: oneOf("ws", "longpoll"),
@@ -119,8 +140,11 @@ export const validators: Record<string, (d: any) => string[]> = {
         thinking: nullable(isStr),
         status,
         openPrompts: arrayOf((p) => check(p, promptOpenShape, "openPrompts[]", ["message", "tool", "source", "options", "placeholder", "questions"]).length === 0),
+        todos: nullable((v) => isObj(v) && Array.isArray(v.tasks)),
+        subagents: arrayOf(isSubagentUpdateEvent),
       },
       "hello",
+      ["todos", "subagents"],
     ),
   ],
   "agent.snapshot": (d) =>
@@ -140,7 +164,12 @@ export const validators: Record<string, (d: any) => string[]> = {
       {
         epoch: isStr,
         seq: (v) => Number.isInteger(v) && (v as number) >= 1,
-        e: (v) => isObj(v) && isStr(v.type) && (v.type !== "comm" || isCommEvent(v)),
+        e: (v) =>
+          isObj(v) &&
+          isStr(v.type) &&
+          (v.type !== "comm" || isCommEvent(v)) &&
+          (v.type !== "subagent_update" || isSubagentUpdateEvent(v)) &&
+          (v.type !== "todo_update" || isTodoUpdateEvent(v)),
       },
       "event",
     ),
@@ -168,7 +197,7 @@ export const validators: Record<string, (d: any) => string[]> = {
         hostname: isStr,
         roots: arrayOf(isStr),
         backends: (v) => isObj(v) && "herdr" in v && "tmux" in v && isBool(v.wt) && isBool(v.console),
-        defaultBackend: nullable(oneOf("herdr", "tmux", "wt", "console")),
+        defaultBackend: oneOf("herdr", "tmux", "wt", "console"),
         launchers: arrayOf(isStr),
         defaultLauncher: isStr,
         quotas: arrayOf(isMachineQuota),
@@ -186,7 +215,57 @@ export const validators: Record<string, (d: any) => string[]> = {
     ),
   "host.dirs": (d) => check(d, { path: (v) => typeof v === "string", dirs: arrayOf(isStr) }, "host.dirs"),
   "host.spawned": (d) =>
-    check(d, { spawnId: isStr, backend: oneOf("herdr", "tmux", "wt", "console"), herdr: nullable((v) => isObj(v) && isStr(v.paneId)), tmuxSession: nullable(isStr) }, "host.spawned"),
+    check(
+      d,
+      {
+        spawnId: isStr,
+        backend: oneOf("herdr", "tmux", "wt", "console"),
+        herdr: nullable((v) => isObj(v) && typeof v.workspaceId === "string" && isStr(v.paneId)),
+        tmuxSession: nullable(isStr),
+      },
+      "host.spawned",
+    ),
+  "host.git_diff.result": (d) =>
+    check(
+      d,
+      {
+        cwd: isStr,
+        branch: nullable((v) => typeof v === "string"),
+        files: arrayOf(
+          (f) =>
+            isObj(f) &&
+            isStr(f.path) &&
+            oneOf("modified", "added", "deleted", "untracked", "renamed")(f.status) &&
+            isNum(f.additions) &&
+            isNum(f.deletions) &&
+            isBool(f.binary) &&
+            typeof f.patch === "string" &&
+            isBool(f.truncated),
+        ),
+        totalAdditions: isNum,
+        totalDeletions: isNum,
+      },
+      "host.git_diff.result",
+    ),
+  "host.git_discard.result": (d) =>
+    check(
+      d,
+      {
+        cwd: isStr,
+        path: isStr,
+        ok: isBool,
+      },
+      "host.git_discard.result",
+    ),
+  "host.herdr_layout.result": (d) =>
+    check(
+      d,
+      {
+        available: isBool,
+        workspaces: arrayOf((w) => isObj(w) && isStr(w.id) && typeof w.name === "string" && Array.isArray(w.panes)),
+      },
+      "host.herdr_layout.result",
+    ),
 };
 
 export function validateEnvelope(e: any): string[] {

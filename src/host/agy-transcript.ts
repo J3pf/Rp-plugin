@@ -5,7 +5,7 @@ import os from "node:os";
 import type { SnapshotEntry } from "../extension/snapshot.ts";
 import { SNAPSHOT_LIMIT } from "../extension/snapshot.ts";
 import { LIMITS } from "../extension/forwarder.ts";
-import type { SubagentToolCall, SubagentUpdateEvent } from "../shared/protocol.ts";
+import type { SubagentUpdateEvent } from "../shared/protocol.ts";
 import { truncateBytes } from "../shared/util.ts";
 
 export interface AgyToolCallRaw {
@@ -526,7 +526,7 @@ export class AgyTranscriptReader {
             label: isRedacted ? "[redacted]" : norm.subagentSpec.role,
             status: "running",
             startedAt: at,
-            tools: [] as SubagentToolCall[],
+            tools: [],
           };
           this.subagents.set(norm.toolCallId, sub);
           outEvents.push(sub as unknown as Record<string, unknown>);

@@ -113,6 +113,17 @@ export interface SubagentToolCall {
   durationMs?: number;
 }
 
+export interface SubagentTokens {
+  prompt?: number;
+  completion?: number;
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  total?: number;
+  cost?: number;
+}
+
 export interface SubagentUpdateEvent {
   type: "subagent_update";
   taskId: string;
@@ -126,11 +137,11 @@ export interface SubagentUpdateEvent {
   durationMs?: number;
   turns?: number;
   toolCalls?: number;
-  tokens?: number;
+  tokens?: SubagentTokens;
   cost?: number;
   error?: string;
   result?: string;
-  tools?: SubagentToolCall[];
+  tools?: string[];
 }
 
 export interface PromptOption {
@@ -247,7 +258,7 @@ export interface HostHelloBody {
     wt?: boolean;
     console?: boolean;
   };
-  defaultBackend?: string | null;
+  defaultBackend?: "herdr" | "tmux" | "wt" | "console";
   launchers: string[];
   defaultLauncher?: string;
   quotas?: MachineQuota[];

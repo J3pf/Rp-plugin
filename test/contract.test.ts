@@ -144,7 +144,7 @@ describe("wire contract (PROTOCOLO v1)", () => {
 
   it("validates frozen comm fixtures and aligns local copies with rp-relay when available", () => {
     const localDir = path.resolve(import.meta.dirname, "fixtures/comm");
-    const relayDir = "/home/drift/Workspace/RP/Rp-relay/packages/protocol/fixtures";
+    const relayDir = process.env.RP_RELAY_FIXTURES_DIR ?? path.resolve(import.meta.dirname, "../../Rp-relay/packages/protocol/fixtures");
     const hasRelayFixtures = fs.existsSync(relayDir);
 
     for (const file of commFixtureFiles) {
