@@ -6,7 +6,7 @@ import dns from "node:dns/promises";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { httpRequest, toHttpUrl, toWsUrl } from "../shared/http.ts";
 import { piHomes } from "../shared/platform.ts";
-import { errMsg } from "../shared/util.ts";
+import { errMsg, splitCommand } from "../shared/util.ts";
 import { updateConfigFile, type GateMode, type RpConfig } from "./config.ts";
 import { GENTLE_RANGE, detectGentleVersion, gentleVersionSupported, hasGentleAskTools } from "./compat.ts";
 import type { Runtime } from "./runtime.ts";
@@ -27,13 +27,7 @@ const SUBCOMMANDS = ["pair", "status", "doctor", "on", "off", "gate", "test", "u
 const GATE_MODES: GateMode[] = ["auto-detect", "off", "dangerous", "writes", "all"];
 
 /** Split a command line honoring single/double quotes. */
-export function tokenize(input: string): string[] {
-  const out: string[] = [];
-  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(input))) out.push(m[1] ?? m[2] ?? m[3]!);
-  return out;
-}
+export const tokenize = splitCommand;
 
 export function parseFlags(tokens: string[]): { positional: string[]; flags: Record<string, string | true> } {
   const positional: string[] = [];
@@ -170,7 +164,7 @@ export function pluginDeclaredIn(home: string): { found: boolean; file: string; 
     const pkgs: unknown[] = Array.isArray(json?.packages) ? json.packages : [];
     const found = pkgs.some((p) => {
       const src = typeof p === "string" ? p : (p as any)?.source;
-      return typeof src === "string" && src.includes(PLUGIN_PACKAGE) && !src.startsWith("git:");
+      return typeof src === "string" && !src.startsWith("git:") && (src.includes(PLUGIN_PACKAGE) || /Rp-plugin/i.test(src));
     });
     return { found, file };
   } catch (e) {

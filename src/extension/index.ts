@@ -70,7 +70,25 @@ export default function rp(pi: ExtensionAPI): void {
   });
   pi.on("ui_prompt_start", (ev) => rt?.terminalWait(ev, true));
   pi.on("ui_prompt_end", (ev) => rt?.terminalWait(ev, false));
-  pi.events.on("pi-permission-system:permission-request", (d) => rt?.classifier.onPermissionRequest(d)); // gentle-pi P1
-  pi.events.on("gentle-pi:notification:source", (d) => rt?.subagents.onGentleNotification(d));
-  pi.events.on("gentle:runtime-metrics:child/v1", (d) => rt?.subagents.onGentleMetrics(d));
+  pi.events.on("pi-permission-system:permission-request", (d) => {
+    try {
+      rt?.classifier.onPermissionRequest(d);
+    } catch {
+      /* ignore malformed event */
+    }
+  }); // gentle-pi P1
+  pi.events.on("gentle-pi:notification:source", (d) => {
+    try {
+      rt?.subagents.onGentleNotification(d);
+    } catch {
+      /* ignore malformed event */
+    }
+  });
+  pi.events.on("gentle:runtime-metrics:child/v1", (d) => {
+    try {
+      rt?.subagents.onGentleMetrics(d);
+    } catch {
+      /* ignore malformed event */
+    }
+  });
 }

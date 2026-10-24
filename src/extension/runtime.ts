@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { newId, type AgentEventPayload, type AgentHelloBody, type AgentStatus, type Envelope, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
 import { parseTodoTasks, redactTodoTasks, replayTodoBranch } from "./todos.ts";
-import { errMsg, preview } from "../shared/util.ts";
+import { LruSet, errMsg, preview, safeUser } from "../shared/util.ts";
 import type { RpConfig } from "./config.ts";
 import { resolveInboxDir } from "./config.ts";
 import type { StaticEnv, HerdrLocation } from "./environment.ts";
@@ -70,7 +70,7 @@ export class Runtime {
   readonly forwarder: Forwarder;
   readonly subagents: SubagentTracker;
   readonly comm: CommTracker;
-  readonly allowed: Set<string>;
+  readonly allowed: LruSet;
 
   mirror: MirrorResult = { uninstall: () => {}, installed: false, dialogs: false };
   askUserRegistered = false;
@@ -115,7 +115,12 @@ export class Runtime {
 
     this.statuses = new StatusTracker(
       (status, detail) => this.conn.send("agent.status", { status, ...(detail ? { detail } : {}) }),
-      (items) => this.conn.send("agent.statuses", { items }),
+      (items) => {
+        const filtered = this.filterStatuses(items);
+        if (Object.keys(filtered).length || !this.cfg.redactContent) {
+          this.conn.send("agent.statuses", { items: filtered });
+        }
+      },
     );
 
     this.broker = new Broker({
@@ -124,6 +129,7 @@ export class Runtime {
       hasUI: ctx.hasUI,
       classifier: this.classifier,
       herdr: this.herdrBlocker,
+      redact: () => this.cfg.redactContent,
       onChange: () => this.updateWaiting(),
     });
     this.adapters = new AdapterRegistry(this.broker);
@@ -243,6 +249,7 @@ export class Runtime {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    const hadOpenPrompts = this.broker.openCount > 0;
     this.comm.reset();
     try {
       this.broker.shutdown();
@@ -262,8 +269,13 @@ export class Runtime {
         /* ctx may be stale */
       }
     } finally {
-      // give the socket a tick to flush prompt.resolved before closing
-      await new Promise((r) => setTimeout(r, 50));
+      if (hadOpenPrompts) {
+        // give the socket a tick to flush prompt.resolved before closing
+        await new Promise<void>((r) => {
+          const t = setTimeout(r, 50);
+          t.unref?.();
+        });
+      }
       this.conn.stop();
     }
   }
@@ -334,7 +346,8 @@ export class Runtime {
     this.touch(ctx);
     if (ev?.source !== "interactive") return;
     const text = normalizeText(String(ev.text ?? ""));
-    const i = this.inputWaiters.findIndex((w) => w.text === text);
+    let i = this.inputWaiters.findIndex((w) => w.text === text);
+    if (i < 0 && text.length > 0 && this.inputWaiters.length === 1) i = 0;
     if (i >= 0) {
       const [w] = this.inputWaiters.splice(i, 1);
       clearTimeout(w!.timer);
@@ -352,7 +365,12 @@ export class Runtime {
     if ((kind === "custom" || kind === "editor") && !this.broker.hasAdapterPrompt()) {
       this.terminalWaits = Math.max(0, this.terminalWaits + (active ? 1 : -1));
       this.updateWaiting();
-      this.emitEvent({ type: "terminal_wait", kind, title: ev?.title ?? null, active });
+      this.emitEvent({
+        type: "terminal_wait",
+        kind,
+        title: this.cfg.redactContent ? null : (ev?.title ?? null),
+        active,
+      });
     }
   }
 
@@ -382,7 +400,7 @@ export class Runtime {
   private onWelcome(w: WelcomeBody): void {
     this.sendSnapshot(true);
     this.conn.sendDirect("agent.status", { status: this.statuses.current });
-    const items = this.statuses.snapshot();
+    const items = this.filterStatuses(this.statuses.snapshot());
     if (Object.keys(items).length) this.conn.sendDirect("agent.statuses", { items });
     this.conn.needsSnapshot = false;
     for (const p of pendingAnswers(w)) this.broker.handleAnswer(p.promptId, p.answer);
@@ -390,9 +408,25 @@ export class Runtime {
 
   private sendSnapshot(direct: boolean): void {
     const { entries, truncated } = buildSnapshotEntries(this.safeBranch(), this.cfg.redactContent);
-    const body = { epoch: this.epoch, seq: this.seq, entries, truncated };
-    if (direct) this.conn.sendDirect("agent.snapshot", body);
-    else this.conn.send("agent.snapshot", body);
+    if (direct) {
+      if (this.conn.needsSnapshot) {
+        this.conn.dropQueuedEventsUpTo(this.seq);
+      }
+      const minQueued = this.conn.minQueuedEventSeq();
+      const snapSeq = minQueued !== null ? Math.max(0, minQueued - 1) : this.seq;
+      this.conn.sendDirect("agent.snapshot", { epoch: this.epoch, seq: snapSeq, entries, truncated });
+    } else {
+      this.conn.send("agent.snapshot", { epoch: this.epoch, seq: this.seq, entries, truncated });
+    }
+  }
+
+  private filterStatuses(items: Record<string, string>): Record<string, string> {
+    if (!this.cfg.redactContent) return items;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(items)) {
+      if (/^(gentle:mode|gentle:vim|vim|pi:theme|rp)$/i.test(k)) out[k] = v;
+    }
+    return out;
   }
 
   private safeBranch(): any[] {
@@ -432,7 +466,7 @@ export class Runtime {
       epoch: this.epoch,
       pi: { version: detectPiVersion(), mode },
       plugin: { version: pluginVersion(), features: this.features() },
-      session: { id: this.sessionId, file: sessionFile, name: sessionName },
+      session: { id: this.sessionId, file: sessionFile, name: this.cfg.redactContent ? null : sessionName },
       host: { hostname: os.hostname(), user: safeUser(), pid: process.pid, os: process.platform },
       launcher: this.env.launcher,
       herdr: herdrHello(this.env.herdr),
@@ -670,14 +704,6 @@ export function toolDetail(name: string, args: any): string {
               ? args.message
               : "";
   return v ? `: ${preview(v, 60)}` : "";
-}
-
-function safeUser(): string {
-  try {
-    return os.userInfo().username;
-  } catch {
-    return process.env.USER || process.env.USERNAME || "";
-  }
 }
 
 function spawnIdFlag(pi: ExtensionAPI): string | null {

@@ -70,7 +70,12 @@ export function installMirror(
   };
 
   // compat check (R1): the wrapper must be what callers see
-  if (opts.dialogs && !mirrorTookEffect(ctx, ui.select)) {
+  if (
+    opts.dialogs &&
+    (!mirrorTookEffect(ctx, ui.select) ||
+      (ctx.ui as any)?.confirm !== ui.confirm ||
+      (ctx.ui as any)?.input !== ui.input)
+  ) {
     uninstall();
     warnOnce(ctx, "mirror", "RP: no se pudo interceptar los diálogos de Pi (versión incompatible); se desactiva el espejo.");
     return { uninstall: () => {}, installed: false, dialogs: false };

@@ -38,9 +38,9 @@ export const DEFAULT_CONFIG: RpConfig = {
   gate: {
     mode: "auto-detect",
     dangerousPatterns: [
-      "\\brm\\s+-[a-z]*r",
+      "\\brm\\b\\s+(-[a-zA-Z0-9]+\\s+)*(-[a-zA-Z0-9]*r|--recursive\\b)",
       "\\bsudo\\b",
-      "\\bgit\\s+push\\b.*--force",
+      "\\bgit\\s+push\\b.*(\\s--force|\\s-f\\b)",
       "\\bchmod\\b.*777",
       "\\bdd\\b",
       "\\bmkfs",
@@ -118,7 +118,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, platform: NodeJ
 
 /** Atomic write with 0600 permissions. Persisted file never contains env overrides applied at load. */
 export function saveConfig(p: string, cfg: RpConfig): void {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
   const tmp = `${p}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
   try {

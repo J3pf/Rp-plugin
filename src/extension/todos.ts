@@ -36,17 +36,21 @@ export function parseTodoTasks(details: unknown): TodoTask[] | null {
 export function replayTodoBranch(branch: readonly unknown[] | undefined): TodoTask[] {
   if (!Array.isArray(branch)) return [];
   for (let i = branch.length - 1; i >= 0; i--) {
-    const entry = branch[i] as
-      | {
-          type?: string;
-          message?: { role?: string; toolName?: string; isError?: boolean; details?: unknown };
-        }
-      | undefined;
-    if (entry?.type !== "message") continue;
-    const msg = entry.message;
-    if (msg?.role !== "toolResult" || msg.toolName !== "todo" || msg.isError === true) continue;
-    const parsed = parseTodoTasks(msg.details);
-    if (parsed) return parsed;
+    try {
+      const entry = branch[i] as
+        | {
+            type?: string;
+            message?: { role?: string; toolName?: string; isError?: boolean; details?: unknown };
+          }
+        | undefined;
+      if (entry?.type !== "message") continue;
+      const msg = entry.message;
+      if (msg?.role !== "toolResult" || msg.toolName !== "todo" || msg.isError === true) continue;
+      const parsed = parseTodoTasks(msg.details);
+      if (parsed) return parsed;
+    } catch {
+      /* ignore malformed entry */
+    }
   }
   return [];
 }

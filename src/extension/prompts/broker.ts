@@ -31,6 +31,7 @@ export interface OpenPrompt {
   id: string;
   body: PromptOpen;
   req: DialogRequest | null;
+  isAdapter: boolean;
   closed: boolean;
   /** A phone answer was already accepted for this prompt. */
   answered: boolean;
@@ -47,6 +48,7 @@ export interface BrokerDeps {
   hasUI: boolean;
   classifier: Classifier;
   herdr: HerdrBlocker | null;
+  redact?: () => boolean;
   onChange?: (openCount: number) => void;
   now?: () => number;
 }
@@ -58,7 +60,6 @@ export function withSignal<O extends DialogOpts | undefined>(opts: O, extra: Abo
 
 export class Broker {
   private prompts = new Map<string, OpenPrompt>();
-  private recentlyClosed = new Set<string>();
 
   constructor(private d: BrokerDeps) {}
 
@@ -73,13 +74,14 @@ export class Broker {
 
   /** Whether any prompt originated from an adapter (suppresses the "waiting on terminal" notice for its custom() dialog). */
   hasAdapterPrompt(): boolean {
-    for (const p of this.prompts.values()) if (p.req === null) return true;
+    for (const p of this.prompts.values()) if (p.isAdapter) return true;
     return false;
   }
 
   private build(req: DialogRequest): { body: Omit<PromptOpen, "promptId" | "agentId">; cls: Classification } {
     const message = req.kind === "confirm" ? req.message : undefined;
     const cls = this.d.classifier.classifyDialog(req.kind, req.title, message);
+    const redact = !!this.d.redact?.();
     let options: PromptOption[] | undefined;
     if (req.kind === "select") options = req.options.map((label, i) => ({ id: String(i), label }));
     else if (req.kind === "confirm") {
@@ -90,29 +92,30 @@ export class Broker {
       ];
     }
     const expiresAt = req.opts?.timeout ? (this.d.now ?? Date.now)() + req.opts.timeout : null;
+    const rawMsg = cls.message ?? message;
     return {
       cls,
       body: {
         kind: req.kind,
         category: cls.category,
         title: req.title,
-        message: cls.message ?? message,
+        message: redact && rawMsg ? "[redacted]" : rawMsg,
         options,
         allowFreeText: req.kind === "input" || (req.kind === "select" && !!req.allowFreeText),
         placeholder: req.kind === "input" ? (req.placeholder ?? null) : null,
         questions: null,
         source: cls.source,
-        tool: cls.tool,
+        tool: cls.tool ? (redact && cls.tool.args ? { ...cls.tool, args: { redacted: true } } : cls.tool) : undefined,
         danger: cls.danger,
         expiresAt,
       },
     };
   }
 
-  private register(body: PromptOpen, req: DialogRequest | null, herdrReported: boolean): OpenPrompt {
+  private register(body: PromptOpen, req: DialogRequest | null, herdrReported: boolean, isAdapter = false): OpenPrompt {
     let resolveRemote!: (a: Answer) => void;
     const remoteAnswer = new Promise<Answer>((r) => (resolveRemote = r));
-    const p: OpenPrompt = { id: body.promptId, body, req, closed: false, answered: false, remoteAnswer, resolveRemote, openedAt: (this.d.now ?? Date.now)() };
+    const p: OpenPrompt = { id: body.promptId, body, req, isAdapter, closed: false, answered: false, remoteAnswer, resolveRemote, openedAt: (this.d.now ?? Date.now)() };
     this.prompts.set(p.id, p);
     this.d.send("prompt.open", body);
     this.d.herdr?.block(p.id, body.title, herdrReported);
@@ -122,42 +125,56 @@ export class Broker {
 
   open(req: DialogRequest): OpenPrompt {
     const { body, cls } = this.build(req);
-    return this.register({ promptId: newId(), agentId: this.d.agentId, ...body }, req, cls.herdrReported);
+    return this.register({ promptId: newId(), agentId: this.d.agentId, ...body }, req, cls.herdrReported, false);
   }
 
   /** Open a prompt described by an adapter (custom() dialogs). */
   openSpec(spec: AdapterPromptSpec): OpenPrompt {
+    const redact = !!this.d.redact?.();
+    const stripPreview = (opts?: PromptOption[]) =>
+      redact && opts ? opts.map(({ preview: _p, ...rest }) => rest) : opts;
     const body: PromptOpen = {
       promptId: newId(),
       agentId: this.d.agentId,
       kind: spec.kind,
       category: spec.category ?? "question",
       title: spec.title,
-      message: spec.message,
-      options: spec.options,
+      message: redact && spec.message ? "[redacted]" : spec.message,
+      options: stripPreview(spec.options),
       allowFreeText: !!spec.allowFreeText,
       placeholder: null,
-      questions: spec.questions ?? null,
+      questions: spec.questions
+        ? spec.questions.map((q) => ({ ...q, options: stripPreview(q.options) ?? [] }))
+        : null,
       source: spec.source,
       danger: spec.danger ?? "low",
       expiresAt: null,
     };
     const herdrReported = spec.herdrReported ?? (spec.source?.extension !== "@eko24ive/pi-ask");
-    return this.register(body, null, herdrReported);
+    return this.register(body, null, herdrReported, true);
   }
 
   close(p: OpenPrompt): void {
     if (p.closed) return;
     p.closed = true;
     this.prompts.delete(p.id);
-    this.recentlyClosed.add(p.id);
-    if (this.recentlyClosed.size > 200) this.recentlyClosed.delete(this.recentlyClosed.values().next().value as string);
     this.d.herdr?.unblock(p.id);
     this.d.onChange?.(this.prompts.size);
   }
 
   resolved(p: OpenPrompt, by: ResolvedBy, answer: Answer | null): void {
-    this.d.send("prompt.resolved", { promptId: p.id, by, answer });
+    let safeAnswer = answer;
+    if (safeAnswer && this.d.redact?.()) {
+      const any = safeAnswer as any;
+      if (typeof any.text === "string") safeAnswer = { ...any, text: "[redacted]" };
+      else if (Array.isArray(any.answers)) {
+        safeAnswer = {
+          ...any,
+          answers: any.answers.map((a: any) => (typeof a?.text === "string" ? { ...a, text: "[redacted]" } : a)),
+        };
+      }
+    }
+    this.d.send("prompt.resolved", { promptId: p.id, by, answer: safeAnswer });
   }
 
   ack(promptId: string, accepted: boolean): void {

@@ -136,7 +136,7 @@ export class CommTracker {
         truncated: content.truncated,
         at: this.now(),
       };
-      this.deps.emit(copyEvent(event));
+      this.deps.emit(copyEvent(event, this.deps.isRedacted()));
     } catch {
       // Message hooks are observational and must never break Pi execution.
     }
@@ -253,7 +253,7 @@ export class CommTracker {
 
       if (!event) return;
       if (toolCallId) this.activeCalls.set(toolCallId, event);
-      this.deps.emit(copyEvent(event));
+      this.deps.emit(copyEvent(event, this.deps.isRedacted()));
     } catch {
       // Tool hooks are observational and must never break Pi execution.
     }
@@ -276,7 +276,7 @@ export class CommTracker {
       call.messageId = messageId;
       call.delivered = typeof details?.delivered === "boolean" ? details.delivered : !isError && !details?.error;
       this.activeCalls.delete(toolCallId);
-      this.deps.emit(copyEvent(call));
+      this.deps.emit(copyEvent(call, this.deps.isRedacted()));
     } catch {
       // Tool hooks are observational and must never break Pi execution.
     }
@@ -316,8 +316,16 @@ function resolveInboundAction(message: InboundCommMessage): CommEvent["action"] 
   return "send";
 }
 
-function copyEvent(event: CommEvent): CommEvent {
-  const out = { ...event, peer: { ...event.peer } };
+function copyEvent(event: CommEvent, redacted = false): CommEvent {
+  const peer: CommPeer = redacted
+    ? {
+        sessionId: event.peer.sessionId,
+        name: null,
+        cwd: null,
+        ref: event.peer.ref && event.peer.ref === event.peer.sessionId ? event.peer.ref : null,
+      }
+    : { ...event.peer };
+  const out = { ...event, peer };
   if (out.delivered === undefined) delete out.delivered;
   return out;
 }

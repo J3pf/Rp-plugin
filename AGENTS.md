@@ -7,9 +7,9 @@ Extension for the [Pi](https://github.com/earendil-works/pi) coding agent and co
 - **Runtime**: Node.js >= 20, TypeScript (`tsc -p tsconfig.build.json`).
 - **Target OS**: Linux (systemd `--user`), macOS (`launchd`), Windows (Task Scheduler with `conhost.exe --headless`).
 - **Core Components**:
-  - `src/extension/`: Pi extension hooking into `session_start`, `prompt_start`, questions, and tool execution events.
-  - `src/host/`: The `rp-host` daemon process that maintains WebSocket communication with the relay, executes host tools, and manages background autostart.
-  - `src/domain/`: Host command handlers (`host.git_diff`, `host.git_discard`, `host.quota`, etc.).
+  - `src/extension/`: Pi extension hooking into `session_start`, `ui_prompt_start`, questions, and tool execution events.
+  - `src/host/`: The `rp-host` daemon process that maintains WebSocket communication with the relay, executes host tools (`git.ts`, `quota.ts`, `herdr-bridge.ts`, `agy-transcript.ts`), and manages background autostart (`service.ts`).
+  - `src/shared/`: Shared wire protocol types, HTTP/proxy helpers, platform path discovery, and bounded LRU utilities.
 
 ## Commands
 
@@ -28,9 +28,6 @@ npm run typecheck
 
 # Build extension and host daemon
 npm run build
-
-# Update fixtures if protocol contracts change
-npm run fixtures
 ```
 
 ## Boundaries & Non-Obvious Conventions

@@ -144,11 +144,11 @@ export default function rp(pi: ExtensionAPI) {
   `NO_PROXY`; Node respeta `NODE_EXTRA_CA_CERTS` para CA corporativas.
 - Reconexión 1→30 s con jitter. Tras 3 fallos consecutivos de *upgrade* WS (p. ej. proxy que bloquea WebSocket) →
   **transporte long-poll** (`POST /v1/agent/send`, `POST /v1/agent/poll` con espera 25 s) con los mismos mensajes; se
-  reintenta WS cada 10 min.
+  reintenta WS cada 15 s (`wsRetryMs`).
 - Al conectar: `agent.hello` (con `openPrompts`) → `agent.welcome` → `agent.snapshot` → vaciar cola.
 - Cola: máx. 500 mensajes / 2 MB; si desborda se descartan `agent.event` viejos y se marca `needsSnapshot`;
-  `prompt.*` nunca se descartan.
-- Cierres `4001`/`4002` → no reconectar; `ctx.ui.notify` + `setStatus("rp","RP ✗")`. Conectado: `setStatus("rp","📱")`.
+  `prompt.*` tienen prioridad crítica sobre los eventos.
+- Cierres `4001`/`4002`/`4003` → no reconectar; `ctx.ui.notify` + `setStatus("rp","RP ✗")`. Conectado: `setStatus("rp","📱")` (o `📱~` en long-poll).
 - El arranque de Pi nunca espera al relay.
 
 ## 7. Reenvío de eventos (`forwarder.ts`)

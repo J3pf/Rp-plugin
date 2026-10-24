@@ -54,6 +54,14 @@ export function hasGentleAskTools(pi: ExtensionAPI): boolean {
 }
 
 const pkgCache = new Map<string, { dir: string; json: any } | null>();
+function setPkgCache(key: string, val: { dir: string; json: any } | null): void {
+  pkgCache.delete(key);
+  pkgCache.set(key, val);
+  if (pkgCache.size > 200) {
+    const first = pkgCache.keys().next();
+    if (!first.done) pkgCache.delete(first.value);
+  }
+}
 
 /** Walk upwards from a path to find the owning package.json (used to read the gentle-pi version). */
 export function findPackageJson(startPath: string, name?: string): { dir: string; json: any } | null {
@@ -71,7 +79,7 @@ export function findPackageJson(startPath: string, name?: string): { dir: string
       const json = JSON.parse(fs.readFileSync(f, "utf8"));
       if (!name || json.name === name) {
         const res = { dir, json };
-        pkgCache.set(cacheKey, res);
+        setPkgCache(cacheKey, res);
         return res;
       }
     } catch {
@@ -81,7 +89,7 @@ export function findPackageJson(startPath: string, name?: string): { dir: string
     if (parent === dir) break;
     dir = parent;
   }
-  pkgCache.set(cacheKey, null);
+  setPkgCache(cacheKey, null);
   return null;
 }
 

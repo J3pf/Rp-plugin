@@ -13,6 +13,7 @@ export interface Transport {
   /** Returns false if the message could not be accepted (transport not open). */
   send(env: Envelope): boolean;
   drainUnsent?(): Envelope[];
+  isSending?(): boolean;
   close(): void;
 }
 
@@ -148,7 +149,8 @@ export class WsTransport implements Transport {
 
   send(env: Envelope): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
-    // backpressure: drop non-critical frames when the socket buffer is saturated
+    // backpressure: drop non-critical frames when the socket buffer is saturated, and cap critical frames at 4x MAX_FRAME_BYTES
+    if (this.ws.bufferedAmount > 4 * MAX_FRAME_BYTES) return false;
     if (this.ws.bufferedAmount > 1_000_000 && !CRITICAL_TYPES.has(env.t)) return false;
     try {
       this.ws.send(JSON.stringify(env));
@@ -208,6 +210,10 @@ export class LongPollTransport implements Transport {
 
   drainUnsent(): Envelope[] {
     return [...this.inFlight.splice(0), ...this.outbox.splice(0)];
+  }
+
+  isSending(): boolean {
+    return this.flushing;
   }
 
   private fail(res: { status: number } | null, err?: unknown): boolean {
@@ -487,11 +493,15 @@ export class Connection {
   }
 
   /** While on long-poll, retry WebSocket periodically (default 15s instead of 10 min). */
-  private scheduleWsRetry(): void {
+  private scheduleWsRetry(delayMs = this.o.wsRetryMs ?? 15_000): void {
     if (this.wsRetryTimer) return;
     this.wsRetryTimer = setTimeout(() => {
       this.wsRetryTimer = null;
       if (this.stopped || this.transportName !== "longpoll") return;
+      if (this.t?.isSending?.()) {
+        this.scheduleWsRetry(250);
+        return;
+      }
       this.forceLongPoll = false;
       this.probingWs = true;
       if (this.t?.drainUnsent) this.rescueUnsent(this.t.drainUnsent());
@@ -499,7 +509,37 @@ export class Connection {
       this.t = null;
       this.welcomed = false;
       this.open();
-    }, this.o.wsRetryMs ?? 15_000);
+    }, delayMs);
+    this.wsRetryTimer.unref?.();
+  }
+
+  /** Drop queued non-critical `agent.event` envelopes already covered by a snapshot up to `maxSeq`. */
+  dropQueuedEventsUpTo(maxSeq: number): void {
+    if (maxSeq <= 0) return;
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      const q = this.queue[i]!;
+      if (q.env.t === "agent.event") {
+        const seq = (q.env.d as { seq?: unknown } | undefined)?.seq;
+        if (typeof seq === "number" && seq <= maxSeq) {
+          this.queue.splice(i, 1);
+          this.queueBytes -= q.bytes;
+        }
+      }
+    }
+  }
+
+  /** Lowest `seq` among currently queued `agent.event` envelopes, or `null` if none. */
+  minQueuedEventSeq(): number | null {
+    let min: number | null = null;
+    for (const q of this.queue) {
+      if (q.env.t === "agent.event") {
+        const seq = (q.env.d as { seq?: unknown } | undefined)?.seq;
+        if (typeof seq === "number" && (min === null || seq < min)) {
+          min = seq;
+        }
+      }
+    }
+    return min;
   }
 
   /** Send now if connected, otherwise queue (bounded). */
@@ -527,6 +567,12 @@ export class Connection {
       if (i < 0) break;
       const [dropped] = this.queue.splice(i, 1);
       this.queueBytes -= dropped!.bytes;
+      this.needsSnapshot = true;
+    }
+    while (this.queue.length > this.maxMsgs * 2 || this.queueBytes > this.maxBytes * 2) {
+      const [dropped] = this.queue.splice(0, 1);
+      if (!dropped) break;
+      this.queueBytes -= dropped.bytes;
       this.needsSnapshot = true;
     }
   }

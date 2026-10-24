@@ -146,7 +146,7 @@ export class Forwarder {
       case "tool_execution_end":
         return this.onToolEnd(ev);
       case "session_info_changed":
-        return this.d.send({ type: "session_info_changed", name: ev?.name ?? null });
+        return this.d.send({ type: "session_info_changed", name: this.d.redact ? null : (ev?.name ?? null) });
       case "model_select":
         return this.d.send({
           type: "model_select",

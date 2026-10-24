@@ -15,6 +15,8 @@ export interface AttachmentRef {
 export const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 export const MAX_INLINE_IMAGE = 10 * 1024 * 1024;
 export const MAX_BLOB = 25 * 1024 * 1024;
+export const MAX_ATTACHMENTS = 10;
+export const MAX_FETCH_CONCURRENCY = 3;
 
 export interface ResolvedAttachments {
   images: Array<{ type: "image"; data: string; mimeType: string }>;
@@ -58,19 +60,31 @@ export async function resolveAttachments(
 ): Promise<ResolvedAttachments> {
   const out: ResolvedAttachments = { images: [], lines: [], failures: [] };
   if (refs.length === 0) return out;
+  const boundedRefs = refs.slice(0, MAX_ATTACHMENTS);
+  for (const extra of refs.slice(MAX_ATTACHMENTS)) {
+    const safeExtra = sanitizeFileName(extra.name);
+    out.failures.push(`${safeExtra}: attachment limit exceeded`);
+    out.lines.push(`[Adjunto no disponible: ${safeExtra}]`);
+  }
   const dir = path.join(opts.inboxDir, sessionDirName(opts.sessionId));
   let dirCreated = false;
-  const fetched = await Promise.all(
-    refs.map((ref) =>
-      opts.fetchBlob(ref.blobId).then(
+  const fetched: Array<{ ok: true; res: Awaited<ReturnType<FetchBlob>> } | { ok: false; err: unknown }> = new Array(boundedRefs.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(MAX_FETCH_CONCURRENCY, boundedRefs.length) }, async () => {
+    while (cursor < boundedRefs.length) {
+      const i = cursor++;
+      const ref = boundedRefs[i]!;
+      fetched[i] = await opts.fetchBlob(ref.blobId).then(
         (res) => ({ ok: true as const, res }),
         (err) => ({ ok: false as const, err }),
-      ),
-    ),
-  );
-  for (let idx = 0; idx < refs.length; idx++) {
-    const ref = refs[idx]!;
-    const cacheKey = `${idx}:${ref.blobId}:${ref.name}`;
+      );
+    }
+  });
+  await Promise.all(workers);
+  for (let idx = 0; idx < boundedRefs.length; idx++) {
+    const ref = boundedRefs[idx]!;
+    const safeName = sanitizeFileName(ref.name);
+    const cacheKey = `${idx}:${ref.blobId}:${safeName}`;
     try {
       const item = fetched[idx]!;
       if (!item.ok) throw item.err;
@@ -88,14 +102,16 @@ export async function resolveAttachments(
       let target = opts.writtenFiles?.get(cacheKey);
       if (!target) {
         if (!dirCreated) {
-          await fs.promises.mkdir(dir, { recursive: true });
+          await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
           dirCreated = true;
         }
-        const file = path.join(dir, `${timestampName(opts.now)}-${sanitizeFileName(ref.name)}`);
+        const file = path.join(dir, `${timestampName(opts.now)}-${safeName}`);
         target = file;
-        for (let i = 1; ; i++) {
+        let written = false;
+        for (let i = 1; i <= 100; i++) {
           try {
             await fs.promises.writeFile(target, buf, { mode: 0o600, flag: "wx" });
+            written = true;
             break;
           } catch (err: any) {
             if (err?.code === "EEXIST") {
@@ -105,12 +121,14 @@ export async function resolveAttachments(
             throw err;
           }
         }
+        if (!written) throw new Error("too many filename collisions");
         opts.writtenFiles?.set(cacheKey, target);
       }
-      out.lines.push(`[Archivo adjunto desde el móvil: ${target} (${ref.mime}, ${formatSize(buf.length)})]`);
+      const safeMime = String(ref.mime || "application/octet-stream").replace(/[\r\n\[\]]/g, "");
+      out.lines.push(`[Archivo adjunto desde el móvil: ${target} (${safeMime}, ${formatSize(buf.length)})]`);
     } catch (e) {
-      out.failures.push(`${ref.name}: ${e instanceof Error ? e.message : String(e)}`);
-      out.lines.push(`[Adjunto no disponible: ${ref.name}]`);
+      out.failures.push(`${safeName}: ${e instanceof Error ? e.message : String(e)}`);
+      out.lines.push(`[Adjunto no disponible: ${safeName}]`);
     }
   }
   return out;

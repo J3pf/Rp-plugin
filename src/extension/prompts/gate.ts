@@ -1,8 +1,9 @@
 // Own authorizations (PLAN §8.4). Disabled when gentle-pi already asks for confirmations.
+import path from "node:path";
 import { promptContext } from "./classify.ts";
 import type { RpConfig, GateMode } from "../config.ts";
 import type { Danger } from "../../shared/protocol.ts";
-import { truncateBytes } from "../../shared/util.ts";
+import { LruSet, truncateBytes } from "../../shared/util.ts";
 
 export type EffectiveGateMode = Exclude<GateMode, "auto-detect">;
 
@@ -20,7 +21,7 @@ export function compilePatterns(patterns: string[]): RegExp[] {
   const out: RegExp[] = [];
   for (const p of patterns) {
     try {
-      out.push(new RegExp(p, "i"));
+      out.push(new RegExp(p, "is"));
     } catch {
       /* ignore invalid pattern */
     }
@@ -30,6 +31,27 @@ export function compilePatterns(patterns: string[]): RegExp[] {
 
 const WRITE_TOOLS = new Set(["write", "edit"]);
 const SHELL_TOOLS = new Set(["bash", "powershell"]);
+const INTERPRETER_CMDS = new Set([
+  "bash",
+  "sh",
+  "zsh",
+  "dash",
+  "ksh",
+  "python",
+  "python3",
+  "node",
+  "perl",
+  "ruby",
+  "php",
+  "osascript",
+  "powershell",
+  "pwsh",
+  "cmd",
+  "sudo",
+  "env",
+  "xargs",
+  "find",
+]);
 
 export interface GateToolInfo {
   annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
@@ -65,6 +87,10 @@ export function allowKey(toolName: string, input: any): string {
       return `${toolName}:${cmd}`;
     }
     const first = cmd.split(/\s+/)[0] ?? "";
+    const base = path.posix.basename(first.replace(/\\/g, "/")).replace(/\.exe$/i, "").toLowerCase();
+    if (INTERPRETER_CMDS.has(base) && /\s/.test(cmd)) {
+      return `${toolName}:${cmd}`;
+    }
     return `${toolName}:${first}`;
   }
   return toolName;
@@ -109,7 +135,7 @@ export interface GateDeps {
   askInput(title: string, placeholder?: string): Promise<string | undefined>;
   toolInfo(name: string): GateToolInfo | undefined;
   persistAllow(key: string): void;
-  allowed: Set<string>;
+  allowed: { has(v: string): boolean; add(v: string): unknown };
 }
 
 export class Gate {
@@ -163,10 +189,15 @@ export class Gate {
 }
 
 /** Rebuild "allow always" keys from the session branch (custom entries written with pi.appendEntry). */
-export function allowedFromBranch(branch: any[]): Set<string> {
-  const out = new Set<string>();
+export function allowedFromBranch(branch: any[]): LruSet {
+  const out = new LruSet(1000);
+  if (!Array.isArray(branch)) return out;
   for (const e of branch) {
-    if (e?.type === "custom" && e.customType === "rp.allow" && typeof e.data?.key === "string") out.add(e.data.key);
+    try {
+      if (e?.type === "custom" && e.customType === "rp.allow" && typeof e.data?.key === "string") out.add(e.data.key);
+    } catch {
+      /* ignore malformed entry */
+    }
   }
   return out;
 }

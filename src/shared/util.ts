@@ -86,6 +86,9 @@ export class LruSet {
   keys(): IterableIterator<string> {
     return this.set.keys();
   }
+  [Symbol.iterator](): IterableIterator<string> {
+    return this.set.values();
+  }
   get size(): number {
     return this.set.size;
   }

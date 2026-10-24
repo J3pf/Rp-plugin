@@ -70,6 +70,7 @@ export class Deliverer {
   private seen = new LruSet(500);
   /** Serialize deliveries: typing into the editor must never interleave. */
   private tail: Promise<unknown> = Promise.resolve();
+  private activeSelectPromises = new Set<Promise<void>>();
 
   constructor(private d: DelivererDeps) {}
 
@@ -79,6 +80,8 @@ export class Deliverer {
       .then(() =>
         this.process(msg, (task) => {
           bg = task;
+          this.activeSelectPromises.add(task);
+          void task.finally(() => this.activeSelectPromises.delete(task));
         }),
       )
       .catch(() => {});
@@ -203,6 +206,9 @@ export class Deliverer {
           return;
         }
         if (method === "interactive") {
+          if (this.activeSelectPromises.size > 0) {
+            await Promise.allSettled([...this.activeSelectPromises]);
+          }
           const r = await deliverInteractive(this.d.interactive(), text, msg.delivery ?? "auto");
           if (r.ok) {
             this.record(msg, "interactive");

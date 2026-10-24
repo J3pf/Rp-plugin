@@ -39,18 +39,11 @@ export function normalizeText(s: string): string {
  * Vim-mode safeguard: with a custom editor installed we only type when we can see the editor is in insert mode.
  * Pending confirmation in spike S7.
  */
-export function editorAcceptsText(ctx: ExtensionContext, statuses: Record<string, string>): { ok: boolean; reason?: string } {
-  let custom: unknown;
-  try {
-    custom = ctx.ui.getEditorComponent();
-  } catch {
-    custom = undefined;
-  }
+export function editorAcceptsText(_ctx: ExtensionContext, statuses: Record<string, string>): { ok: boolean; reason?: string } {
   const vimKey = Object.keys(statuses).find((k) => /vim/i.test(k) || /vim/i.test(statuses[k] ?? ""));
   if (vimKey) {
     return /insert/i.test(statuses[vimKey] ?? "") ? { ok: true } : { ok: false, reason: `editor not in insert mode (${statuses[vimKey]})` };
   }
-  void custom;
   return { ok: true };
 }
 

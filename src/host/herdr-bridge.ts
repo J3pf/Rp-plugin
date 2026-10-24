@@ -350,7 +350,12 @@ export class BridgedAgentSession {
         ...(lastActivityAt ? { lastActivityAt } : {}),
       };
       if (direct) {
-        this.conn.sendDirect("agent.snapshot", body);
+        if (this.conn.needsSnapshot) {
+          this.conn.dropQueuedEventsUpTo(this.seq);
+        }
+        const minQueued = this.conn.minQueuedEventSeq();
+        const snapSeq = minQueued !== null ? Math.max(0, minQueued - 1) : this.seq;
+        this.conn.sendDirect("agent.snapshot", { ...body, seq: snapSeq });
         for (const ev of events) {
           if (ev.type === "subagent_update") this.sendEvent(ev);
         }
@@ -385,8 +390,16 @@ export class BridgedAgentSession {
       truncated: false,
       ...(entryAt ? { lastActivityAt: entryAt } : {}),
     };
-    if (direct) this.conn.sendDirect("agent.snapshot", body);
-    else this.conn.send("agent.snapshot", body);
+    if (direct) {
+      if (this.conn.needsSnapshot) {
+        this.conn.dropQueuedEventsUpTo(this.seq);
+      }
+      const minQueued = this.conn.minQueuedEventSeq();
+      const snapSeq = minQueued !== null ? Math.max(0, minQueued - 1) : this.seq;
+      this.conn.sendDirect("agent.snapshot", { ...body, seq: snapSeq });
+    } else {
+      this.conn.send("agent.snapshot", body);
+    }
   }
 
   private sendEvent(e: Record<string, unknown>): void {

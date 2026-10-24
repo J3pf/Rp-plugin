@@ -19,7 +19,7 @@ interface Current {
 
 export class AdapterRegistry implements CustomInterceptor {
   private byTool = new Map<string, CustomDialogAdapter>();
-  private current: Current | null = null;
+  private stack: Current[] = [];
   enabled = true;
 
   constructor(private broker: Broker, adapters: CustomDialogAdapter[] = BUILTIN_ADAPTERS) {
@@ -34,24 +34,29 @@ export class AdapterRegistry implements CustomInterceptor {
     return this.byTool.has(tool);
   }
 
-  /** tool_execution_start: both gentle tools are executionMode "sequential", so at most one is active. */
+  /** tool_execution_start: track active adapted tool calls by toolCallId. */
   onStart(ev: { toolCallId?: string; toolName?: string; args?: unknown }): void {
     if (!this.enabled || !ev?.toolName) return;
     const adapter = this.byTool.get(ev.toolName);
     if (!adapter || !adapter.accepts(ev.args)) return;
-    this.current = { toolCallId: String(ev.toolCallId), args: ev.args, adapter };
+    const id = String(ev.toolCallId);
+    const idx = this.stack.findIndex((c) => c.toolCallId === id);
+    if (idx >= 0) this.stack.splice(idx, 1);
+    this.stack.push({ toolCallId: id, args: ev.args, adapter });
   }
 
   onEnd(ev: { toolCallId?: string }): void {
-    if (this.current && this.current.toolCallId === String(ev?.toolCallId)) this.current = null;
+    const id = String(ev?.toolCallId);
+    const idx = this.stack.findIndex((c) => c.toolCallId === id);
+    if (idx >= 0) this.stack.splice(idx, 1);
   }
 
   active(): boolean {
-    return this.enabled && this.current !== null;
+    return this.enabled && this.stack.length > 0;
   }
 
   async race<T>(factory: (...a: any[]) => any, _options: unknown, runOrig: (factory: (...a: any[]) => any) => Promise<T>): Promise<T> {
-    const cur = this.current!;
+    const cur = this.stack[this.stack.length - 1]!;
     let doneRef: ((v: unknown) => void) | undefined;
     let pendingResult: unknown = undefined;
     let hasPendingResult = false;
