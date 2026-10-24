@@ -63,7 +63,7 @@ export function loadHostConfig(env: NodeJS.ProcessEnv = process.env): { cfg: Hos
 }
 
 export function writeDefaultHostConfig(p: string): void {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
   const body = {
     roots: DEFAULT_HOST_CONFIG.roots,
     backend: "auto",

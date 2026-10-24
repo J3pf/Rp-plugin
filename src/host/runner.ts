@@ -15,15 +15,39 @@ export type Runner = (cmd: string, args: string[], opts?: RunOptions) => Promise
 
 export const run: Runner = (cmd, args, opts = {}) =>
   new Promise((resolve) => {
-    execFile(
+    const timeoutMs = opts.timeoutMs ?? 15_000;
+    let settled = false;
+    const child = execFile(
       cmd,
       args,
-      { cwd: opts.cwd, env: opts.env ? { ...process.env, ...opts.env } : process.env, timeout: opts.timeoutMs ?? 15_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+      {
+        cwd: opts.cwd,
+        env: opts.env ? { ...process.env, ...opts.env } : process.env,
+        timeout: timeoutMs,
+        windowsHide: true,
+        maxBuffer: 4 * 1024 * 1024,
+      },
       (err, stdout, stderr) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(killTimer);
         if (err) {
           const code = typeof (err as any).code === "number" ? (err as any).code : -1;
           resolve({ code, stdout: String(stdout ?? ""), stderr: String(stderr || (err as Error).message) });
-        } else resolve({ code: 0, stdout: String(stdout), stderr: String(stderr) });
+        } else {
+          resolve({ code: 0, stdout: String(stdout), stderr: String(stderr) });
+        }
       },
     );
+    const killTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      resolve({ code: -1, stdout: "", stderr: "command timed out (SIGKILL)" });
+    }, timeoutMs + 2_000);
+    killTimer.unref?.();
   });

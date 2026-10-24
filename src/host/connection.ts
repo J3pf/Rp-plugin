@@ -6,7 +6,7 @@ import { getProxyAgent, toWsUrl } from "../shared/http.ts";
 import { backoffDelay, errMsg } from "../shared/util.ts";
 import type { HostConfig } from "./config.ts";
 import type { HostManager } from "./manager.ts";
-import { HostError, listDirs } from "./validate.ts";
+import { HostError, listDirs, validateSessionId } from "./validate.ts";
 import { gitDiff, gitDiscard } from "./git.ts";
 
 export interface HostConnectionOptions {
@@ -25,6 +25,7 @@ export class HostConnection {
   private attempt = 0;
   private timer: NodeJS.Timeout | null = null;
   private watchdog: NodeJS.Timeout | null = null;
+  private pingTimer: NodeJS.Timeout | null = null;
   private quotaTimer: NodeJS.Timeout | null = null;
   private quotaPolling = false;
 
@@ -40,6 +41,7 @@ export class HostConnection {
 
   stop(): void {
     this.stopped = true;
+    this.stopHeartbeat();
     this.clearWatchdog();
     this.stopQuotaTimer();
     if (this.timer) clearTimeout(this.timer);
@@ -51,7 +53,30 @@ export class HostConnection {
     }
   }
 
-  /** The relay pings every 25 s; silence beyond 70 s means a dead socket. */
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.pingTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.ping();
+        } catch {
+          try {
+            this.ws.terminate();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }, 20_000);
+    this.pingTimer.unref?.();
+  }
+
+  private stopHeartbeat(): void {
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = null;
+  }
+
+  /** The relay pings every 25 s, client pings every 20 s; silence beyond 70 s means a dead socket. */
   private arm(): void {
     this.clearWatchdog();
     this.watchdog = setTimeout(() => this.ws?.terminate(), 70_000);
@@ -97,10 +122,12 @@ export class HostConnection {
     ws.on("open", () => {
       this.attempt = 0;
       this.arm();
+      this.startHeartbeat();
       this.startQuotaTimer();
-      void this.hello(ws);
+      void this.hello(ws).catch((e) => this.log(`hello failed: ${errMsg(e)}`));
     });
     ws.on("ping", () => this.arm());
+    ws.on("pong", () => this.arm());
     ws.on("message", (data) => {
       this.arm();
       const env = parseEnvelope(data.toString("utf8"));
@@ -120,6 +147,7 @@ export class HostConnection {
       }
     });
     ws.on("close", (code) => {
+      this.stopHeartbeat();
       this.clearWatchdog();
       this.stopQuotaTimer();
       if (this.ws !== ws) return;
@@ -129,7 +157,12 @@ export class HostConnection {
   }
 
   private sendEnv(e: Envelope): void {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(e));
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify(e));
+    } catch {
+      /* ignore transient send error */
+    }
   }
 
   private startQuotaTimer(): void {
@@ -239,9 +272,15 @@ export class HostConnection {
 export function parseTarget(t: any) {
   if (!t || typeof t !== "object") return undefined;
   if (t.type === "workspace") return { type: "workspace" as const };
-  if (t.type === "tab" && typeof t.workspaceId === "string" && t.workspaceId) return { type: "tab" as const, workspaceId: t.workspaceId };
+  if (t.type === "tab" && typeof t.workspaceId === "string" && t.workspaceId) {
+    return { type: "tab" as const, workspaceId: validateSessionId(t.workspaceId) };
+  }
   if (t.type === "split" && typeof t.paneId === "string" && t.paneId) {
-    return { type: "split" as const, paneId: t.paneId, direction: t.direction === "down" ? ("down" as const) : ("right" as const) };
+    return {
+      type: "split" as const,
+      paneId: validateSessionId(t.paneId),
+      direction: t.direction === "down" ? ("down" as const) : ("right" as const),
+    };
   }
   throw new HostError("bad_request", "invalid herdrTarget");
 }

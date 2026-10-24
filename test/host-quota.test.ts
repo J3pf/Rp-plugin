@@ -126,6 +126,16 @@ describe("mapPiquotaJsonToMachineQuotas", () => {
               remainingPercent: NaN,
               resetsInSec: 12.34,
             },
+            {
+              id: "w2",
+              label: "Only usedPercent",
+              usedPercent: 75,
+            },
+            {
+              id: "w3",
+              label: "Only remainingPercent clamped",
+              remainingPercent: 120,
+            },
           ],
         },
       ],
@@ -135,6 +145,10 @@ describe("mapPiquotaJsonToMachineQuotas", () => {
     expect(quotas[0]!.windows[0]!.usedPercent).toBe(0);
     expect(quotas[0]!.windows[0]!.remainingPercent).toBe(100);
     expect(quotas[0]!.windows[0]!.resetsInSec).toBe(12);
+    expect(quotas[0]!.windows[1]!.usedPercent).toBe(75);
+    expect(quotas[0]!.windows[1]!.remainingPercent).toBe(25);
+    expect(quotas[0]!.windows[2]!.remainingPercent).toBe(100);
+    expect(quotas[0]!.windows[2]!.usedPercent).toBe(0);
   });
 });
 

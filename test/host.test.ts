@@ -241,9 +241,13 @@ describe("Windows backends (id travels as --rp-spawn-id because wt/cmd do not pa
   });
   it("cmd /c start arguments", () => {
     expect(consoleArgs(req)).toEqual(["/c", "start", '"api"', "/D", "C:\\proyectos\\api", "gentle-shell", "--link", "--rp-spawn-id", "SPAWNID12345"]);
+    expect(() => consoleArgs({ ...req, cwd: "C:\\proyectos\\api&calc" })).toThrow(/unsafe/);
+    expect(() => consoleArgs({ ...req, launcherCommand: "pi & whoami" })).toThrow(/unsafe/);
   });
   it("kill script matches only this spawn id", () => {
     expect(killScript("SPAWNID12345")).toContain("--rp-spawn-id SPAWNID12345*");
+    expect(killScript("SPAWNID12345")).toContain("$_.ProcessId -ne $PID");
+    expect(() => killScript("bad'; Stop-Process")).toThrow(HostError);
   });
   it("spawn/kill run wt.exe / cmd.exe / powershell without a shell string", async () => {
     const f = fakeRun({ "wt.exe": () => ({}), "cmd.exe": () => ({}), "powershell.exe": () => ({}), "where wt.exe": () => ({}) });
@@ -975,12 +979,32 @@ Statut: Inconnu
       expect(added?.patch).toContain("+fresh");
 
       // Discard untracked
-      await gitDiscard(cfg, dir, "new.txt");
+      const disc1 = await gitDiscard(cfg, dir, "new.txt");
+      expect(disc1).toEqual({ cwd: fs.realpathSync(dir), ok: true, path: "new.txt" });
       expect(fs.existsSync(path.join(dir, "new.txt"))).toBe(false);
 
       // Discard modified
       await gitDiscard(cfg, dir, "file.txt");
       expect(fs.readFileSync(path.join(dir, "file.txt"), "utf8")).toBe("hello\nworld\n");
+
+      // Filenames with leading/internal spaces and untracked nested directories
+      fs.mkdirSync(path.join(dir, "sub dir"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "sub dir", " spaced.txt"), "space content\n");
+      const diffSpace = await gitDiff(cfg, dir);
+      expect(diffSpace.cwd).toBe(fs.realpathSync(dir));
+      const spaceFile = diffSpace.files.find((f) => f.path === "sub dir/ spaced.txt");
+      expect(spaceFile).toBeDefined();
+      expect(spaceFile?.binary).toBe(false);
+      expect(spaceFile?.truncated).toBe(false);
+      expect(spaceFile?.patch).toContain("+space content");
+      await gitDiscard(cfg, dir, "sub dir/ spaced.txt");
+      expect(fs.existsSync(path.join(dir, "sub dir", " spaced.txt"))).toBe(false);
+
+      // Rejects traversal, '.' / '..', option flags, and pathspec magic
+      await expect(gitDiscard(cfg, dir, ".")).rejects.toThrow(/invalid relative path/);
+      await expect(gitDiscard(cfg, dir, "sub/../..")).rejects.toThrow(/invalid relative path/);
+      await expect(gitDiscard(cfg, dir, ":(icase)file.txt")).rejects.toThrow(/invalid relative path/);
+      await expect(gitDiscard(cfg, dir, "-f")).rejects.toThrow(/invalid relative path/);
 
       const cleanDiff = await gitDiff(cfg, dir);
       expect(cleanDiff.files.length).toBe(0);

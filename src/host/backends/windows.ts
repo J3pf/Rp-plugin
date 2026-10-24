@@ -1,21 +1,35 @@
 // Windows backends: Windows Terminal (`wt.exe`) and plain console (`cmd /c start`).
 // Neither passes environment variables, so the id travels as the `--rp-spawn-id` flag registered by the plugin.
-import { HostError, splitCommand } from "../validate.ts";
+import { HostError, splitCommand, validateSessionId, validateSpawnId } from "../validate.ts";
 import type { Backend, BackendDeps, SpawnRecord, SpawnRequest } from "./types.ts";
 
+const CMD_META_RE = /[&|<>^%\r\n\0"!]/;
+
 export function wtArgs(req: SpawnRequest): string[] {
-  if (req.cwd.includes(";")) throw new HostError("bad_request", "cwd with ';' is not supported by Windows Terminal");
-  return ["-w", "rp", "new-tab", "-d", req.cwd, "--title", req.name, ...splitCommand(req.launcherCommand), "--rp-spawn-id", req.spawnId];
+  const spawnId = validateSpawnId(req.spawnId);
+  if (req.sessionId !== undefined) validateSessionId(req.sessionId);
+  if (req.cwd.includes(";") || /[\r\n\0]/.test(req.cwd)) {
+    throw new HostError("bad_request", "cwd with ';' or control chars is not supported by Windows Terminal");
+  }
+  const cleanName = req.name.replace(/[\r\n\0;]/g, " ");
+  return ["-w", "rp", "new-tab", "-d", req.cwd, "--title", cleanName, ...splitCommand(req.launcherCommand), "--rp-spawn-id", spawnId];
 }
 
 export function consoleArgs(req: SpawnRequest): string[] {
-  const title = `"${req.name.replace(/"/g, "")}"`;
-  return ["/c", "start", title, "/D", req.cwd, ...splitCommand(req.launcherCommand), "--rp-spawn-id", req.spawnId];
+  const spawnId = validateSpawnId(req.spawnId);
+  if (req.sessionId !== undefined) validateSessionId(req.sessionId);
+  const parts = splitCommand(req.launcherCommand);
+  if (CMD_META_RE.test(req.cwd) || parts.some((p) => CMD_META_RE.test(p))) {
+    throw new HostError("bad_request", "unsafe characters for Windows console backend");
+  }
+  const title = `"${req.name.replace(/["&|<>^%\r\n\0!]/g, "")}"`;
+  return ["/c", "start", title, "/D", req.cwd, ...parts, "--rp-spawn-id", spawnId];
 }
 
-/** PowerShell that stops the processes whose command line carries the spawn id (ids are alphanumeric → injection-safe). */
+/** PowerShell that stops the processes whose command line carries the spawn id (ids are validated alphanumeric → injection-safe). */
 export function killScript(spawnId: string): string {
-  return `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*--rp-spawn-id ${spawnId}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`;
+  const safeId = validateSpawnId(spawnId);
+  return `Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*--rp-spawn-id ${safeId}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`;
 }
 
 async function killByFlag(d: BackendDeps, spawnId: string): Promise<void> {

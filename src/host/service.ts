@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { safeUser } from "../shared/util.ts";
 import { run as realRun, type Runner } from "./runner.ts";
 
 export interface ServiceSpec {
@@ -89,9 +90,23 @@ export function isStaleNodePath(installedNodePath: string): boolean {
   }
 }
 
+function stripControlChars(s: string): string {
+  return s.replace(/[\0\r\n]/g, "");
+}
+
+function escapeXml(value: string): string {
+  return stripControlChars(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 export function systemdUnit(spec: ServiceSpec): string {
-  const envPath = spec.envPath ?? process.env.PATH ?? "";
-  const pathEnvironment = envPath ? `Environment="PATH=${envPath.replace(/(["\\])/g, "\\$1")}"\n` : "";
+  const envPath = stripControlChars(spec.envPath ?? process.env.PATH ?? "");
+  const escapedEnvPath = envPath.replace(/%/g, "%%").replace(/(["\\])/g, "\\$1");
+  const pathEnvironment = escapedEnvPath ? `Environment="PATH=${escapedEnvPath}"\n` : "";
   return `[Unit]
 Description=RP host (create Pi agents from the phone)
 StartLimitIntervalSec=0
@@ -109,7 +124,8 @@ WantedBy=default.target
 }
 
 function quoteSystemd(s: string): string {
-  return /[\s"\\]/.test(s) ? `"${s.replace(/(["\\])/g, "\\$1")}"` : s;
+  const clean = stripControlChars(s).replace(/%/g, "%%");
+  return /[\s"\\]/.test(clean) ? `"${clean.replace(/(["\\])/g, "\\$1")}"` : clean;
 }
 
 export function systemdUnitPath(home = os.homedir()): string {
@@ -117,7 +133,8 @@ export function systemdUnitPath(home = os.homedir()): string {
 }
 
 export function schtasksXml(spec: ServiceSpec): string {
-  const esc = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const safeNode = escapeXml(spec.nodePath.replace(/"/g, ""));
+  const safeScript = escapeXml(spec.scriptPath.replace(/"/g, ""));
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -152,7 +169,7 @@ export function schtasksXml(spec: ServiceSpec): string {
   <Actions Context="Author">
     <Exec>
       <Command>conhost.exe</Command>
-      <Arguments>--headless "${esc(spec.nodePath)}" "${esc(spec.scriptPath)}" run</Arguments>
+      <Arguments>--headless "${safeNode}" "${safeScript}" run</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -165,14 +182,15 @@ export function schtasksCreateXmlArgs(xmlPath: string): string[] {
 
 export function schtasksCreateArgs(spec: ServiceSpec, xmlPath?: string): string[] {
   if (xmlPath !== undefined) return schtasksCreateXmlArgs(xmlPath);
-  const tr = `conhost.exe --headless "${spec.nodePath}" "${spec.scriptPath}" run`;
+  const safeNode = stripControlChars(spec.nodePath).replace(/"/g, "");
+  const safeScript = stripControlChars(spec.scriptPath).replace(/"/g, "");
+  const tr = `conhost.exe --headless "${safeNode}" "${safeScript}" run`;
   return ["/Create", "/SC", "ONLOGON", "/TN", "rp-host", "/TR", tr, "/F"];
 }
 
 export const LAUNCHD_LABEL = "dev.j3pf.rp-host";
 
 export function launchdPlist(spec: ServiceSpec): string {
-  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const home = spec.home ?? os.homedir();
   const logPath = path.join(home, "Library", "Logs", "rp-host.log");
   const envPath = spec.envPath ?? process.env.PATH ?? "";
@@ -182,18 +200,18 @@ export function launchdPlist(spec: ServiceSpec): string {
 <dict>
   <key>Label</key><string>${LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
-  <array><string>${esc(spec.nodePath)}</string><string>${esc(spec.scriptPath)}</string><string>run</string></array>
+  <array><string>${escapeXml(spec.nodePath)}</string><string>${escapeXml(spec.scriptPath)}</string><string>run</string></array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${esc(envPath)}</string>
+    <string>${escapeXml(envPath)}</string>
   </dict>
   <key>ThrottleInterval</key>
   <integer>5</integer>
   <key>StandardOutPath</key>
-  <string>${esc(logPath)}</string>
+  <string>${escapeXml(logPath)}</string>
   <key>StandardErrorPath</key>
-  <string>${esc(logPath)}</string>
+  <string>${escapeXml(logPath)}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict>
@@ -206,7 +224,7 @@ export function launchdPath(home = os.homedir()): string {
 }
 
 function lingerUser(user?: string): string {
-  return user ?? process.env.USER ?? os.userInfo().username;
+  return user ?? process.env.USER ?? safeUser();
 }
 
 export async function checkLinger(user?: string, run: Runner = realRun): Promise<{ lingering: boolean; error?: string }> {
@@ -282,7 +300,7 @@ function parseExecStart(value: string): string[] {
   }
   if (escaped) current += String.fromCharCode(92);
   if (current) args.push(current);
-  return args;
+  return args.map((a) => a.replace(/%%/g, "%"));
 }
 
 function validInstalledNode(nodePath: string | undefined): boolean {

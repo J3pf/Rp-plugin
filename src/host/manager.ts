@@ -69,7 +69,16 @@ export class HostManager {
   private load(): void {
     try {
       const arr: SpawnRecord[] = JSON.parse(fs.readFileSync(this.storeFile, "utf8"));
-      for (const r of arr) if (r?.spawnId) this.records.set(r.spawnId, r);
+      if (!Array.isArray(arr)) return;
+      for (const r of arr) {
+        if (!r || typeof r !== "object" || !r.spawnId) continue;
+        try {
+          const validId = validateSpawnId(r.spawnId);
+          this.records.set(validId, { ...r, spawnId: validId });
+        } catch {
+          /* skip invalid persisted record */
+        }
+      }
       this.trimRecords();
     } catch {
       /* first run */
@@ -77,8 +86,11 @@ export class HostManager {
   }
   private save(): void {
     try {
-      fs.mkdirSync(path.dirname(this.storeFile), { recursive: true });
-      fs.writeFileSync(this.storeFile, JSON.stringify([...this.records.values()], null, 2), { mode: 0o600 });
+      const dir = path.dirname(this.storeFile);
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const tmpFile = `${this.storeFile}.${process.pid}.tmp`;
+      fs.writeFileSync(tmpFile, JSON.stringify([...this.records.values()], null, 2), { mode: 0o600 });
+      fs.renameSync(tmpFile, this.storeFile);
     } catch {
       /* best effort */
     }
@@ -158,10 +170,5 @@ export class HostManager {
   async collectQuotas(): Promise<MachineQuota[] | null> {
     if (!this.cfg.quotaEnabled) return null;
     return this.quotaCollector.collect();
-  }
-
-  getLastQuotas(): MachineQuota[] | null {
-    if (!this.cfg.quotaEnabled) return null;
-    return this.quotaCollector.getLastQuotas();
   }
 }

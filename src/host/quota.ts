@@ -51,13 +51,26 @@ export function mapPiquotaJsonToMachineQuotas(raw: unknown): MachineQuota[] {
 
     const windows: QuotaWindow[] = [];
     if (Array.isArray(p.windows)) {
+      const clampPct = (n: number) => Math.min(100, Math.max(0, n));
       for (const w of p.windows) {
         if (!w || typeof w !== "object" || typeof w.id !== "string" || !w.id) continue;
+        const rawUsed = parseNum(w.usedPercent, NaN);
+        const rawRem = parseNum(w.remainingPercent, NaN);
+        const usedPercent = Number.isFinite(rawUsed)
+          ? clampPct(rawUsed)
+          : Number.isFinite(rawRem)
+            ? clampPct(100 - rawRem)
+            : 0;
+        const remainingPercent = Number.isFinite(rawRem)
+          ? clampPct(rawRem)
+          : Number.isFinite(rawUsed)
+            ? clampPct(100 - rawUsed)
+            : 100;
         windows.push({
           id: String(w.id),
           label: parseOptStr(w.label),
-          usedPercent: parseNum(w.usedPercent, 0),
-          remainingPercent: parseNum(w.remainingPercent, 100),
+          usedPercent,
+          remainingPercent,
           resetsAt: parseOptStr(w.resetsAt),
           resetsInSec: parseOptInt(w.resetsInSec),
           note: parseOptStr(w.note),
@@ -87,7 +100,6 @@ export class QuotaCollector {
   private timeoutMs: number;
   private onLog?: (msg: string) => void;
   private lastQuotas: MachineQuota[] | null = null;
-  private lastCollectedAt = 0;
 
   constructor(opts: QuotaCollectorOptions = {}) {
     this.runner = opts.runner ?? realRun;
@@ -98,10 +110,6 @@ export class QuotaCollector {
 
   getLastQuotas(): MachineQuota[] | null {
     return this.lastQuotas;
-  }
-
-  getLastCollectedAt(): number {
-    return this.lastCollectedAt;
   }
 
   async collect(): Promise<MachineQuota[] | null> {
@@ -130,7 +138,6 @@ export class QuotaCollector {
 
       const quotas = mapPiquotaJsonToMachineQuotas(parsed);
       this.lastQuotas = quotas;
-      this.lastCollectedAt = Date.now();
       return quotas;
     } catch (e) {
       this.onLog?.(`quota collection exception: ${(e as Error).message}`);
