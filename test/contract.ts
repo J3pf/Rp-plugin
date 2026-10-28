@@ -173,6 +173,7 @@ export const validators: Record<string, (d: any) => string[]> = {
       },
       "event",
     ),
+  "agent.closed": (d) => check(d, { reason: oneOf("pane_closed") }, "agent.closed"),
   "agent.status": (d) => check(d, { status, detail: (v) => typeof v === "string" }, "status", ["detail"]),
   "agent.statuses": (d) => check(d, { items: (v) => isObj(v) && Object.values(v).every((x) => typeof x === "string") }, "statuses"),
   "prompt.open": (d) => check(d, promptOpenShape, "prompt.open", ["message", "tool", "source", "options", "placeholder", "questions"]),

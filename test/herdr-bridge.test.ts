@@ -281,6 +281,136 @@ describe("herdr-bridge & PreToolUse gate", () => {
     ]);
   });
 
+  it("sends agent.closed once after a discovered pane disappears, then stops its connection", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-closed-"));
+    tmpDirs.push(dir);
+    let listPoll = 0;
+    const transports = new Map<string, FakeTransport>();
+    const runner = async (cmd: string, args: string[]) => {
+      if (cmd === "herdr" && args[0] === "agent" && args[1] === "list") {
+        listPoll++;
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            result: {
+              agents: listPoll === 1 ? [{ agent: "claude", pane_id: "wS:p1", cwd: dir, agent_status: "idle" }] : [],
+            },
+          }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    };
+    const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+    const bridge = new HerdrAgentBridge({
+      relayUrl: "https://relay.example.com",
+      machineId: "M1",
+      token: "T1",
+      cfg,
+      herdrSession: null,
+      runner,
+      socketPath: path.join(dir, "agy-gate.sock"),
+      pollIntervalMs: 60_000,
+      connectionFactory: (opts) =>
+        new Connection({
+          ...opts,
+          transportFactory: (_name, handlers) => {
+            const transport = new FakeTransport("ws", handlers);
+            transports.set(opts.agentId, transport);
+            return transport;
+          },
+        }),
+    });
+
+    try {
+      await bridge.poll();
+      const session = bridge.getActiveSessions()[0]!;
+      const transport = transports.get(session.agentId)!;
+      transport.open();
+      transport.receive({ v: 1, id: "w1", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+      expect(transport.sent.filter((env) => env.t === "agent.closed")).toHaveLength(0);
+      expect(bridge.getActiveSessions()).toContain(session);
+
+      const closeOriginal = session.closeFromHerdr.bind(session);
+      const close = vi.spyOn(session, "closeFromHerdr");
+      close.mockImplementation((reason, _graceMs) => closeOriginal(reason, 20));
+
+      await bridge.poll();
+      expect(transport.sent.filter((env) => env.t === "agent.closed")).toHaveLength(0);
+      expect(bridge.getActiveSessions()).toContain(session);
+      await bridge.poll();
+
+      const closed = transport.sent.filter((env) => env.t === "agent.closed");
+      expect(closed).toHaveLength(1);
+      expect(closed[0]!.d).toEqual({ reason: "pane_closed" });
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(bridge.getActiveSessions()).not.toContain(session);
+      expect(session.conn.state).toBe("connected");
+      await vi.waitFor(() => expect(session.conn.state).toBe("stopped"), { timeout: 1_000, interval: 5 });
+    } finally {
+      bridge.stop();
+    }
+  });
+
+  it("keeps a vanished pane with an open prompt and does not send agent.closed", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-closed-prompt-"));
+    tmpDirs.push(dir);
+    let listPoll = 0;
+    const transports = new Map<string, FakeTransport>();
+    const runner = async (cmd: string, args: string[]) => {
+      if (cmd === "herdr" && args[0] === "agent" && args[1] === "list") {
+        listPoll++;
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            result: {
+              agents: listPoll === 1 ? [{ agent: "claude", pane_id: "wS:p2", cwd: dir, agent_status: "idle" }] : [],
+            },
+          }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    };
+    const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+    const bridge = new HerdrAgentBridge({
+      relayUrl: "https://relay.example.com",
+      machineId: "M1",
+      token: "T1",
+      cfg,
+      herdrSession: null,
+      runner,
+      socketPath: path.join(dir, "agy-gate.sock"),
+      pollIntervalMs: 60_000,
+      connectionFactory: (opts) =>
+        new Connection({
+          ...opts,
+          transportFactory: (_name, handlers) => {
+            const transport = new FakeTransport("ws", handlers);
+            transports.set(opts.agentId, transport);
+            return transport;
+          },
+        }),
+    });
+
+    try {
+      await bridge.poll();
+      const session = bridge.getActiveSessions()[0]!;
+      const transport = transports.get(session.agentId)!;
+      transport.open();
+      transport.receive({ v: 1, id: "w1", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+      session.broker.open({ kind: "confirm", title: "Confirm", message: "Keep pane open?" });
+
+      await bridge.poll();
+      await bridge.poll();
+
+      expect(transport.sent.filter((env) => env.t === "agent.closed")).toHaveLength(0);
+      expect(bridge.getActiveSessions()).toContain(session);
+    } finally {
+      bridge.stop();
+    }
+  });
+
   it("bridges discovered agy agents, delivers prompts via herdr, and gates dangerous commands via PreToolUse", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-bridge-"));
     tmpDirs.push(dir);

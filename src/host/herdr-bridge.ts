@@ -20,6 +20,7 @@ import { AgyTranscriptReader, parseAgyArgs, resolveAgyTranscriptPath } from "./a
 import { configDir } from "../shared/platform.ts";
 import {
   newId,
+  type AgentClosedReason,
   type AgentHelloBody,
   type AgentStatus,
   type Envelope,
@@ -159,6 +160,7 @@ export class BridgedAgentSession {
   private optimisticWorkingUntilMs = 0;
   private fallbackTurnTs = 0;
   private commandTimer: NodeJS.Timeout | null = null;
+  private closeTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private info: HerdrDiscoveredAgent,
@@ -704,9 +706,21 @@ export class BridgedAgentSession {
     });
   }
 
+  closeFromHerdr(reason: AgentClosedReason = "pane_closed", graceMs = 250): void {
+    if (this.disposed || this.closeTimer) return;
+    if (this.conn.connected) this.conn.sendDirect("agent.closed", { reason });
+    this.closeTimer = setTimeout(() => {
+      this.closeTimer = null;
+      this.stop();
+    }, graceMs);
+    this.closeTimer.unref?.();
+  }
+
   stop(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.closeTimer) clearTimeout(this.closeTimer);
+    this.closeTimer = null;
     if (this.commandTimer) clearTimeout(this.commandTimer);
     this.commandTimer = null;
     if (this.startTimer) clearTimeout(this.startTimer);
@@ -880,7 +894,7 @@ export class HerdrAgentBridge {
         if (session.broker.openCount > 0 || gateAge < 30_000) continue;
         const misses = (this.missingPolls.get(key) ?? 0) + 1;
         if (misses >= 2) {
-          session.stop();
+          session.closeFromHerdr();
           this.sessionsByKey.delete(key);
           this.missingPolls.delete(key);
           this.gateCreatedAt.delete(key);
