@@ -89,6 +89,7 @@ Una vez instalado, abre Pi (`pi` o `gentle-shell`) y ejecuta:
 | Comandos `/rp pair\|status\|doctor\|on\|off\|gate\|test\|unpair` | `commands.ts` |
 | `rp-host`: autostart per-OS (systemd linger/PATH, Task Scheduler XML PT0S/batteries/restart, launchd bootstrap/logs), auto-repair on Pi `session_start`, `rp-host doctor` | `src/host/`, `src/extension/host-autostart.ts` |
 | `rp-host`: recolección periódica de cuotas de IA (`piquota --json`) y reporte a `rp-relay` | `src/host/quota.ts` |
+| Sincronía de ciclo de vida con herdr en ambos sentidos: cerrar el panel lo borra de la app (`agent.closed`) y olvidar el agente en la app cierra su panel (`host.herdr_close` → `herdr pane close`) | `src/host/herdr-bridge.ts`, `src/host/connection.ts` |
 
 Documentos: [INSTALACION](docs/INSTALACION.md) (instalación y troubleshooting) · [PLAN-PLUGIN](docs/PLAN-PLUGIN.md) (plan + estado de implementación) · [RESILIENCIA](docs/RESILIENCIA.md) ·
 [COMPATIBILIDAD](docs/COMPATIBILIDAD.md) · [ARQUITECTURA](docs/ARQUITECTURA.md) · [QA manual](docs/QA.md) ·

@@ -44,6 +44,9 @@ sólo se puede comprobar a mano, en tus dos PCs y con la app. Marca cada casilla
 - [ ] `initialPrompt` llega al agente nuevo.
 - [ ] Una carpeta fuera de `roots` o un `launcher` inventado son rechazados.
 - [ ] `host.kill` cierra sólo agentes creados por rp-host.
+- [ ] Olvidar en la app un agente descubierto en herdr (confirmando el cierre): su panel desaparece en herdr.
+- [ ] Cerrar a mano un panel de herdr: el agente desaparece de la app en dos sondeos (`agent.closed`, `pane_closed`).
+- [ ] `host.herdr_close` con un panel inexistente responde `ok:false` (`pane_not_found`) y rp-host sigue conectado.
 
 ## 6. Resiliencia
 - [ ] Reiniciar el relay con un agente trabajando: se reconecta solo y la app resincroniza.

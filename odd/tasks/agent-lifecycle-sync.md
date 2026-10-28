@@ -1,0 +1,40 @@
+# Feature: Agent lifecycle sync (Herdr panes ⟷ RP agents)
+Two-way lifecycle sync between Herdr panes and the agents the app lists, on the rp-plugin side only
+(`Rp-relay` and `Rp-app` are owned by other sessions). Branch: `feat/agent-lifecycle-sync` | Base: `main` @ 31a083f | Status: in progress
+
+## Specs
+- S1 — herdr → app (user, L1): "que si uno elimina un agente de herdr el man también lo borre de la app". When a previously discovered pane stops appearing in `herdr agent list`, the bridge sends `agent.closed {reason:"pane_closed"}` on that agent's socket and then closes it.
+- S2 — app → herdr (user, L2): "basicamente es que si por la app se elimna (olvida) un agente, este debe desparecer de herdr y en el sentido contrario tambien". The app asks the relay to forget an agent; the relay sends `host.herdr_close` to the host that owns it and the host closes that Herdr pane. S1 is the opposite direction.
+- S3 — confirmation (user decision, L3): "Matar con confirmacion". The mobile app closes the Herdr pane only after an explicit confirmation; rp-plugin closes exactly the pane the app asked for and never closes panes on its own initiative.
+- S4 — fixed cross-repo contract (agreed; do not rename without telling the orchestrator):
+  1. `agent.hello` (agent→relay): optional additive `herdr: { paneId, tabId?, workspaceId? }` — mirror the type in `src/shared/protocol.ts` and send it from `herdr-bridge.ts` for every discovered non-Pi agent.
+  2. `host.herdr_close` (relay→host): `{ machineId, paneId }`, handled in `src/host/connection.ts` next to `host.kill` → reply `host.herdr_closed`: `{ paneId, ok: boolean, error?: string|null }`.
+  3. `agent.closed` (agent→relay, sent immediately before the bridge closes that agent socket): `{ reason: "pane_closed" }`.
+- S5 — close path: `host.herdr_close` closes the pane through the Herdr CLI. Real subcommand verified: `herdr pane close <pane_id>` (`herdr pane --help`); `host.kill` only works for spawns rp-host created (`validateSpawnId`), so discovered panes need this new path. Unknown/absent pane → `ok:false` with a typed error, never a crash; never close a pane outside the requested `machineId`; validate inputs the same way the existing host handlers do.
+- S6 — detection: `herdr-bridge.ts` detects that a previously discovered pane no longer exists in `herdr agent list`, sends `agent.closed{pane_closed}` on that agent's socket, and then closes it. Covered by unit tests with a fake runner (no real herdr needed).
+- S7 — compatibility: additive and backward compatible. An old relay that ignores the new fields keeps working; no behaviour change for Pi agents or for the tmux/wt/console backends.
+- S8 — quality: `npm run typecheck && npm test` green (vitest), existing suites untouched in behaviour, README/docs updated where the host RPC surface is documented.
+- S9 — report only (no code without orchestrator go): point 4 of the user's request needs the app's diagram to show running subagents as nodes. Verify whether the Pi extension path emits `subagent_update` events (relay mesh consumes that event type) for Pi subagents, and whether agy/claude/codex bridged agents expose subagent state. Report with `file:line` evidence what the app can actually receive; propose the minimal change if data is missing.
+
+## Tasks
+- T1 (S4.1, S4.3) [gentle-ai-worker] Mirror `herdr` location and `agent.closed` body in `src/shared/protocol.ts`: done (commit 6090e47)
+- T2 (S1, S6) [gentle-ai-worker] Emit `agent.closed` when a discovered pane vanishes, then close that socket (`src/host/herdr-bridge.ts` + unit tests): done (commit 6090e47)
+- T3 (S4.2, S5, S7) [gentle-ai-worker] Handle `host.herdr_close` → `host.herdr_closed` through `herdr pane close`, with pane validation and typed errors (`src/host/connection.ts`, `src/host/validate.ts`, `src/host/manager.ts`, `src/host/backends/herdr.ts` + tests): done (commit 29dbb26)
+- T4 (S8) [inline] Document the host RPC surface and the new lifecycle contract (`docs/PLAN-PLUGIN.md`, `docs/QA.md`, `README.md`): done (this commit)
+- T5 (S8) [gentle-ai-verify] Independent verification against this document, per `S#`: in progress
+- T6 (S9) [inline] Report the `subagent_update` finding for Pi, agy, claude and codex agents with `file:line` evidence: done (report only, no code; evidence in L8)
+
+## Log
+- L1 (user): "que si uno elimina un agente de herdr el man también lo borre de la app"
+- L2 (user): "basicamente es que si por la app se elimna (olvida) un agente, este debe desparecer de herdr y en el sentido contrario tambien"
+- L3 (user decision): "Matar con confirmacion" — the app closes the Herdr pane after an explicit confirmation.
+- L4 (orchestrator brief): fixed cross-repo contract for `agent.hello.herdr`, `host.herdr_close`/`host.herdr_closed` and `agent.closed{reason:"pane_closed"}`; second item (subagent nodes in the app diagram) is report-first, no code without explicit go.
+- L5 (evidence): `herdr pane close <pane_id>` exists in herdr 0.9.5; an unknown pane exits 1 and prints `{"error":{"code":"pane_not_found","message":"pane <id> not found"},"id":"cli:pane:close"}` — so exit code alone is not enough, the JSON error must be parsed.
+- L6 (decision): keep the existing open-prompt / 30s gate grace before removing a vanished pane, and only then send `agent.closed` and close, so a slow `herdr agent list` refresh never cuts an approval in flight.
+- L7 (decision): `agent.closed` is sent before closing the socket with a short bounded grace (default 250 ms) so the long-poll transport can flush the frame; the WebSocket transport flushes on close.
+- L8 (T6 finding, report only — no code):
+  - Pi agents **do** emit `subagent_update`: `src/extension/runtime.ts:136-139` wires the tracker to `emitEvent`, `src/extension/runtime.ts:330-333` wraps it as `agent.event`, and the event is produced for the `subagent_run` tool (`src/extension/subagents.ts:81-115`) plus gentle-pi subagent notifications (`src/extension/index.ts:82` → `src/extension/subagents.ts:177-189`). `agent.hello.subagents` carries the current snapshot (`src/extension/runtime.ts:484`). Gap: only the `subagent_run` tool name is tracked, so a subagent started by any other tool name produces no node.
+  - agy bridged agents expose subagent state through the transcript reader: `src/host/herdr-bridge.ts:173-180` (agy only), `src/host/agy-transcript.ts:552-563` (emits `subagent_update` per subagent tool spec), `src/host/agy-transcript.ts:322-331` (`getSubagents`), forwarded in `agent.hello` (`src/host/herdr-bridge.ts:296`) and in `agent.event` snapshots (`src/host/herdr-bridge.ts:360`).
+  - claude/codex bridged agents expose **no** subagent state: the viewer is created only for agy (`src/host/herdr-bridge.ts:173`), so those sessions fall back to raw pane text (`src/host/herdr-bridge.ts:473-508`) and send no `subagent_update`.
+  - Conclusion for the app diagram: nodes are already available for Pi and agy; claude/codex need a per-CLI transcript or event source that does not exist here yet, so nothing should be invented for them.
+- L9 (verification evidence): the workers could not run the toolchain because `node_modules` was absent; after `npm install`, RED was re-observed by reverting each unit's source while keeping its tests (`test/herdr-bridge.test.ts` 1 failed, `test/host.test.ts` 5 failed with `timeout waiting for reply to host.herdr_close`), then restored: `npm run typecheck` clean, `npx vitest run test/herdr-bridge.test.ts test/host.test.ts test/contract.test.ts` = 84 passed, and the full suite `npm test` = 18 files passed, 377 tests passed, 19 skipped (e2e).
