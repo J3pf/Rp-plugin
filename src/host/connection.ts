@@ -255,6 +255,8 @@ export class HostConnection {
         case "host.kill":
           await this.o.manager.kill(d.spawnId);
           return reply("ack", {});
+        case "host.herdr_close":
+          return reply("host.herdr_closed", await this.o.manager.herdrClose(d.paneId));
         case "error":
           this.log(`relay error: ${d.code} ${d.message}`);
           return;

@@ -89,3 +89,10 @@ export function validateSessionId(id: unknown): string {
   }
   return id;
 }
+
+export function validatePaneId(id: unknown): string {
+  if (typeof id !== "string" || !/^[0-9A-Za-z][0-9A-Za-z_.:-]{0,63}$/.test(id)) {
+    throw new HostError("bad_request", "invalid paneId");
+  }
+  return id;
+}

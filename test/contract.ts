@@ -215,6 +215,7 @@ export const validators: Record<string, (d: any) => string[]> = {
       "host.quotas",
     ),
   "host.dirs": (d) => check(d, { path: (v) => typeof v === "string", dirs: arrayOf(isStr) }, "host.dirs"),
+  "host.herdr_closed": (d) => check(d, { paneId: isStr, ok: isBool, error: nullable(isStr) }, "host.herdr_closed", ["error"]),
   "host.spawned": (d) =>
     check(
       d,

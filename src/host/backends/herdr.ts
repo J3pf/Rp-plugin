@@ -148,6 +148,23 @@ export class HerdrBackend implements Backend {
     if (r.code !== 0) throw new HostError("internal", `herdr ${args[0]} close failed: ${(r.stderr || r.stdout).trim()}`);
   }
 
+  async closePane(paneId: string): Promise<{ ok: boolean; error: string | null }> {
+    try {
+      const r = await this.herdr(["pane", "close", paneId]);
+      const json = parseJson(r.stderr) ?? parseJson(r.stdout);
+      const hasError = json?.error !== null && typeof json?.error === "object";
+      if (r.code === 0 && !hasError) return { ok: true, error: null };
+      const error = (
+        pick(json, ["error.code"]) ??
+        pick(json, ["error.message"]) ??
+        (json === null ? r.stderr.trim() || r.stdout.trim() : "")
+      ) || "herdr_close_failed";
+      return { ok: false, error };
+    } catch {
+      return { ok: false, error: "herdr_close_failed" };
+    }
+  }
+
   /** workspace list + tab list for the app's "where to create the agent" picker. */
   async layout(): Promise<{ workspaces: Array<{ id: string; label: string; cwd: string | null; tabs: Array<{ id: string; label: string; panes: Array<{ id: string; agent?: string }> }> }> }> {
     const [wsRes, tabsRes] = await Promise.all([this.herdr(["workspace", "list"]), this.herdr(["tab", "list"])]);
