@@ -352,6 +352,62 @@ describe("herdr-bridge & PreToolUse gate", () => {
     }
   });
 
+  it("never sends agent.closed while the pane is still listed", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-still-listed-"));
+    tmpDirs.push(dir);
+    const transports = new Map<string, FakeTransport>();
+    const runner = async (cmd: string, args: string[]) => {
+      if (cmd === "herdr" && args[0] === "agent" && args[1] === "list") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            result: { agents: [{ agent: "claude", pane_id: "wL:p1", cwd: dir, agent_status: "idle" }] },
+          }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    };
+    const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+    const bridge = new HerdrAgentBridge({
+      relayUrl: "https://relay.example.com",
+      machineId: "M1",
+      token: "T1",
+      cfg,
+      herdrSession: null,
+      runner,
+      socketPath: path.join(dir, "agy-gate.sock"),
+      pollIntervalMs: 60_000,
+      connectionFactory: (opts) =>
+        new Connection({
+          ...opts,
+          transportFactory: (_name, handlers) => {
+            const transport = new FakeTransport("ws", handlers);
+            transports.set(opts.agentId, transport);
+            return transport;
+          },
+        }),
+    });
+
+    try {
+      await bridge.poll();
+      const session = bridge.getActiveSessions()[0]!;
+      const transport = transports.get(session.agentId)!;
+      transport.open();
+      transport.receive({ v: 1, id: "w1", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+
+      await bridge.poll();
+      await bridge.poll();
+      await bridge.poll();
+
+      expect(transport.sent.filter((env) => env.t === "agent.closed")).toHaveLength(0);
+      expect(bridge.getActiveSessions()).toContain(session);
+      expect(session.conn.state).toBe("connected");
+    } finally {
+      bridge.stop();
+    }
+  });
+
   it("keeps a vanished pane with an open prompt and does not send agent.closed", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-closed-prompt-"));
     tmpDirs.push(dir);

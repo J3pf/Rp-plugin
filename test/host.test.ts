@@ -399,6 +399,15 @@ describe("HostConnection protocol", () => {
     }
     expect(f.calls.filter((call) => call.args[0] === "pane" && call.args[1] === "close")).toHaveLength(0);
   });
+  it("rejects non-string pane ids without invoking Herdr close", async () => {
+    const { f, ask } = await connect({ "herdr --version": () => ({ stdout: "herdr 0.9.5" }) });
+    for (const paneId of [undefined, 123, "-x"]) {
+      const reply = await ask("host.herdr_close", { machineId: "MACH-H", paneId });
+      expect(reply.t).toBe("error");
+      expect(reply.d).toEqual({ code: "bad_request", message: "invalid paneId" });
+    }
+    expect(f.calls.filter((call) => call.args[0] === "pane" && call.args[1] === "close")).toHaveLength(0);
+  });
   it("rejects a mismatched machine id without invoking Herdr close", async () => {
     const { f, ask } = await connect({ "herdr --version": () => ({ stdout: "herdr 0.9.5" }) });
     const reply = await ask("host.herdr_close", { machineId: "OTHER", paneId: "w1:p1" });
