@@ -1,6 +1,7 @@
 // Validation of everything that comes from the phone: it can choose a directory under `roots` and a launcher key, nothing else.
 import fs from "node:fs";
 import path from "node:path";
+import { NO_ROOTS_HINT, missingRoots } from "./config.js";
 import { splitCommand } from "../shared/util.js";
 export { splitCommand };
 export class HostError extends Error {
@@ -51,6 +52,8 @@ export function resolveWithinRoots(cfg, requested, platform = process.platform) 
 }
 export function listDirs(cfg, requested) {
     if (!requested || requested === "/" || requested === "") {
+        if (missingRoots(cfg))
+            throw new HostError("not_found", NO_ROOTS_HINT);
         return { path: "", dirs: cfg.roots.filter((r) => fs.existsSync(r)) };
     }
     const real = resolveWithinRoots(cfg, requested);

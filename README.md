@@ -115,7 +115,7 @@ Documentos: [INSTALACION](docs/INSTALACION.md) (instalación y troubleshooting) 
 }
 ```
 Variables: `RP_RELAY_URL`, `RP_DISABLED=1`, `RP_CONFIG`, `RP_DEBUG=1`; flags de Pi `--rp-off`, `--rp-spawn-id` y `--rp-no-auto-host` (omite el autostart para esa ejecución).
-`rp-host` usa `host.json` (mismo directorio): `roots`, `backend`, `launchers`, `defaultLauncher`, `herdrSession`, `quotaEnabled`, `quotaCommand`, `quotaIntervalSec`.
+`rp-host` usa `host.json` (mismo directorio). Las carpetas que el teléfono puede explorar se gestionan con `rp-host roots` (`list`, `add <ruta>`, `remove <ruta>`); si no configuras ninguna, usa las carpetas de proyectos habituales que existan (`~/Projects`, `~/dev`, `~/code`, …) y, si no hay ninguna, `rp-host doctor` y la app te piden ejecutar `rp-host roots add <ruta>`. Campos: `roots`, `backend`, `launchers`, `defaultLauncher`, `herdrSession`, `quotaEnabled`, `quotaCommand`, `quotaIntervalSec`.
 
 ```bash
 rp-host init

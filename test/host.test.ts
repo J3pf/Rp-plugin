@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { normalizeHostConfig, withDetectedRoots, writeDefaultHostConfig, DEFAULT_HOST_CONFIG } from "../src/host/config.ts";
+import { addRoot, removeRoot, normalizeHostConfig, withDetectedRoots, writeDefaultHostConfig, DEFAULT_HOST_CONFIG } from "../src/host/config.ts";
 import { HostError, listDirs, resolveLauncher, resolveWithinRoots, sanitizeLabel, splitCommand, validateSpawnId } from "../src/host/validate.ts";
 import { gitDiff, gitDiscard } from "../src/host/git.ts";
 import { HerdrBackend, parseJson, pick, PANE_PATHS } from "../src/host/backends/herdr.ts";
@@ -1102,11 +1102,17 @@ describe("withDetectedRoots", () => {
     fs.mkdirSync(path.join(h, "Projects"));
     expect(withDetectedRoots(normalizeHostConfig({}, h), h).roots).toEqual([path.join(h, "proyectos")]);
   });
-  it("falls back to the first usual project folder that exists", () => {
+  it("uses every usual project folder that exists, in order", () => {
     const h = home();
     fs.mkdirSync(path.join(h, "code"));
     fs.mkdirSync(path.join(h, "Projects"));
-    expect(withDetectedRoots(normalizeHostConfig({ roots: ["~/proyectos"] }, h), h).roots).toEqual([path.join(h, "Projects")]);
+    expect(withDetectedRoots(normalizeHostConfig({ roots: ["~/proyectos"] }, h), h).roots).toEqual([path.join(h, "Projects"), path.join(h, "code")]);
+  });
+  it("counts a folder once when two names point at the same directory", () => {
+    const h = home();
+    fs.mkdirSync(path.join(h, "Projects"));
+    fs.symlinkSync(path.join(h, "Projects"), path.join(h, "dev"));
+    expect(withDetectedRoots(normalizeHostConfig({}, h), h).roots).toEqual([path.join(h, "Projects")]);
   });
   it("keeps the default when nothing exists", () => {
     const h = home();
@@ -1117,5 +1123,45 @@ describe("withDetectedRoots", () => {
     fs.mkdirSync(path.join(h, "Projects"));
     const cfg = normalizeHostConfig({ roots: ["~/mine"] }, h);
     expect(withDetectedRoots(cfg, h).roots).toEqual([path.join(h, "mine")]);
+  });
+});
+
+describe("roots resilience", () => {
+  const setup = () => {
+    const h = tmp();
+    return { h, file: path.join(h, "host.json") };
+  };
+  it("host.list_dirs says what to do when no root exists", () => {
+    const h = tmp();
+    const cfg = normalizeHostConfig({}, h);
+    expect(() => listDirs(cfg, "")).toThrow(/rp-host roots add/);
+  });
+  it("addRoot replaces the missing default, keeps other settings and is idempotent", () => {
+    const { h, file } = setup();
+    fs.mkdirSync(path.join(h, "work"));
+    fs.writeFileSync(file, JSON.stringify({ roots: ["~/proyectos"], backend: "tmux" }));
+    expect(addRoot(file, "~/work", h)).toEqual([path.join(h, "work")]);
+    expect(addRoot(file, path.join(h, "work"), h)).toEqual([path.join(h, "work")]);
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw).toEqual({ roots: [path.join(h, "work")], backend: "tmux" });
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+  });
+  it("addRoot appends to explicit roots and rejects bad targets", () => {
+    const { h, file } = setup();
+    fs.mkdirSync(path.join(h, "a"));
+    fs.mkdirSync(path.join(h, "b"));
+    fs.writeFileSync(file, JSON.stringify({ roots: [path.join(h, "a")] }));
+    expect(addRoot(file, path.join(h, "b"), h)).toEqual([path.join(h, "a"), path.join(h, "b")]);
+    expect(() => addRoot(file, path.join(h, "nope"), h)).toThrow(/not found/);
+    fs.writeFileSync(path.join(h, "f"), "x");
+    expect(() => addRoot(file, path.join(h, "f"), h)).toThrow(/not a directory/);
+    expect(() => addRoot(file, path.parse(h).root, h)).toThrow(/filesystem root/);
+  });
+  it("addRoot creates host.json when missing; removeRoot returns to the default", () => {
+    const { h, file } = setup();
+    fs.mkdirSync(path.join(h, "a"));
+    addRoot(file, path.join(h, "a"), h);
+    expect(removeRoot(file, path.join(h, "a"), h)).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).roots).toEqual(DEFAULT_HOST_CONFIG.roots);
   });
 });

@@ -3,7 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../extension/config.ts";
-import { loadHostConfig, writeDefaultHostConfig } from "./config.ts";
+import { expandHome } from "../shared/platform.ts";
+import { addRoot, loadHostConfig, missingRoots, NO_ROOTS_HINT, removeRoot, writeDefaultHostConfig } from "./config.ts";
 import { HostConnection } from "./connection.ts";
 import { HerdrAgentBridge, installAgyHooks, runAgyHook } from "./herdr-bridge.ts";
 import { HostManager } from "./manager.ts";
@@ -17,6 +18,7 @@ Usage: rp-host <command>
   uninstall   Remove the service
   status      Show config, available backends and spawned agents
   doctor      Check service status and diagnose autostart / health
+  roots       List / add <path> / remove <path> project folders the phone may browse
   init        Write a default ~/.config/rp/host.json if missing
   agy-hook    Antigravity CLI PreToolUse hook entrypoint
 
@@ -59,6 +61,24 @@ export async function main(argv: string[]): Promise<void> {
       }
       return;
     }
+    case "roots": {
+      const { cfg, path: hp } = loadHostConfig();
+      const [sub, target] = [argv[1] ?? "list", argv[2]];
+      if (sub === "list") {
+        for (const r of cfg.roots) console.log(`${fs.existsSync(r) ? "ok     " : "missing"} ${r}`);
+        if (missingRoots(cfg)) console.log(NO_ROOTS_HINT);
+        process.exitCode = missingRoots(cfg) ? 1 : 0;
+        return;
+      }
+      if ((sub === "add" || sub === "remove") && target) {
+        const roots = sub === "add" ? addRoot(hp, target) : removeRoot(hp, target);
+        console.log(`${sub === "add" ? "added" : "removed"}: ${path.resolve(expandHome(target))}`);
+        console.log(`roots: ${roots.length ? roots.join(", ") : "(default / autodetect)"}`);
+        console.log("restart rp-host to apply: `rp-host install` (or restart the service)");
+        return;
+      }
+      throw new Error("usage: rp-host roots [list | add <path> | remove <path>]");
+    }
     case "install": {
       const stableNode = resolveStableNodePath(process.env, process.platform);
       try {
@@ -80,7 +100,7 @@ export async function main(argv: string[]): Promise<void> {
       };
       const inspection = await inspectService(spec);
       const healthy = inspection.installed && inspection.enabled !== false && inspection.running && !inspection.stale && inspection.nodePathValid && inspection.scriptPathValid &&
-        (inspection.platform !== "linux" || inspection.details?.linger === true);
+        (inspection.platform !== "linux" || inspection.details?.linger === true) && !missingRoots(loadHostConfig().cfg);
       const status = healthy ? "OK" : "PROBLEM";
       if (argv.includes("--json")) {
         console.log(JSON.stringify({ status, healthy, ...inspection }, null, 2));
@@ -108,6 +128,7 @@ export async function main(argv: string[]): Promise<void> {
           if (!inspection.nodePathValid) problems.push("node path is invalid or stale");
           if (!inspection.scriptPathValid) problems.push("host script path is missing");
           if (inspection.platform === "linux" && inspection.details?.linger !== true) problems.push("systemd user lingering is disabled");
+          if (missingRoots(loadHostConfig().cfg)) problems.push(NO_ROOTS_HINT);
           for (const problem of problems) console.log(`Problem: ${problem}`);
         }
       }
