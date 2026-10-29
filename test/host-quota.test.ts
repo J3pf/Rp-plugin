@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mapPiquotaJsonToMachineQuotas, QuotaCollector } from "../src/host/quota.ts";
+import { mapPiquotaJsonToMachineQuotas, piquotaScriptCandidates, QuotaCollector } from "../src/host/quota.ts";
 import type { Runner } from "../src/host/runner.ts";
 
 const SAMPLE_PIQUOTA_OUTPUT = {
@@ -219,5 +219,44 @@ describe("QuotaCollector", () => {
     const quotas = await collector.collect();
     expect(quotas).toBeNull();
     expect(logs.some((l) => l.includes("invalid JSON"))).toBe(true);
+  });
+});
+
+describe("piquota not on PATH (service environment)", () => {
+  const script = new URL(import.meta.url).pathname; // any existing file
+  const miss: Awaited<ReturnType<Runner>> = { code: -1, stdout: "", stderr: "spawn piquota ENOENT" };
+
+  it("falls back to the Pi-installed script run with the host's node", async () => {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const runner: Runner = async (cmd, args) => {
+      calls.push({ cmd, args });
+      return cmd === "piquota" ? miss : { code: 0, stdout: JSON.stringify(SAMPLE_PIQUOTA_OUTPUT), stderr: "" };
+    };
+    const c = new QuotaCollector({ runner, fallbackScripts: () => ["/nope/piquota.js", script] });
+    const quotas = await c.collect();
+    expect(quotas?.map((q) => q.family)).toContain("antigravity");
+    expect(calls[1]).toEqual({ cmd: process.execPath, args: [script, "--json"] });
+  });
+
+  it("stays graceful when no fallback script exists", async () => {
+    const logs: string[] = [];
+    const runner: Runner = async () => miss;
+    const c = new QuotaCollector({ runner, fallbackScripts: () => ["/nope/piquota.js"], onLog: (m) => logs.push(m) });
+    expect(await c.collect()).toBeNull();
+    expect(logs).toHaveLength(1);
+  });
+
+  it("does not second-guess a custom command", async () => {
+    let n = 0;
+    const runner: Runner = async () => (n++, miss);
+    await new QuotaCollector({ runner, command: "/opt/x/piquota --json", fallbackScripts: () => [script] }).collect();
+    expect(n).toBe(1);
+  });
+
+  it("looks in the pi and gentle-shell agent dirs", () => {
+    const got = piquotaScriptCandidates({ PI_CODING_AGENT_DIR: "/a" }, "/h");
+    expect(got[0]).toBe("/a/npm/node_modules/@j3pf/piquota/bin/piquota.js");
+    expect(got).toContain("/h/.pi/agent/npm/node_modules/@j3pf/piquota/bin/piquota.js");
+    expect(got).toContain("/h/.gentle-shell/agent/npm/node_modules/@j3pf/piquota/bin/piquota.js");
   });
 });

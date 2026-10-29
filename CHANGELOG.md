@@ -5,6 +5,11 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Quotas did not show up for users because `piquota` is installed as a Pi package and is not on the PATH of the launchd/systemd service. With the default `quotaCommand`, the collector now falls back to the Pi-installed script (`$PI_CODING_AGENT_DIR`, `~/.pi/agent`, `~/.gentle-shell/agent`) run with the host's own node; custom commands are untouched.
+
 ## [0.3.1] - 2026-10-29
 
 Hotfix: `rp-host` could not start on git installs.

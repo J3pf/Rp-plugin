@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { run as realRun } from "./runner.js";
 import { splitCommand } from "./validate.js";
 function parseNum(val, fallback) {
@@ -83,17 +86,27 @@ export function mapPiquotaJsonToMachineQuotas(raw) {
     }
     return result;
 }
+/**
+ * `piquota` ships as a Pi package, so it is usually not on the PATH of a launchd/systemd
+ * service. Look where Pi installs npm packages (pi and gentle-shell homes).
+ */
+export function piquotaScriptCandidates(env = process.env, home = os.homedir()) {
+    const agentDirs = [env.PI_CODING_AGENT_DIR, path.join(home, ".pi", "agent"), path.join(home, ".gentle-shell", "agent")].filter((d) => !!d);
+    return agentDirs.map((d) => path.join(d, "npm", "node_modules", "@j3pf", "piquota", "bin", "piquota.js"));
+}
 export class QuotaCollector {
     runner;
     command;
     timeoutMs;
     onLog;
+    fallbackScripts;
     lastQuotas = null;
     constructor(opts = {}) {
         this.runner = opts.runner ?? realRun;
         this.command = opts.command ?? "piquota --json";
         this.timeoutMs = opts.timeoutMs ?? 15_000;
         this.onLog = opts.onLog;
+        this.fallbackScripts = opts.fallbackScripts ?? (() => piquotaScriptCandidates());
     }
     getLastQuotas() {
         return this.lastQuotas;
@@ -106,7 +119,13 @@ export class QuotaCollector {
         }
         const [bin, ...args] = parts;
         try {
-            const res = await this.runner(bin, args, { timeoutMs: this.timeoutMs });
+            let res = await this.runner(bin, args, { timeoutMs: this.timeoutMs });
+            if (res.code === -1 && bin === "piquota") {
+                // Not on PATH (typical for a service): run the Pi-installed script with this same node.
+                const script = this.fallbackScripts().find((f) => fs.existsSync(f));
+                if (script)
+                    res = await this.runner(process.execPath, [script, ...args], { timeoutMs: this.timeoutMs });
+            }
             if (res.code !== 0) {
                 const errSnippet = (res.stderr || res.stdout || "").trim().slice(0, 200);
                 this.onLog?.(`quota command "${this.command}" failed (exit ${res.code}): ${errSnippet}`);
