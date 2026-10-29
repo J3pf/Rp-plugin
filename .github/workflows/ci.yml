@@ -56,8 +56,8 @@ jobs:
           GENTLE_AI_BIN: ${{ runner.temp }}/gentle-ai-bin
 
   windows:
-    continue-on-error: true   # stays permissive only until the job is observed running the unit tests; see the comment on the setup-go step
-    # Windows paths, Task Scheduler arguments and wt/cmd argument building run on a real win32 Node.
+    # Required, not advisory: run 40870326831 shows this job executing the unit suite on win32
+    # (Tests 248 passed (248)), so a red Windows run is now a real regression, not missing setup.
     name: windows (unit)
     runs-on: windows-latest
     steps:
