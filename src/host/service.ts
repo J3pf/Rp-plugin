@@ -81,7 +81,7 @@ export function resolveStableNodePath(env?: NodeJS.ProcessEnv, platform: NodeJS.
 }
 
 export function isStaleNodePath(installedNodePath: string): boolean {
-  if (!isNodeBinaryName(installedNodePath) || !fs.existsSync(installedNodePath) || installedNodePath.includes("/Cellar/node/")) return true;
+  if (!isNodeBinaryName(installedNodePath) || !fs.existsSync(installedNodePath) || /[\\/]Cellar[\\/]node[\\/]/.test(installedNodePath)) return true;
   try {
     fs.realpathSync(installedNodePath);
     return false;

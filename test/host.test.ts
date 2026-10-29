@@ -443,7 +443,8 @@ describe("HostConnection protocol", () => {
       return waitUntil(() => relay.all.slice(before).find((e) => e.re === id), 3000, `reply to ${t}`);
     };
     expect((await ask("host.list_dirs", { machineId: "MACH1", path: root })).d).toEqual({ path: fs.realpathSync(root), dirs: ["alpha"] });
-    const bad = await ask("host.list_dirs", { machineId: "MACH1", path: "/etc" });
+    const outside = tmp();
+    const bad = await ask("host.list_dirs", { machineId: "MACH1", path: outside });
     expect(bad.t).toBe("error");
     expect(bad.d.code).toBe("bad_request");
     const sp = await ask("host.spawn", { machineId: "MACH1", cwd: path.join(root, "alpha"), name: "alpha", launcher: "pi", sessionId: "sess-resumed", initialPrompt: "hola" });
@@ -602,7 +603,8 @@ describe("service installation", () => {
     expect(u).toContain('Environment="PATH=/home/u/bin:/usr/bin"');
     expect(u).toContain("WantedBy=default.target");
     expect(systemdUnit({ ...spec, scriptPath: "/opt/my dir/rp.mjs" })).toContain('"/opt/my dir/rp.mjs"');
-    expect(systemdUnit(spec)).toContain(`Environment="PATH=${process.env.PATH ?? ""}"`);
+    const escapedPath = (process.env.PATH ?? "").replace(/%/g, "%%").replace(/(["\\])/g, "\\$1");
+    expect(systemdUnit(spec)).toContain(`Environment="PATH=${escapedPath}"`);
     expect(systemdUnit({ ...spec, envPath: "" })).not.toContain('Environment="PATH=');
   });
   it("Task Scheduler at logon, without admin and with windowless conhost launcher", () => {
@@ -692,8 +694,9 @@ describe("service installation", () => {
     expect(p).toContain("<key>PATH</key>");
     expect(p).toContain("<string>/opt/bin:/usr/bin</string>");
     expect(p).toContain("<key>ThrottleInterval</key>\n  <integer>5</integer>");
-    expect(p).toContain(`<key>StandardOutPath</key>\n  <string>${home}/Library/Logs/rp-host.log</string>`);
-    expect(p).toContain(`<key>StandardErrorPath</key>\n  <string>${home}/Library/Logs/rp-host.log</string>`);
+    const logPath = path.join(home, "Library", "Logs", "rp-host.log");
+    expect(p).toContain(`<key>StandardOutPath</key>\n  <string>${logPath}</string>`);
+    expect(p).toContain(`<key>StandardErrorPath</key>\n  <string>${logPath}</string>`);
   });
   it("checks and enables login linger through the injected runner", async () => {
     const yes = fakeRun({ "loginctl show-user alice -p Linger": () => ({ stdout: "Linger=yes\n" }) });
@@ -961,7 +964,8 @@ Statut: Inconnu
     const unit = systemdUnit({ ...linuxSpec, envPath: process.env.PATH });
     const unitPath = path.join(home, ".config", "systemd", "user", "rp-host.service");
     fs.mkdirSync(path.dirname(unitPath), { recursive: true });
-    fs.writeFileSync(unitPath, unit.replace(nodePath, "/missing/old-node"));
+    const staleUnit = systemdUnit({ ...linuxSpec, nodePath: path.join(home, "gone-node"), envPath: process.env.PATH });
+    fs.writeFileSync(unitPath, staleUnit);
     const stale = await ensureHostService(linuxSpec, fakeRun(handlers(false)).run);
     expect(stale.action).toBe("reinstalled");
     fs.writeFileSync(unitPath, unit);
@@ -1034,6 +1038,7 @@ Statut: Inconnu
     const dir = tmp();
     try {
       execSync("git init", { cwd: dir });
+      execSync("git config core.autocrlf false", { cwd: dir });
       execSync('git config user.email "test@test.com" && git config user.name "Test"', { cwd: dir });
       fs.writeFileSync(path.join(dir, "file.txt"), "hello\nworld\n");
       execSync("git add file.txt && git commit -m initial", { cwd: dir });
@@ -1144,7 +1149,7 @@ describe("roots resilience", () => {
     expect(addRoot(file, path.join(h, "work"), h)).toEqual([path.join(h, "work")]);
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
     expect(raw).toEqual({ roots: [path.join(h, "work")], backend: "tmux" });
-    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") expect(fs.statSync(file).mode & 0o777).toBe(0o600);
   });
   it("addRoot appends to explicit roots and rejects bad targets", () => {
     const { h, file } = setup();
