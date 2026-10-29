@@ -8,6 +8,7 @@ import { getSharedUi, mirrorTookEffect, warnOnce } from "../compat.ts";
 export interface CustomInterceptor {
   active(): boolean;
   race<T>(factory: (...a: any[]) => any, options: any, runOrig: (factory: (...a: any[]) => any) => Promise<T>): Promise<T>;
+  customMirror?<T>(factory: (...a: any[]) => any, options: any, runOrig: (factory: (...a: any[]) => any) => Promise<T>): Promise<T>;
 }
 
 export interface MirrorResult {
@@ -46,7 +47,11 @@ export function installMirror(
       broker.race({ kind: "input", title, placeholder, opts: o }, (s) => orig.input.call(ui, title, placeholder, withSignal(o, s)));
     if (custom) {
       ui.custom = (factory: any, o?: any) =>
-        custom.active() ? custom.race(factory, o, (f) => orig.custom.call(ui, f, o)) : orig.custom.call(ui, factory, o);
+        custom.active()
+          ? custom.customMirror
+            ? custom.customMirror(factory, o, (f) => orig.custom.call(ui, f, o))
+            : custom.race(factory, o, (f) => orig.custom.call(ui, f, o))
+          : orig.custom.call(ui, factory, o);
     }
   }
   ui.setStatus = (k: string, v: string | undefined) => {
