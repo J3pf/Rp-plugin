@@ -38,13 +38,34 @@ export function normalizeHostConfig(raw, home) {
         quotaIntervalSec,
     };
 }
+/** Usual project folders, most specific first; the default `~/proyectos` is only a guess. */
+const COMMON_ROOTS = ["~/proyectos", "~/Projects", "~/projects", "~/dev", "~/code", "~/src", "~/workspace", "~/repos", "~/Developer"];
+/**
+ * When the roots are still the shipped default and that folder does not exist, use the first
+ * usual project folder that does, so the phone's folder picker is not empty. Roots the user
+ * chose explicitly are never replaced.
+ */
+export function withDetectedRoots(cfg, home) {
+    const isDefault = cfg.roots.length === DEFAULT_HOST_CONFIG.roots.length && cfg.roots.every((r, i) => r === path.resolve(expandHome(DEFAULT_HOST_CONFIG.roots[i], home)));
+    if (!isDefault || cfg.roots.some((r) => fs.existsSync(r)))
+        return cfg;
+    for (const c of COMMON_ROOTS) {
+        const dir = path.resolve(expandHome(c, home));
+        try {
+            if (fs.statSync(dir).isDirectory())
+                return { ...cfg, roots: [dir] };
+        }
+        catch { }
+    }
+    return cfg;
+}
 export function loadHostConfig(env = process.env) {
     const p = hostConfigPath(env);
     try {
-        return { cfg: normalizeHostConfig(JSON.parse(fs.readFileSync(p, "utf8"))), path: p, exists: true };
+        return { cfg: withDetectedRoots(normalizeHostConfig(JSON.parse(fs.readFileSync(p, "utf8")))), path: p, exists: true };
     }
     catch {
-        return { cfg: normalizeHostConfig({}), path: p, exists: false };
+        return { cfg: withDetectedRoots(normalizeHostConfig({})), path: p, exists: false };
     }
 }
 export function writeDefaultHostConfig(p) {

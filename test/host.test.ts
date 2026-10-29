@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { normalizeHostConfig, writeDefaultHostConfig, DEFAULT_HOST_CONFIG } from "../src/host/config.ts";
+import { normalizeHostConfig, withDetectedRoots, writeDefaultHostConfig, DEFAULT_HOST_CONFIG } from "../src/host/config.ts";
 import { HostError, listDirs, resolveLauncher, resolveWithinRoots, sanitizeLabel, splitCommand, validateSpawnId } from "../src/host/validate.ts";
 import { gitDiff, gitDiscard } from "../src/host/git.ts";
 import { HerdrBackend, parseJson, pick, PANE_PATHS } from "../src/host/backends/herdr.ts";
@@ -1091,5 +1091,31 @@ Statut: Inconnu
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("withDetectedRoots", () => {
+  const home = () => tmp();
+  it("keeps the default when it exists", () => {
+    const h = home();
+    fs.mkdirSync(path.join(h, "proyectos"));
+    fs.mkdirSync(path.join(h, "Projects"));
+    expect(withDetectedRoots(normalizeHostConfig({}, h), h).roots).toEqual([path.join(h, "proyectos")]);
+  });
+  it("falls back to the first usual project folder that exists", () => {
+    const h = home();
+    fs.mkdirSync(path.join(h, "code"));
+    fs.mkdirSync(path.join(h, "Projects"));
+    expect(withDetectedRoots(normalizeHostConfig({ roots: ["~/proyectos"] }, h), h).roots).toEqual([path.join(h, "Projects")]);
+  });
+  it("keeps the default when nothing exists", () => {
+    const h = home();
+    expect(withDetectedRoots(normalizeHostConfig({}, h), h).roots).toEqual([path.join(h, "proyectos")]);
+  });
+  it("never replaces roots chosen by the user", () => {
+    const h = home();
+    fs.mkdirSync(path.join(h, "Projects"));
+    const cfg = normalizeHostConfig({ roots: ["~/mine"] }, h);
+    expect(withDetectedRoots(cfg, h).roots).toEqual([path.join(h, "mine")]);
   });
 });
