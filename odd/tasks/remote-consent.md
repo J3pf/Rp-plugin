@@ -1,0 +1,39 @@
+# Feature: Remote review consent (answer gentle-pi's "Review consent" from the app)
+Branch: `feat/remote-consent` | Base: `main` @ 98676ae | Status: implementing the guarded component mirror (T2)
+
+## Specs
+- S1 — user need (verbatim): "cuando son solicitudes de este tipo: [captura del prompt] Review consent / Gentle AI can review this change before you call it done / 1. Review this change / 2. Skip this time / 3. Review and allow this session / Effect: ... — no me deja responderlas desde la app, por eso tarde tanto en autorizar, andaba fuera". The app must be able to answer that consent dialog.
+- S2 — the three actions, in this order and with their own text: `1. Review this change`, `2. Skip this time`, `3. Review and allow this session`, each with its `Effect:` line; action 3's text is gentle-pi's constant (`HOST_REVIEW_SESSION_PERMISSION_LABEL/EFFECT`), never invented by rp-plugin.
+- S3 — lossless content: headline, reason, value, risk, target, projection, evidence lines and the off-path note must all reach the prompt. No shortening that hides a consequence.
+- S4 — never fabricate authority: the answer must be delivered through the component's own callbacks (`onSelect(index)` / `onCancel`), so the provider-owned grant stays provider-owned. No synthesised answer tokens, no bypassing the component.
+- S5 — the visual title stays app-owned ("Review consent"); the provider `headline` must never become the prompt title (gentle-pi asserts this itself).
+- S6 — isolation: a component that does not match the expected shape passes through untouched to the terminal; `ask_user_choice`, `ask_user_question` and `ask_user` keep working exactly as today.
+- S7 — prefer a supported hook over reflection; if the content cannot be read robustly, STOP and report the component shape and the options rather than shipping a fragile hack.
+- S8 — tests with a fake factory/component (no real TUI): prompt emitted with the three ordered options; answer index maps to `onSelect` with the right index; cancel maps to `onCancel`; non-matching dialog passes through; unreadable content posts no prompt.
+- S9 — separate branch `feat/remote-consent` and PR from P1; no tag, no publish, no version bump, no merge without explicit go.
+- S10 — report the exact prompt shape (kind, title, body fields, options with ids/descriptions/effects, danger) because Rp-app's C2 renders it verbatim.
+
+## Facts (evidence, from the read-only exploration)
+- RP intercepts `ctx.ui.custom` in `src/extension/prompts/mirror.ts:43-44`; when no adapter is on the stack it delegates straight to `orig.custom`, which is why this dialog reaches the terminal untouched.
+- `AdapterRegistry` (`src/extension/prompts/adapters/index.ts:19-43`) is keyed by tool name and builds the prompt from `tool_execution_start` args via `toPrompt(args)`. Registered today: `ask_user_choice`, `ask_user_question`, `ask_user`.
+- `gentle_review`'s tool args do **not** carry the consent envelope: `node_modules/gentle-pi/extensions/gentle-ai.ts:10070` is just `{ operation: "start", ... }`, and the envelope is produced inside native execution and held in a module-private registry (`extensions/gentle-ai.ts:6757, 8572`).
+- `UIPromptStartEvent` carries only `{ type, reason, kind, title? }` (`node_modules/@earendil-works/pi-coding-agent/types.d.ts:809-814`): no component, no content, no factory.
+- The component factory receives `(tui, theme, keybindings, done)` and returns only `{ getActionOptions, render, invalidate, handleInput }` (`node_modules/gentle-pi/lib/review-consent-ui.ts:89-97`). `onSelect`/`onCancel` and the content live in the private `ReviewConsentComponent` instance.
+- `getActionOptions()` returns the three strings `"1. <label>\nEffect: <effect>"` verbatim (`lib/review-consent-component.ts:70-72`) — the actions and their consequences are reachable through a public method.
+- The rest of the content (`headline`, `reason`, `value`, `risk`, `target`, `projection`, `evidence`, `offPathNote`) is only reachable through `render(width)`, i.e. the rendered lines, not as fields. `ReviewConsentContent` is declared in `lib/review-consent-component.ts:11-23`.
+- `done({ kind: "provider", answer: "granted" | "declined" })` and `done({ kind: "host-session" })` are the component's own results (`lib/review-consent-ui.ts:84-87`), so the authority path is available if the prompt can be built.
+
+## Feasibility verdict
+Building this under the current `AdapterRegistry` design is **infeasible without either (a) a small upstream hook in gentle-pi that exposes the consent envelope/content, or (b) reading the component's rendered lines and mirroring them verbatim** (a presentation scrape that survives content changes but not layout changes). Everything else the feature needs already exists: the `ctx.ui.custom` interception, the broker, the `done` callback, and the three action strings.
+
+## Tasks
+- T1 (S7) [inline] Report the component shape, the factory arguments, the reachable content and the two viable paths, and wait for the product decision: done (decision in L4)
+- T2 (S2, S3, S4, S5, S8) [gentle-ai-worker] Implement the guarded component mirror for `gentle_review` (component adapter + registry/ mirror hook + tests): in progress
+- T3 (S9, S10) [inline] Docs, contract report for Rp-app and PR: pending
+
+## Log
+- L1 (user, verbatim): "cuando son solicitudes de este tipo: [captura del prompt] Review consent / Gentle AI can review this change before you call it done / 1. Review this change / 2. Skip this time / 3. Review and allow this session / Effect: ... — no me deja responderlas desde la app, por eso tarde tanto en autorizar, andaba fuera" (via the coordinating session for Rp-app's C2).
+- L2 (constraints, from the coordinating session): never fabricate authority; lossless content; prefer a supported hook; if unreadable, stop and report the shape and options; separate branch and PR; report the prompt shape field by field.
+- L3 (exploration): the evidence in "Facts" above, gathered read-only with `path:line` references. Conclusion: content is not exposed as fields; actions and their effects are; the terminal components' render output is the only full source.
+- L4 (user decision): "la idea es que se pueda responder desde la app, si no pierde un poco de sentido la app" — it must work today from the phone, so the chosen path is the guarded component mirror: read the mounted component's rendered lines verbatim (actions screen + the `D` details screen), show the three actions from `getActionOptions()` with their `Effect:` text, and deliver the answer by calling the component's own `done` callback with the exact selection values gentle-pi's `onSelect` would produce. Any shape deviation (no title line, not three actions, no details screen, component not returned) means no prompt and an untouched terminal dialog.
+- L5 (decision, mapping): the three answers map to `{kind:"provider",answer:"granted"}`, `{kind:"provider",answer:"declined"}` and `{kind:"host-session"}`, exactly as `node_modules/gentle-pi/lib/review-consent-ui.ts:84-87` does; the mapping lives in one place with that citation so a gentle-pi change is a one-line fix.
