@@ -17,7 +17,7 @@ Usage: rp-host <command>
   install     Install as a service (systemd --user / Task Scheduler at logon / launchd)
   uninstall   Remove the service
   status      Show config, available backends and spawned agents
-  doctor      Check service status and diagnose autostart / health
+  doctor      Check service status, project folders and autostart / health
   roots       List / add <path> / remove <path> project folders the phone may browse
   init        Write a default ~/.config/rp/host.json if missing
   agy-hook    Antigravity CLI PreToolUse hook entrypoint
@@ -113,6 +113,8 @@ export async function main(argv: string[]): Promise<void> {
         console.log(`Script Path: ${inspection.scriptPath ?? "not reported"} (${inspection.scriptPathValid ? "valid" : "missing"})`);
         console.log(`Stale: ${inspection.stale ? "yes" : "no"}`);
         if (inspection.staleReason) console.log(`Stale Reason: ${inspection.staleReason}`);
+        const roots = loadHostConfig().cfg.roots;
+        for (const root of roots) console.log(`Roots: ${root} (${fs.existsSync(root) ? "found" : "missing"})`);
         if (inspection.platform === "linux") {
           console.log(`Linger: ${inspection.details?.linger === true ? "enabled" : "disabled"}`);
           if (inspection.details?.lingerError) console.log(`Linger Error: ${inspection.details.lingerError}`);

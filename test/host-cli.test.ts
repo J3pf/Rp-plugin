@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { inspectService, type ServiceInspection } from "../src/host/service.ts";
+import { NO_ROOTS_HINT } from "../src/host/config.ts";
 import { main } from "../src/host/main.ts";
 
 vi.mock("../src/host/service.ts", async (importOriginal) => {
@@ -13,6 +14,12 @@ vi.mock("../src/host/service.ts", async (importOriginal) => {
 let dir: string;
 let previousExitCode: typeof process.exitCode;
 const backup = { ...process.env };
+/** Writes host.json with explicit project roots, so doctor's health never depends on the runner's home. */
+function writeRoots(roots: string[]): void {
+  const p = process.env.RP_CONFIG!;
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p.replace(/config\.json$/, "host.json"), JSON.stringify({ roots }, null, 2));
+}
 beforeEach(() => {
   previousExitCode = process.exitCode;
   vi.mocked(inspectService).mockReset();
@@ -33,7 +40,7 @@ describe("rp-host CLI", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     await main(["--help"]);
     expect(log.mock.calls[0]![0]).toContain("rp-host");
-    expect(log.mock.calls[0]![0]).toContain("doctor      Check service status and diagnose autostart / health");
+    expect(log.mock.calls[0]![0]).toContain("doctor      Check service status, project folders and autostart / health");
     await main(["init"]);
     const hostJson = path.join(dir, "rp", "host.json");
     expect(JSON.parse(fs.readFileSync(hostJson, "utf8")).defaultLauncher).toBe("gentle-shell");
@@ -50,6 +57,9 @@ describe("rp-host CLI", () => {
   });
   it("doctor reports healthy services as OK with exit code zero", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const projects = path.join(dir, "projects");
+    fs.mkdirSync(projects);
+    writeRoots([projects]);
     vi.mocked(inspectService).mockResolvedValue({
       platform: process.platform,
       installed: true,
@@ -63,9 +73,34 @@ describe("rp-host CLI", () => {
       details: process.platform === "linux" ? { linger: true } : {},
     });
     await main(["doctor"]);
-    expect(log.mock.calls.map(([line]) => line).join("\n")).toContain("Status: OK");
+    const out = log.mock.calls.map(([line]) => line).join("\n");
+    expect(out).toContain("Status: OK");
+    expect(out).toContain(`Roots: ${projects} (found)`);
+    expect(out).not.toContain(NO_ROOTS_HINT);
     expect(process.exitCode).toBe(0);
     expect(vi.mocked(inspectService)).toHaveBeenCalledWith(expect.objectContaining({ platform: process.platform, scriptPath: expect.stringContaining("rp-host.mjs") }));
+  });
+  it("doctor reports a healthy service with no existing project folder as a problem, with the roots hint", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    writeRoots([path.join(dir, "missing-projects")]);
+    vi.mocked(inspectService).mockResolvedValue({
+      platform: "darwin",
+      installed: true,
+      enabled: true,
+      running: true,
+      nodePath: "/stable/node",
+      nodePathValid: true,
+      scriptPath: "/rp-host.mjs",
+      scriptPathValid: true,
+      stale: false,
+      details: {},
+    });
+    await main(["doctor"]);
+    const out = log.mock.calls.map(([line]) => line).join("\n");
+    expect(out).toContain("Roots: " + path.join(dir, "missing-projects") + " (missing)");
+    expect(out).toContain("Status: PROBLEM");
+    expect(out).toContain(`Problem: ${NO_ROOTS_HINT}`);
+    expect(process.exitCode).toBe(1);
   });
   it("doctor reports unhealthy services with a nonzero exit code", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
