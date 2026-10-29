@@ -5,6 +5,21 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-10-29
+
+`rp-host doctor` keeps its health verdict and now says which project folders it checked; the Windows CI job actually runs the tests.
+
+### Added
+- **`rp-host doctor` lists the project folders it checked**: one `Roots: <path> (found|missing)` line per configured folder. A red run used to say "no project folder found" without saying which folders had been looked at, so answering "is this machine healthy?" needed a second command.
+
+### Fixed
+- **`rp-host doctor`'s health verdict survives the resilient-roots behaviour** and is now pinned by tests: a healthy service with no existing project folder is `Status: PROBLEM` with `Problem: no project folder found: run \`rp-host roots add <path>\`` and exit 1, while a machine with an existing folder reports `Status: OK` and exit 0. The test that failed on CI built no folders at all and only passed on a developer machine whose own `~/Projects` was auto-detected.
+- **Homebrew-shaped Node paths are recognised on any platform**: the stale-path check matched only `/Cellar/node/`, so a `Cellar` path built with `path.join` on Windows was not treated as stale. macOS and Linux semantics are unchanged.
+
+### CI
+- **`windows (unit)` runs the unit suite instead of dying in `npm ci`**: gentle-pi builds its Gentle AI binary from source on Windows and requires Go >= 1.25.10, which the runner did not have. The job now installs Go 1.25.10 (pinned exactly), and the eight tests that assumed a POSIX/macOS host were corrected — a real temp folder instead of `/etc`, systemd and launchd expectations that follow the host's path escaping, a fixture repo with `core.autocrlf=false`, and the POSIX-only `0600` assertion skipped visibly on Windows. The job is required now: it runs `248 passed (248)`, so a red Windows run is a real regression.
+- `continue-on-error: true` and its stale "promote to required once green" comment are gone.
+
 ## [0.3.4] - 2026-10-29
 
 Project folders work out of the box for more users, and the rest get a clear way to fix it.
