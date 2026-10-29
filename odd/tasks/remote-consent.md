@@ -12,6 +12,10 @@ Branch: `feat/remote-consent` | Base: `main` @ 98676ae | Status: implementing th
 - S8 — tests with a fake factory/component (no real TUI): prompt emitted with the three ordered options; answer index maps to `onSelect` with the right index; cancel maps to `onCancel`; non-matching dialog passes through; unreadable content posts no prompt.
 - S9 — separate branch `feat/remote-consent` and PR from P1; no tag, no publish, no version bump, no merge without explicit go.
 - S10 — report the exact prompt shape (kind, title, body fields, options with ids/descriptions/effects, danger) because Rp-app's C2 renders it verbatim.
+- S11 — do not damage the terminal the human is looking at: after scraping the details screen the component must be returned to the actions screen and the restoration proven byte-identical by test; if that is not reliable, the details screen is not scraped and the prompt says the details are visible on the terminal.
+- S12 — scrape with one fixed documented width (80), never the caller's terminal width, so the same consent produces the same body text on every machine.
+- S13 — single resolution: whichever side answers first wins, the losing path is retired (nothing dangles on the phone), and no second prompt is posted if the component renders again (same mounted component → one prompt).
+- S14 — known limitation, recorded here and in the PR: the body is the component's rendered text, so a gentle-pi layout change can make the mirror unusable; the guard turns that into "no remote prompt, dialog stays in the terminal", never into a wrong or partial consent.
 
 ## Facts (evidence, from the read-only exploration)
 - RP intercepts `ctx.ui.custom` in `src/extension/prompts/mirror.ts:43-44`; when no adapter is on the stack it delegates straight to `orig.custom`, which is why this dialog reaches the terminal untouched.
