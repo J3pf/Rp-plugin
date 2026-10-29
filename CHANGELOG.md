@@ -5,7 +5,9 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.3] - 2026-10-29
+
+Hotfix: the phone's folder picker works without configuring `roots`.
 
 ### Fixed
 - The phone's folder picker was empty on machines without `~/proyectos` (the shipped default root). While the roots are still the default and that folder is missing, `rp-host` now uses the first usual project folder that exists (`~/Projects`, `~/projects`, `~/dev`, `~/code`, `~/src`, `~/workspace`, `~/repos`, `~/Developer`). Explicit `roots` are never replaced.
