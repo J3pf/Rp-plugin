@@ -9,7 +9,7 @@ import { HerdrBackend } from "./backends/herdr.ts";
 import { TmuxBackend } from "./backends/tmux.ts";
 import { ConsoleBackend, WindowsTerminalBackend } from "./backends/windows.ts";
 import { run as realRun, type Runner } from "./runner.ts";
-import { HostError, resolveLauncher, resolveWithinRoots, sanitizeLabel, validateSessionId, validateSpawnId } from "./validate.ts";
+import { HostError, resolveLauncher, resolveWithinRoots, sanitizeLabel, validatePaneId, validateSessionId, validateSpawnId } from "./validate.ts";
 import { QuotaCollector } from "./quota.ts";
 
 export interface BackendReport {
@@ -161,6 +161,14 @@ export class HostManager {
     if (!rep.herdr) throw new HostError("bad_request", "herdr is not available");
     await (this.backends.herdr as HerdrBackend).ensureServer();
     return (this.backends.herdr as HerdrBackend).layout();
+  }
+
+  async herdrClose(paneId: unknown): Promise<{ paneId: string; ok: boolean; error: string | null }> {
+    const id = validatePaneId(paneId);
+    const rep = await this.detect();
+    if (!rep.herdr) return { paneId: id, ok: false, error: "herdr_unavailable" };
+    const result = await (this.backends.herdr as HerdrBackend).closePane(id);
+    return { paneId: id, ...result };
   }
 
   list(): SpawnRecord[] {

@@ -342,6 +342,86 @@ describe("HostConnection protocol", () => {
     hc?.stop();
     await relay?.stop();
   });
+  async function connect(handlers: Record<string, (args: string[]) => { code?: number; stdout?: string; stderr?: string }>, machineId = "MACH-H") {
+    relay = await new FakeRelay().start();
+    const cfg = normalizeHostConfig({ roots: [tmp()], quotaEnabled: false });
+    const f = fakeRun(handlers);
+    const manager = new HostManager(cfg, { run: f.run, platform: "linux", storeFile: path.join(tmp(), "spawns.json") });
+    hc = new HostConnection({ relayUrl: relay.url, machineId, token: "tok", cfg, manager, backoff: () => 20 });
+    hc.start();
+    await waitUntil(() => relay.of("host.hello")[0]);
+    let sequence = 0;
+    const ask = async (t: string, d: any) => {
+      const before = relay!.all.length;
+      const id = `HERDR-${++sequence}`;
+      relay!.conns[0]!.ws.send(JSON.stringify(envelope(t, d, { id })));
+      return waitUntil(() => relay!.all.slice(before).find((e) => e.re === id), 3000, `reply to ${t}`);
+    };
+    return { f, ask };
+  }
+  it("closes a Herdr pane and replies with the exact result", async () => {
+    const { f, ask } = await connect({
+      "herdr --version": () => ({ stdout: "herdr 0.9.5" }),
+      "herdr pane close": () => ({ code: 0 }),
+    });
+    const reply = await ask("host.herdr_close", { machineId: "MACH-H", paneId: "w1:p1" });
+    expect(reply.t).toBe("host.herdr_closed");
+    expect(reply.d).toEqual({ paneId: "w1:p1", ok: true, error: null });
+    expect(f.calls.filter((call) => call.args[0] === "pane" && call.args[1] === "close").map((call) => call.args)).toEqual([["pane", "close", "w1:p1"]]);
+  });
+  it("returns typed unknown-pane errors and remains usable", async () => {
+    const { f, ask } = await connect({
+      "herdr --version": () => ({ stdout: "herdr 0.9.5" }),
+      "herdr pane close": () => ({ code: 1, stderr: '{"error":{"code":"pane_not_found","message":"pane w9:p9 not found"},"id":"cli:pane:close"}' }),
+    });
+    const reply = await ask("host.herdr_close", { machineId: "MACH-H", paneId: "w9:p9" });
+    expect(reply.t).toBe("host.herdr_closed");
+    expect(reply.d).toEqual({ paneId: "w9:p9", ok: false, error: "pane_not_found" });
+    const followup = await ask("host.list_dirs", { machineId: "MACH-H", path: "" });
+    expect(followup.t).toBe("host.dirs");
+    expect(f.calls.filter((call) => call.args[0] === "pane" && call.args[1] === "close").map((call) => call.args)).toEqual([["pane", "close", "w9:p9"]]);
+  });
+  it("uses the stable error for empty non-JSON failures", async () => {
+    const { ask } = await connect({
+      "herdr --version": () => ({ stdout: "herdr 0.9.5" }),
+      "herdr pane close": () => ({ code: 1 }),
+    });
+    const reply = await ask("host.herdr_close", { machineId: "MACH-H", paneId: "w1:p2" });
+    expect(reply.t).toBe("host.herdr_closed");
+    expect(reply.d).toEqual({ paneId: "w1:p2", ok: false, error: "herdr_close_failed" });
+  });
+  it("rejects malformed pane ids without invoking Herdr close", async () => {
+    const { f, ask } = await connect({ "herdr --version": () => ({ stdout: "herdr 0.9.5" }) });
+    for (const paneId of ["../etc", ""]) {
+      const reply = await ask("host.herdr_close", { machineId: "MACH-H", paneId });
+      expect(reply.t).toBe("error");
+      expect(reply.d).toEqual({ code: "bad_request", message: "invalid paneId" });
+    }
+    expect(f.calls.filter((call) => call.args[0] === "pane" && call.args[1] === "close")).toHaveLength(0);
+  });
+  it("rejects non-string pane ids without invoking Herdr close", async () => {
+    const { f, ask } = await connect({ "herdr --version": () => ({ stdout: "herdr 0.9.5" }) });
+    for (const paneId of [undefined, 123, "-x"]) {
+      const reply = await ask("host.herdr_close", { machineId: "MACH-H", paneId });
+      expect(reply.t).toBe("error");
+      expect(reply.d).toEqual({ code: "bad_request", message: "invalid paneId" });
+    }
+    expect(f.calls.filter((call) => call.args[0] === "pane" && call.args[1] === "close")).toHaveLength(0);
+  });
+  it("rejects a mismatched machine id without invoking Herdr close", async () => {
+    const { f, ask } = await connect({ "herdr --version": () => ({ stdout: "herdr 0.9.5" }) });
+    const reply = await ask("host.herdr_close", { machineId: "OTHER", paneId: "w1:p1" });
+    expect(reply.t).toBe("error");
+    expect(reply.d).toEqual({ code: "bad_request", message: "machineId mismatch" });
+    expect(f.calls.filter((call) => call.args[0] === "pane" && call.args[1] === "close")).toHaveLength(0);
+  });
+  it("reports Herdr unavailable without trying to close a pane", async () => {
+    const { f, ask } = await connect({});
+    const reply = await ask("host.herdr_close", { machineId: "MACH-H", paneId: "w1:p1" });
+    expect(reply.t).toBe("host.herdr_closed");
+    expect(reply.d).toEqual({ paneId: "w1:p1", ok: false, error: "herdr_unavailable" });
+    expect(f.calls.filter((call) => call.args[0] === "pane" && call.args[1] === "close")).toHaveLength(0);
+  });
   it("host.hello, list_dirs, spawn → host.spawned, errors, kill", async () => {
     relay = await new FakeRelay().start();
     const root = tmp();

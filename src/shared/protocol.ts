@@ -195,6 +195,19 @@ export interface UserMessageBody {
   asCommand?: boolean;
 }
 
+export interface AgentHerdrLocation {
+  paneId: string;
+  tabId?: string | null;
+  workspaceId?: string | null;
+  session?: string | null;
+}
+
+export type AgentClosedReason = "pane_closed";
+
+export interface AgentClosedBody {
+  reason: AgentClosedReason;
+}
+
 export interface AgentHelloBody {
   agentId: string;
   kind: string;
@@ -205,7 +218,7 @@ export interface AgentHelloBody {
   session: { id: string; file: string | null; name: string | null };
   host: { hostname: string; user: string; pid: number; os: string };
   launcher: string;
-  herdr: unknown;
+  herdr: AgentHerdrLocation | null;
   gentle: { version: string | null; mode: string } | null;
   transport: string;
   redacted: boolean;

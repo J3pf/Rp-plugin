@@ -335,8 +335,26 @@ Igual que el plan v1: descarga `GET /v1/blobs/{id}` (token de máquina), verific
   - El plugin envía `spawnId` en `agent.hello`; el relay entrega `initialPrompt` como `user.message` a ese agente.
 - `host.list_dirs {path}` (sólo dentro de `roots`), `host.kill {spawnId}` (sólo agentes creados por rp-host:
   `herdr workspace close` / `tmux kill-session`).
+- `host.herdr_close {machineId, paneId}` → `host.herdr_closed {paneId, ok, error}`: cierra un panel de herdr que
+  rp-host **no** creó (`herdr pane close <pane_id>`), por ejemplo cuando olvidas en la app un agente descubierto en
+  herdr. Un panel desconocido responde `ok:false` con el error tipado de herdr (`pane_not_found`) —nunca lanza ni
+  tumba la conexión—; un `paneId` malformado devuelve el sobre `error`/`bad_request` habitual, y el `machineId` se
+  valida antes de tocar nada, así que desde una PC no se puede cerrar un panel de otra.
 - Validaciones: `cwd` canonicalizado (`realpath`) debe estar dentro de un `root`; `launcher` debe ser una clave de
-  `launchers` (nunca un comando arbitrario del móvil).
+  `launchers` (nunca un comando arbitrario del móvil); `paneId` debe tener forma de id de herdr (`w1:p1`).
+
+### 10.1 Ciclo de vida de los agentes descubiertos (dos sentidos)
+
+Los agentes que rp-host no lanzó se descubren con `herdr agent list` (puente `herdr-bridge.ts`) y se conectan al
+relay como cualquier agente, reportando su ubicación en `agent.hello.herdr {paneId, tabId?, workspaceId?}`.
+
+| Sentido | Qué lo dispara | Qué hace rp-plugin |
+|---|---|---|
+| herdr → app | el panel desaparece de `herdr agent list` | tras dos sondeos seguidos sin verlo (se respetan los prompts abiertos y la ventana de gracia de 30 s del gate) envía `agent.closed {reason:"pane_closed"}` por el socket de ese agente y **después** lo cierra |
+| app → herdr | olvidas el agente en la app | el relay manda `host.herdr_close {machineId, paneId}`; rp-host cierra ese panel con `herdr pane close` y responde `host.herdr_closed`. La confirmación («Matar con confirmación») la pide la app antes de enviarlo |
+
+Ambos mensajes son aditivos: un relay antiguo que los ignore sigue funcionando, y los agentes Pi (que se conectan con
+su propia extensión en proceso) siguen igual. El cierre de más de un panel lo decide siempre la persona, no el plugin.
 
 ## 11. Comandos `/rp`
 
@@ -421,6 +439,7 @@ Todo lo descrito arriba está implementado en este repositorio. Resumen por tare
 | P11 | rp-host (herdr, tmux, wt, consola; systemd/schtasks/launchd) | ✅ `src/host/` (Windows y herdr sin ejecutar en máquina real) |
 | P12 | Tests de integración gentle-pi/herdr, publicación npm | ✅ tests y `.github/workflows/ci.yml`; la publicación (`npm publish`) la haces tú |
 | P13 | Agent Mesh: telemetría de comunicación inter-agente (`intercom` y `orchestrator_send_message` entrante/saliente → `CommEvent`) | ✅ `src/extension/comm.ts`, `test/comm.test.ts` |
+| P14 | Ciclo de vida con herdr en ambos sentidos: `agent.closed{pane_closed}` al desaparecer un panel y `host.herdr_close`/`host.herdr_closed` para cerrarlo desde la app | ✅ `src/host/herdr-bridge.ts`, `src/host/connection.ts`, `test/herdr-bridge.test.ts`, `test/host.test.ts` |
 
 ### Decisiones y diferencias respecto al plan
 - **`@j3pf/rp-protocol`** aún no existe: los tipos están en `src/shared/protocol.ts` y los validadores del contrato en
