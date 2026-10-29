@@ -267,6 +267,29 @@ adapters.race(factory, opts, runOrig) {
   "esperando en la terminal". Tests de contrato con fixtures de parámetros/resultados de gentle-pi en CI.
 - Adaptadores adicionales (p. ej. `@eko24ive/pi-ask`, ejemplo `question.ts` de Pi) se añaden con la misma interfaz.
 
+### 8.5.1 Consentimiento de review de gentle-pi (`gentle_review`)
+
+La TUI de "Review consent" **no** expone su contenido por ningún hook: `ui_prompt_start` sólo lleva
+`{type, reason, kind, title?}`, los argumentos de `gentle_review` son `{operation:"start"}` y la factory de
+`ctx.ui.custom` devuelve únicamente `{getActionOptions, render, invalidate, handleInput}` (el contenido y
+`onSelect`/`onCancel` quedan en el closure). El adaptador `review-consent.ts` construye el prompt con lo que **sí** es
+público:
+
+| Dato | Fuente | Nota |
+|---|---|---|
+| Las 3 acciones y su `Effect:` | `getActionOptions()` | cadenas `"1. <label>\nEffect: <effect>"`, orden intacto |
+| Cuerpo (headline, reason, value, risk, target, projection, evidence, off-path) | `render(80)` de la pantalla de acciones y de la de detalles (`D`), ANSI fuera | ancho **fijo 80**, nunca el del terminal |
+| Respuesta | `done({kind:"provider",answer:"granted"\|"declined"})` / `done({kind:"host-session"})` / `done(undefined)` | los mismos valores que produce `onSelect` (referencia: `gentle-pi/lib/review-consent-ui.ts:84-87`) |
+
+Guardas: si el componente no se devuelve, no expone esos métodos, no da exactamente 3 acciones o las pantallas no
+llevan `Review consent` / `Details (read-only)`, **no se publica prompt** y el diálogo sigue en el terminal. Tras
+scrapear los detalles el componente se devuelve a la pantalla de acciones y se comprueba que el render es idéntico
+byte a byte; si esa restauración no se puede probar, sólo se publica la pantalla de acciones con la nota de que
+value/risk/evidence están en el terminal. Resolución única (gana quien conteste primero; el otro lado se retira) e
+idempotencia por identidad del componente montado. Limitación conocida: el cuerpo es el texto renderizado por
+gentle-pi, así que un cambio de maquetación degrada a "sin prompt remoto, diálogo en el terminal", nunca a un
+consentimiento parcial.
+
 ### 8.6 `rp_ask_user` (herramienta propia)
 Se registra en `session_start` **sólo** si no existe ninguna herramienta llamada `ask_user*`/`question*`
 (los nombres son exclusivos, COMPATIBILIDAD P6). Parámetros `{question, options?, allowFreeText?}`; usa
