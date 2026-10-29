@@ -5,6 +5,27 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-29
+
+Two-way agent lifecycle with Herdr panes, and answering gentle-pi's review consent from the phone.
+
+### Added
+- **Agent lifecycle sync with Herdr (`src/host/herdr-bridge.ts`, `src/host/connection.ts`)**:
+  - Deleting an agent's Herdr pane now removes it from the app: after the existing two-miss debounce (keeping the open-prompt and 30 s gate grace), the bridge sends `agent.closed {reason:"pane_closed"}` on that agent's own socket and closes it.
+  - New `host.herdr_close {machineId, paneId}` → `host.herdr_closed {paneId, ok, error}` closes a pane rp-host did not spawn (the app's "forget agent", after its explicit confirmation) through `herdr pane close`. Unknown panes answer `ok:false` with the typed herdr error (`pane_not_found`); a missing herdr answers `herdr_unavailable` without starting a server; ids are validated like every other host input and the `machineId` guard still scopes the call to one machine.
+  - Additive wire contract: `agent.hello.herdr {paneId, tabId?, workspaceId?}` is typed in `src/shared/protocol.ts`, and `src/host/protocol` gained the `agent.closed` body. Older relays that ignore the new fields keep working.
+- **Remote review consent (`src/extension/prompts/adapters/review-consent.ts`)**:
+  - The phone can answer gentle-pi's "Review consent" dialog, which has no supported content hook: the adapter mirrors the mounted component's own action list (`getActionOptions()`, with each `Effect:` text) and its rendered actions/details screens at a fixed width of 80.
+  - The answer is delivered through the component's own `done` with the exact values its `onSelect` produces (grant, decline, session permission) or `done(undefined)` on cancel, so the provider grant stays provider-owned.
+  - Terminal safety: details are scraped only when a `D`→`D` probe proves the actions screen can be restored, and the post-scrape render must match it byte-for-byte; otherwise the prompt carries the actions only plus a note that value, risk and evidence are visible on the terminal. One prompt per mounted component, and whichever side answers first retires the other.
+
+### Fixed
+- The details screen of the consent component paginates by viewport, so the mirror collects its public PageDown pages and stops on a repeated render instead of silently dropping off-screen evidence.
+
+### Notes
+- The new lifecycle and consent code has no native review verdict: the provider refused every reviewer run with `429 ttft_admission_refused` (capacity). Recorded in `odd/tasks/agent-lifecycle-sync.md` and `odd/tasks/remote-consent.md`; nothing was approved by silence.
+- Install channel: `git:github.com/J3pf/Rp-plugin@v0.3.0` (no npm publish).
+
 ## [0.2.8] - 2026-10-21
 
 Special thanks to **Luis Eduardo Chacón Wilches** ([@lchaconw](https://github.com/lchaconw)) for core architecture and implementation of the Herdr agent bridge, Antigravity CLI transcript bridge, PreToolUse permission gate, and Claude/Codex launcher integrations.
