@@ -56,13 +56,19 @@ jobs:
           GENTLE_AI_BIN: ${{ runner.temp }}/gentle-ai-bin
 
   windows:
-    continue-on-error: true   # not yet run on a real Windows runner by the author; promote to required once green
-    # Windows paths, Task Scheduler arguments and wt/cmd argument building run on a real win32 Node.
+    # Required, not advisory: run 40870326831 shows this job executing the unit suite on win32
+    # (Tests 248 passed (248)), so a red Windows run is now a real regression, not missing setup.
     name: windows (unit)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
+      # gentle-pi builds its Gentle AI binary from source on Windows and refuses to fall back below Go 1.25.10
+      # (GENTLE_AI_GO_TOOLCHAIN_TOO_OLD). Pinned exactly, not `stable`: the job must prove itself against the
+      # version the dependency declares, and a floating toolchain would make a red run unattributable.
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.25.10', cache: false }
+      - run: go version
       - run: npm ci
       - run: npx vitest run test/unit-basic.test.ts test/forwarder.test.ts test/prompts.test.ts test/delivery.test.ts test/connection.test.ts test/commands.test.ts test/host.test.ts test/contract.test.ts
