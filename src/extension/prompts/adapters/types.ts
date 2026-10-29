@@ -1,6 +1,11 @@
 import type { Answer } from "../../../shared/protocol.ts";
 import type { AdapterPromptSpec } from "../broker.ts";
 
+/** Optional capability for custom dialogs whose prompt data lives on their returned component. */
+export interface ComponentDialogAdapter {
+  fromComponent(component: unknown): AdapterPromptSpec | null;
+}
+
 /** Knows the parameters and the result type of one custom()-based tool (PLAN §8.5). */
 export interface CustomDialogAdapter {
   /** Tool name this adapter handles. */
@@ -13,4 +18,6 @@ export interface CustomDialogAdapter {
   toResult(args: unknown, answer: Answer): unknown;
   /** The tool's custom() result (from the terminal) → Answer for prompt.resolved. */
   fromResult(args: unknown, result: unknown): Answer;
+  /** Present only for adapters that can safely build a prompt from custom()'s returned component. */
+  fromComponent?: ComponentDialogAdapter["fromComponent"];
 }
