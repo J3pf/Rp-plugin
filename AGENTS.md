@@ -43,6 +43,10 @@ npm run build
 4. **Configuration & Secrets**:
    - Never commit `host.json` if it contains private tokens or specific local directory paths.
 
+5. **Committed `dist/`**:
+   - Pi installs git packages with `--omit=dev` and runs no build, so `dist/` is versioned and `bin/rp-host.mjs` imports it.
+   - Run `npm run build` and commit `dist/` together with any change under `src/`; `test/dist-entry.test.ts` fails if a module is missing.
+
 ## Verification Before Turn End
 
 Always run `npm run typecheck && npm test` and ensure all suites pass before completing changes.
