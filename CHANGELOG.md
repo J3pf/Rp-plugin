@@ -5,7 +5,9 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.4] - 2026-10-29
+
+Project folders work out of the box for more users, and the rest get a clear way to fix it.
 
 ### Added
 - `rp-host roots [list | add <path> | remove <path>]` edits `roots` in `host.json` without hand-editing JSON (keeps the other settings, file mode 0600, refuses the filesystem root).
