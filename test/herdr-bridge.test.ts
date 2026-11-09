@@ -860,7 +860,13 @@ describe("herdr-bridge & PreToolUse gate", () => {
 
       // Wait for the slash command fallback timer to fire and settle
       await vi.waitFor(() => {
-        const msgEnd = t!.sent.find((e) => e.t === "agent.event" && (e.d as any).e?.type === "message_end");
+        const userEnd = t!.sent.find(
+          (e) => e.t === "agent.event" && (e.d as any).e?.type === "message_end" && (e.d as any).e?.message?.role === "user",
+        );
+        expect(userEnd).toBeDefined();
+        const msgEnd = t!.sent.find(
+          (e) => e.t === "agent.event" && (e.d as any).e?.type === "message_end" && (e.d as any).e?.message?.role === "assistant",
+        );
         expect(msgEnd).toBeDefined();
         const content = ((msgEnd!.d as any).e.message.content[0] as any).text;
         expect(content).toContain("> /usage\n  Claude 3.7 Sonnet: 450 tokens");
@@ -868,6 +874,28 @@ describe("herdr-bridge & PreToolUse gate", () => {
         const settled = t!.sent.find((e) => e.t === "agent.event" && (e.d as any).e?.type === "agent_settled");
         expect(settled).toBeDefined();
       }, { timeout: 4_000, interval: 25 });
+
+      // Test /term live terminal peek without typing /term into the pane
+      t!.sent.length = 0;
+      calls.length = 0;
+      t!.receive({
+        v: 1,
+        id: "m3",
+        t: "user.message",
+        ts: Date.now(),
+        d: { clientMsgId: "c3", text: "/term", asCommand: true },
+      });
+
+      await vi.waitFor(() => {
+        expect(calls).not.toContainEqual({ cmd: "herdr", args: ["pane", "send-text", "wS:p2", "/term"] });
+        expect(calls).toContainEqual({ cmd: "herdr", args: ["pane", "read", "--source", "recent", "--lines", "60", "wS:p2"] });
+        const termEnd = t!.sent.find(
+          (e) => e.t === "agent.event" && (e.d as any).e?.type === "message_end" && (e.d as any).e?.message?.role === "assistant",
+        );
+        expect(termEnd).toBeDefined();
+        const termText = ((termEnd!.d as any).e.message.content[0] as any).text;
+        expect(termText).toContain("Claude 3.7 Sonnet: 450 tokens");
+      }, { timeout: 2_000, interval: 20 });
     } finally {
       bridge.stop();
     }

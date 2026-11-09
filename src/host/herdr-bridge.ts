@@ -580,6 +580,16 @@ export class BridgedAgentSession {
       if (!this.fallbackTurnTs) {
         this.fallbackTurnTs = this.lastTerminalSnapshotTs;
       }
+      if (commandText) {
+        this.sendEvent({
+          type: "message_end",
+          message: {
+            role: "user",
+            timestamp: this.fallbackTurnTs,
+            content: [{ type: "text", text: commandText }],
+          },
+        });
+      }
       this.sendEvent({
         type: "message_end",
         message: {
@@ -588,6 +598,67 @@ export class BridgedAgentSession {
           content: [{ type: "text", text: "```text\n" + this.lastTerminalSnapshot + "\n```" }],
         },
       });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private async handleTermCommand(rawCommand: string, env: Record<string, string>): Promise<void> {
+    if (this.disposed || !this.info.paneId || this.d.cfg.redactContent) return;
+    const arg = rawCommand.slice(5).trim().toLowerCase();
+    try {
+      if (arg) {
+        if (arg === "enter") {
+          await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 3_000, env });
+        } else if (arg === "esc" || arg === "escape") {
+          await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Escape"], { timeoutMs: 3_000, env });
+        } else if (arg === "ctrl+c" || arg === "c-c") {
+          await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "C-c"], { timeoutMs: 3_000, env });
+        } else if (arg === "tab") {
+          await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Tab"], { timeoutMs: 3_000, env });
+        } else if (arg === "y" || arg === "n") {
+          await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, arg], { timeoutMs: 3_000, env });
+          await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 3_000, env });
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      const res = await this.d.runner("herdr", ["pane", "read", "--source", "recent", "--lines", "60", this.info.paneId], {
+        timeoutMs: 3_000,
+        env,
+      });
+      if (this.disposed) return;
+      const now = Date.now();
+      this.sendEvent({
+        type: "message_end",
+        message: {
+          role: "user",
+          timestamp: now,
+          content: [{ type: "text", text: rawCommand }],
+        },
+      });
+      if (res.code === 0) {
+        const parsed = parseJson(res.stdout);
+        const rawText: string = (typeof parsed?.result?.text === "string" ? parsed.result.text : res.stdout).trim();
+        const cleaned = rawText.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "").trim();
+        const lines = cleaned
+          .split(/\r?\n/)
+          .map((l) => l.trimEnd())
+          .filter((l, idx, arr) => l.length > 0 || (idx > 0 && arr[idx - 1]!.length > 0));
+        const snippet = truncateBytes(lines.slice(-45).join("\n") || "(terminal vacía)", 16 * 1024).text;
+        this.sendEvent({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            timestamp: now,
+            content: [{ type: "text", text: "```text\n" + snippet + "\n```" }],
+          },
+        });
+      }
+      if (this.currentStatus === "idle") {
+        this.optimisticWorkingUntilMs = 0;
+        this.syncStatus();
+        this.sendEvent({ type: "agent_settled", aborted: false });
+      }
     } catch {
       /* ignore */
     }
@@ -650,6 +721,14 @@ export class BridgedAgentSession {
       }
       this.closeFromHerdr("pane_closed");
       this.d.onSessionClosedByCommand?.(this.sessionKey, this.info.paneId);
+      return;
+    }
+    if (b.asCommand && (text.toLowerCase() === "/term" || text.toLowerCase().startsWith("/term "))) {
+      if (!this.info.paneId || this.d.cfg.redactContent) {
+        return ack("rejected", "herdr_unavailable");
+      }
+      ack("delivered");
+      await this.handleTermCommand(text, env as Record<string, string>);
       return;
     }
     const textArgs = text.startsWith("-") ? ["--", text] : [text];
