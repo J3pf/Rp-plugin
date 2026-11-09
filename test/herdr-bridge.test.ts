@@ -127,6 +127,67 @@ describe("agy-transcript", () => {
       typeName: "research",
       prompt: "Audit repo",
     });
+
+    const editFileCall = normalizeAgyToolCall(13, 0, {
+      name: "edit_file",
+      args: {
+        Path: '"/repo/src/main.ts"',
+        Target: '"old"',
+        Replacement: '"new"',
+      },
+    });
+    expect(editFileCall).toEqual({
+      toolCallId: "agy:13:0",
+      name: "edit",
+      args: {
+        path: "/repo/src/main.ts",
+        oldText: "old",
+        newText: "new",
+      },
+    });
+
+    const summaryBash = normalizeAgyToolCall(14, 0, {
+      name: "run_command",
+      args: { CommandLine: '"npm test"', toolSummary: '"Unit test execution"' },
+    });
+    expect(summaryBash.args).toEqual({
+      command: "npm test",
+      toolSummary: "Unit test execution",
+    });
+  });
+
+  it("tracks getActiveTask while a tool call is pending and clears on generic result", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-active-task-"));
+    tmpDirs.push(dir);
+    const tPath = path.join(dir, "transcript.jsonl");
+
+    fs.writeFileSync(
+      tPath,
+      JSON.stringify({
+        step_index: 0,
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        created_at: "2026-10-19T10:00:01Z",
+        tool_calls: [{ name: "run_command", args: { CommandLine: '"npm test"', toolSummary: '"Unit test execution"' } }],
+      }) + "\n",
+    );
+
+    const reader = new AgyTranscriptReader(tPath);
+    reader.pollNewEvents();
+    expect(reader.getActiveTask()).toBe("Unit test execution");
+
+    fs.appendFileSync(
+      tPath,
+      JSON.stringify({
+        step_index: 1,
+        type: "GENERIC",
+        status: "DONE",
+        created_at: "2026-10-19T10:00:02Z",
+        content: "ok",
+      }) + "\n",
+    );
+    reader.pollNewEvents();
+    expect(reader.getActiveTask()).toBeNull();
   });
 
   it("reads transcript.jsonl and resolves truncated_fields from transcript_full.jsonl", () => {

@@ -128,35 +128,41 @@ export function normalizeAgyToolCall(
         args: {
           command: String(parsed.CommandLine ?? parsed.command ?? ""),
           ...(parsed.Cwd ? { cwd: parsed.Cwd } : {}),
+          ...(typeof parsed.toolSummary === "string" && parsed.toolSummary.trim()
+            ? { toolSummary: parsed.toolSummary.trim() }
+            : {}),
         },
       };
     case "view_file":
+    case "read_file":
       return {
         toolCallId,
         name: "read",
         args: {
-          path: String(parsed.AbsolutePath ?? parsed.path ?? ""),
+          path: String(parsed.AbsolutePath ?? parsed.Path ?? parsed.path ?? ""),
           ...(parsed.StartLine !== undefined ? { startLine: parsed.StartLine } : {}),
           ...(parsed.EndLine !== undefined ? { endLine: parsed.EndLine } : {}),
         },
       };
     case "write_to_file":
+    case "write_file":
       return {
         toolCallId,
         name: "write",
         args: {
-          path: String(parsed.TargetFile ?? parsed.path ?? ""),
+          path: String(parsed.TargetFile ?? parsed.Path ?? parsed.path ?? ""),
           ...(parsed.Description ? { description: parsed.Description } : {}),
         },
       };
     case "replace_file_content":
+    case "edit_file":
       return {
         toolCallId,
         name: "edit",
         args: {
-          path: String(parsed.TargetFile ?? parsed.path ?? ""),
-          oldText: truncateBytes(String(parsed.TargetContent ?? ""), 4096).text,
-          newText: truncateBytes(String(parsed.ReplacementContent ?? ""), 4096).text,
+          path: String(parsed.TargetFile ?? parsed.Path ?? parsed.path ?? ""),
+          oldText: truncateBytes(String(parsed.TargetContent ?? parsed.Target ?? ""), 4096).text,
+          newText: truncateBytes(String(parsed.ReplacementContent ?? parsed.Replacement ?? ""), 4096).text,
           ...(parsed.Instruction ? { instruction: truncateBytes(String(parsed.Instruction), 512).text } : {}),
         },
       };
@@ -202,9 +208,9 @@ export function normalizeAgyToolCall(
     case "invoke_subagent": {
       const subs = Array.isArray(parsed.Subagents) ? parsed.Subagents : [];
       const first = subs[0] && typeof subs[0] === "object" ? (subs[0] as Record<string, unknown>) : {};
-      const role = String(first.Role ?? parsed.toolSummary ?? "Subagent");
-      const typeName = String(first.TypeName ?? "subagent");
-      const prompt = String(first.Prompt ?? "");
+      const role = String(first.Role ?? parsed.Role ?? parsed.toolSummary ?? "Subagent");
+      const typeName = String(first.TypeName ?? parsed.TypeName ?? "subagent");
+      const prompt = String(first.Prompt ?? parsed.Prompt ?? "");
       return {
         toolCallId,
         name: "subagent_run",
@@ -228,6 +234,29 @@ export function normalizeAgyToolCall(
       };
     }
   }
+}
+
+/** Produce a compact human-readable label for an active tool call. */
+export function summarizeAgyToolTask(name: string, args: Record<string, unknown>): string {
+  if (typeof args.toolSummary === "string" && args.toolSummary.trim()) {
+    return args.toolSummary.trim().slice(0, 80);
+  }
+  if (name === "bash" && typeof args.command === "string" && args.command.trim()) {
+    const firstLine = args.command.trim().split(/\r?\n/)[0]!.trim();
+    return `$ ${firstLine.slice(0, 64)}`;
+  }
+  if ((name === "read" || name === "edit" || name === "write") && typeof args.path === "string" && args.path.trim()) {
+    const base = path.basename(args.path.trim()) || args.path.trim();
+    const label = name === "read" ? "Read" : name === "edit" ? "Edit" : "Write";
+    return `${label}: ${base}`;
+  }
+  if ((name === "grep" || name === "find") && typeof args.pattern === "string" && args.pattern.trim()) {
+    return `Search: ${args.pattern.trim().slice(0, 48)}`;
+  }
+  if (name === "subagent_run") {
+    return `Subagent: ${String(args.label ?? args.agent ?? "subagent").slice(0, 56)}`;
+  }
+  return name;
 }
 
 function stepTimestampMs(step: AgyStepRaw, stepIndex: number): number {
@@ -334,6 +363,13 @@ export class AgyTranscriptReader {
   getSessionTopic(): string | null {
     if (this.redact()) return null;
     return this.lastTopic;
+  }
+
+  /** Return a compact description of the currently executing tool call, if any. */
+  getActiveTask(): string | null {
+    if (this.redact() || this.pendingTools.length === 0) return null;
+    const latest = this.pendingTools[this.pendingTools.length - 1]!;
+    return summarizeAgyToolTask(latest.name, latest.args);
   }
 
   /** Return the timestamp (ms) of the most recent conversation entry, or the transcript file mtime. */
