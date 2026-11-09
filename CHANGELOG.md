@@ -5,6 +5,20 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-09
+
+Active task streaming, interactive `/term` pane peek, automated Git dirty refresh, and network/reconnect optimizations for Herdr and Pi.
+
+### Added
+- **Herdr Active Task Streaming (`toolSummary`)**: Extracts and streams the currently running tool (`activeTask`) from Antigravity/Herdr transcripts to the relay, powering real-time status and Live Activity notifications on mobile.
+- **Interactive `/term` Live Pane Peek & Keys**: Supports `/term` live snapshots with terminal command reconciliation and quick keys (`enter`, `esc`, `ctrl+c`, `tab`, `y`, `n`).
+- **Automated Git Branch & Dirty (`*`) Tracking**: Detects uncommitted changes and branch switches upon tool execution and turns, updating `gitDirty` and `formattedBranch` without manual polling.
+
+### Performance
+- **Reconnect Snapshot Elision**: Skips redundant full transcript snapshots upon reconnect if the relay sequence has not diverged.
+- **WebSocket Permessage-Deflate**: Negotiates RFC 7692 deflate compression with 1KB threshold.
+- **Adaptive Discovery Polling**: Backs off discovery polling frequency when agents are idle, conserving CPU and disk I/O.
+
 ## [0.3.5] - 2026-10-29
 
 `rp-host doctor` keeps its health verdict and now says which project folders it checked; the Windows CI job actually runs the tests.

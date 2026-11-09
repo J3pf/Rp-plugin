@@ -157,6 +157,7 @@ export class BridgedAgentSession {
     seq = 0;
     disposed = false;
     git = null;
+    gitInFlight = null;
     transcriptReader = null;
     lastTerminalSnapshot = "";
     lastTerminalSnapshotTs = 0;
@@ -267,9 +268,13 @@ export class BridgedAgentSession {
     syncStatus() {
         if (this.disposed)
             return;
-        this.conn.send("agent.status", { status: this.effectiveStatus() });
+        const status = this.effectiveStatus();
+        const detail = status === "working" ? (this.transcriptReader?.getActiveTask() ?? null) : null;
+        this.lastActiveTask = detail;
+        this.conn.send("agent.status", { status, ...(detail ? { detail } : {}) });
         this.scheduleNextPoll();
     }
+    lastActiveTask = null;
     updateFromHerdr(next) {
         const prevCwd = this.info.cwd;
         const prevStatus = this.effectiveStatus();
@@ -314,6 +319,7 @@ export class BridgedAgentSession {
             }
             else if (prevStatus === "working" && this.effectiveStatus() === "idle") {
                 void this.pollTranscriptNow();
+                void this.refreshGit();
                 this.sendEvent({ type: "agent_settled", aborted: false });
             }
         }
@@ -325,6 +331,9 @@ export class BridgedAgentSession {
         const subagents = this.transcriptReader?.getSubagents() ?? [];
         const name = this.sessionDisplayName();
         this.lastSentName = name;
+        const rawBranch = this.git?.branch ?? null;
+        const gitDirty = this.git?.dirty ?? false;
+        const formattedBranch = rawBranch && gitDirty && !rawBranch.endsWith(" *") ? `${rawBranch} *` : rawBranch;
         return {
             agentId: this.agentId,
             kind: this.info.agent,
@@ -350,7 +359,7 @@ export class BridgedAgentSession {
             redacted: this.d.cfg.redactContent,
             cwd: this.info.cwd,
             spawnId: null,
-            git: this.git ?? { branch: null, dirty: false },
+            git: { branch: formattedBranch, dirty: gitDirty },
             model: this.info.agent === "agy" ? { provider: "google", id: "antigravity" } : { provider: this.info.agent, id: "default" },
             thinking: null,
             status: this.effectiveStatus(),
@@ -367,7 +376,10 @@ export class BridgedAgentSession {
         if (!canSkipSnapshot) {
             this.sendSnapshot(true);
         }
-        this.conn.sendDirect("agent.status", { status: this.effectiveStatus() });
+        const status = this.effectiveStatus();
+        const detail = status === "working" ? (this.transcriptReader?.getActiveTask() ?? null) : null;
+        this.lastActiveTask = detail;
+        this.conn.sendDirect("agent.status", { status, ...(detail ? { detail } : {}) });
         this.conn.needsSnapshot = false;
         for (const p of pendingAnswers(w))
             this.broker.handleAnswer(p.promptId, p.answer);
@@ -503,11 +515,26 @@ export class BridgedAgentSession {
                 if (!this.watcher)
                     this.setupFileWatcher();
                 const events = this.transcriptReader.pollNewEvents();
+                let shouldRefreshGit = false;
                 for (const ev of events) {
                     this.sendEvent(ev);
+                    if (ev.type === "tool_execution_end" &&
+                        (ev.toolName === "edit" || ev.toolName === "write" || ev.toolName === "bash")) {
+                        shouldRefreshGit = true;
+                    }
                 }
-                if (events.length > 0)
+                if (events.length > 0) {
                     this.syncSessionNameIfChanged();
+                    if (this.effectiveStatus() === "working") {
+                        const nextTask = this.transcriptReader.getActiveTask();
+                        if (nextTask !== this.lastActiveTask) {
+                            this.syncStatus();
+                        }
+                    }
+                    if (shouldRefreshGit) {
+                        void this.refreshGit();
+                    }
+                }
                 return;
             }
             await this.pollPaneFallback();
@@ -821,7 +848,12 @@ export class BridgedAgentSession {
         const cwd = this.info.cwd;
         if (!cwd)
             return Promise.resolve();
-        return new Promise((resolve) => {
+        if (this.gitInFlight)
+            return this.gitInFlight;
+        const hadPrev = this.git !== null;
+        const prevBranch = this.git?.branch ?? null;
+        const prevDirty = this.git?.dirty ?? false;
+        const p = new Promise((resolve) => {
             execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeout: 2_000 }, (err, stdout) => {
                 if (this.disposed)
                     return resolve();
@@ -831,12 +863,21 @@ export class BridgedAgentSession {
                 }
                 const branch = stdout.trim() || null;
                 execFile("git", ["status", "--porcelain", "-uno"], { cwd, timeout: 2_000 }, (err2, stdout2) => {
-                    if (!this.disposed)
-                        this.git = { branch, dirty: !err2 && stdout2.trim().length > 0 };
+                    if (!this.disposed) {
+                        const dirty = !err2 && stdout2.trim().length > 0;
+                        this.git = { branch, dirty };
+                        if (hadPrev && this.conn.connected && (branch !== prevBranch || dirty !== prevDirty)) {
+                            this.conn.sendDirect("agent.hello", this.makeHello());
+                        }
+                    }
                     resolve();
                 });
             });
+        }).finally(() => {
+            this.gitInFlight = null;
         });
+        this.gitInFlight = p;
+        return p;
     }
     closeFromHerdr(reason = "pane_closed", graceMs = 250) {
         if (this.disposed || this.closeTimer)
@@ -998,17 +1039,26 @@ export class HerdrAgentBridge {
         if (changed)
             this.savePersistedSessions();
     }
+    scheduleNextBridgePoll() {
+        if (this.stopped)
+            return;
+        if (this.pollTimer)
+            clearTimeout(this.pollTimer);
+        const hasActiveSession = [...this.sessionsByKey.values()].some((s) => s.discoveredInfo.status === "working" || s.discoveredInfo.status === "waiting_input");
+        const interval = this.o.pollIntervalMs ?? (hasActiveSession ? 2_500 : 5_000);
+        this.pollTimer = setTimeout(() => {
+            void this.poll().finally(() => this.scheduleNextBridgePoll());
+        }, interval);
+        this.pollTimer.unref?.();
+    }
     start() {
         this.startGateServer();
-        void this.poll();
-        const interval = this.o.pollIntervalMs ?? 3_000;
-        this.pollTimer = setInterval(() => void this.poll(), interval);
-        this.pollTimer.unref?.();
+        void this.poll().finally(() => this.scheduleNextBridgePoll());
     }
     stop() {
         this.stopped = true;
         if (this.pollTimer)
-            clearInterval(this.pollTimer);
+            clearTimeout(this.pollTimer);
         this.pollTimer = null;
         if (this.gateServer) {
             try {
