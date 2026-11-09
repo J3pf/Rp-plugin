@@ -203,11 +203,12 @@ export class Runtime {
         void this.refreshGit();
         this.conn.start();
     }
-    async dispose() {
+    async dispose(closeInHerdr = false) {
         if (this.disposed)
             return;
         this.disposed = true;
         const hadOpenPrompts = this.broker.openCount > 0;
+        const shouldSendClosed = closeInHerdr && !!this.env.herdr?.paneId && this.conn.connected;
         this.comm.reset();
         try {
             this.broker.shutdown();
@@ -215,6 +216,9 @@ export class Runtime {
             this.forwarder.dispose();
             this.statuses.dispose();
             this.mirror.uninstall();
+            if (shouldSendClosed) {
+                this.conn.sendDirect("agent.closed", { reason: "pane_closed" });
+            }
             for (const w of this.inputWaiters.splice(0)) {
                 clearTimeout(w.timer);
                 w.resolve(false);
@@ -231,8 +235,8 @@ export class Runtime {
             }
         }
         finally {
-            if (hadOpenPrompts) {
-                // give the socket a tick to flush prompt.resolved before closing
+            if (hadOpenPrompts || shouldSendClosed) {
+                // give the socket a tick to flush prompt.resolved / agent.closed before closing
                 await new Promise((r) => {
                     const t = setTimeout(r, 50);
                     t.unref?.();

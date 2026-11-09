@@ -34,15 +34,24 @@ export class HostManager {
   private report: BackendReport | null = null;
   private storeFile: string;
   private quotaCollector: QuotaCollector;
+  private onPaneClosed?: (paneId: string) => void;
 
   constructor(
     private cfg: HostConfig,
-    opts: { run?: Runner; platform?: NodeJS.Platform; storeFile?: string; quotaCollector?: QuotaCollector; onLog?: (m: string) => void } = {},
+    opts: {
+      run?: Runner;
+      platform?: NodeJS.Platform;
+      storeFile?: string;
+      quotaCollector?: QuotaCollector;
+      onLog?: (m: string) => void;
+      onPaneClosed?: (paneId: string) => void;
+    } = {},
   ) {
     const run = opts.run ?? realRun;
     const platform = opts.platform ?? process.platform;
     const deps = { run, platform, herdrSession: cfg.herdrSession };
     this.platform = platform;
+    this.onPaneClosed = opts.onPaneClosed;
     this.backends = {
       herdr: new HerdrBackend(deps),
       tmux: new TmuxBackend(deps),
@@ -168,6 +177,9 @@ export class HostManager {
     const rep = await this.detect();
     if (!rep.herdr) return { paneId: id, ok: false, error: "herdr_unavailable" };
     const result = await (this.backends.herdr as HerdrBackend).closePane(id);
+    if (result.ok || result.error === "pane_not_found") {
+      this.onPaneClosed?.(id);
+    }
     return { paneId: id, ...result };
   }
 

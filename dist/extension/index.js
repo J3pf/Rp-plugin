@@ -22,10 +22,10 @@ export default function rp(pi) {
         rt = new Runtime(pi, ctx, cfg, env, reason);
         rt.start();
     };
-    const stop = async () => {
+    const stop = async (closeInHerdr = false) => {
         const r = rt;
         rt = undefined;
-        await r?.dispose();
+        await r?.dispose(closeInHerdr);
     };
     registerCommands(pi, {
         cfg,
@@ -35,16 +35,16 @@ export default function rp(pi) {
             void ensureHostAutostart({ cfg, pi });
             start(ctx);
         },
-        stopRuntime: stop,
+        stopRuntime: () => stop(false),
     });
     pi.on("session_start", async (ev, ctx) => {
         lastReason = ev.reason;
         void ensureHostAutostart({ cfg, pi });
-        await stop(); // a reload leaves the previous runtime invalid
+        await stop(false); // a reload leaves the previous runtime invalid
         start(ctx, ev.reason);
     });
     pi.on("session_shutdown", async () => {
-        await stop();
+        await stop(true);
     });
     for (const name of FORWARDED_EVENTS)
         pi.on(name, (ev, ctx) => rt?.forward(name, ev, ctx));

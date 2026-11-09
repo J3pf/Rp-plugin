@@ -175,7 +175,11 @@ export async function main(argv) {
                     /* ignore */
                 }
             }
-            const manager = new HostManager(host);
+            let bridge;
+            const manager = new HostManager(host, {
+                onLog: (m) => console.error(`[rp-host] ${m}`),
+                onPaneClosed: (paneId) => bridge?.notifyPaneClosed(paneId),
+            });
             const conn = new HostConnection({
                 relayUrl: cfg.relayUrl,
                 machineId: cfg.machineId,
@@ -184,7 +188,7 @@ export async function main(argv) {
                 manager,
                 onLog: (m) => console.error(`[rp-host] ${m}`),
             });
-            const bridge = new HerdrAgentBridge({
+            bridge = new HerdrAgentBridge({
                 relayUrl: cfg.relayUrl,
                 machineId: cfg.machineId,
                 token: cfg.machineToken,

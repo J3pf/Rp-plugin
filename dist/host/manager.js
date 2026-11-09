@@ -16,12 +16,14 @@ export class HostManager {
     report = null;
     storeFile;
     quotaCollector;
+    onPaneClosed;
     constructor(cfg, opts = {}) {
         this.cfg = cfg;
         const run = opts.run ?? realRun;
         const platform = opts.platform ?? process.platform;
         const deps = { run, platform, herdrSession: cfg.herdrSession };
         this.platform = platform;
+        this.onPaneClosed = opts.onPaneClosed;
         this.backends = {
             herdr: new HerdrBackend(deps),
             tmux: new TmuxBackend(deps),
@@ -153,6 +155,9 @@ export class HostManager {
         if (!rep.herdr)
             return { paneId: id, ok: false, error: "herdr_unavailable" };
         const result = await this.backends.herdr.closePane(id);
+        if (result.ok || result.error === "pane_not_found") {
+            this.onPaneClosed?.(id);
+        }
         return { paneId: id, ...result };
     }
     list() {

@@ -534,7 +534,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
       expect((t!.sent[0]?.d as any).kind).toBe("agy");
       expect((t!.sent[0]?.d as any).herdr).toEqual({
         paneId: "wS:p1",
-        tabId: "wS:t1",
+        tabId: "#0001|wS:t1",
         workspaceId: "wS",
         session: null,
       });
@@ -1009,6 +1009,134 @@ describe("herdr-bridge & PreToolUse gate", () => {
       session.stop();
     } finally {
       process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("preserves Herdr visual order, closes pane fallback on migration, retires persisted orphans, and handles notifyPaneClosed", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-lifecycle-"));
+    tmpDirs.push(dir);
+    const stateFile = path.join(dir, "herdr-active-sessions.json");
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify([
+        {
+          agent: "agy",
+          sessionId: "orphan-session",
+          status: "idle",
+          cwd: dir,
+          paneId: "wOrphan:p1",
+          tabId: "wOrphan:t1",
+          workspaceId: "wOrphan",
+          title: null,
+          stateChangeSeq: 0,
+        },
+      ]),
+    );
+
+    let pollStep = 0;
+    const transports = new Map<string, FakeTransport>();
+    const runner = async (cmd: string, args: string[]) => {
+      if (cmd === "herdr" && args[0] === "agent" && args[1] === "list") {
+        pollStep++;
+        const agents =
+          pollStep === 1
+            ? [
+                { agent: "agy", pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: dir, agent_status: "idle" },
+                {
+                  agent: "agy",
+                  pane_id: "w2:p1",
+                  tab_id: "w2:t1",
+                  workspace_id: "w2",
+                  cwd: dir,
+                  agent_status: "working",
+                  agent_session: { value: "conv-second" },
+                },
+              ]
+            : [
+                {
+                  agent: "agy",
+                  pane_id: "w1:p1",
+                  tab_id: "w1:t1",
+                  workspace_id: "w1",
+                  cwd: dir,
+                  agent_status: "idle",
+                  agent_session: { value: "conv-first" },
+                },
+                {
+                  agent: "agy",
+                  pane_id: "w2:p1",
+                  tab_id: "w2:t1",
+                  workspace_id: "w2",
+                  cwd: dir,
+                  agent_status: "idle",
+                  agent_session: { value: "conv-second" },
+                },
+              ];
+        return { code: 0, stdout: JSON.stringify({ result: { agents } }), stderr: "" };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    };
+
+    const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+    const bridge = new HerdrAgentBridge({
+      relayUrl: "https://relay.example.com",
+      machineId: "M1",
+      token: "T1",
+      cfg,
+      herdrSession: null,
+      runner,
+      socketPath: path.join(dir, "agy-gate.sock"),
+      stateFile,
+      pollIntervalMs: 60_000,
+      connectionFactory: (opts) =>
+        new Connection({
+          ...opts,
+          transportFactory: (_name, handlers) => {
+            const t = new FakeTransport("ws", handlers);
+            transports.set(opts.agentId, t);
+            return t;
+          },
+        }),
+    });
+
+    try {
+      await bridge.poll();
+
+      // 1. Orphan session from previous run connects and sends agent.closed
+      const orphanT = transports.get("M1:herdr:orphan-session");
+      expect(orphanT).toBeDefined();
+      orphanT!.open();
+      orphanT!.receive({ v: 1, id: "wo", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+      await vi.waitFor(() => {
+        expect(orphanT!.sent.some((e) => e.t === "agent.closed" && (e.d as any).reason === "pane_closed")).toBe(true);
+      }, { timeout: 2_000, interval: 10 });
+
+      // 2. Fallback pane session and second session preserve exact Herdr visual order (#0001 and #0002)
+      const fallbackT = transports.get("M1:herdr:pane-w1:p1");
+      const secondT = transports.get("M1:herdr:conv-second");
+      expect(fallbackT).toBeDefined();
+      expect(secondT).toBeDefined();
+      fallbackT!.open();
+      fallbackT!.receive({ v: 1, id: "wf", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+      secondT!.open();
+      secondT!.receive({ v: 1, id: "ws", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+      expect((fallbackT!.sent[0]?.d as any).herdr.tabId).toBe("#0001|w1:t1");
+      expect((secondT!.sent[0]?.d as any).herdr.tabId).toBe("#0002|w2:t1");
+
+      // 3. On poll 2, w1:p1 gets sessionId "conv-first" -> pane-w1:p1 sends agent.closed
+      await bridge.poll();
+      expect(fallbackT!.sent.some((e) => e.t === "agent.closed" && (e.d as any).reason === "pane_closed")).toBe(true);
+
+      const firstT = transports.get("M1:herdr:conv-first");
+      expect(firstT).toBeDefined();
+      firstT!.open();
+      firstT!.receive({ v: 1, id: "w1", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+
+      // 4. notifyPaneClosed immediately sends agent.closed and suppresses revival on poll
+      bridge.notifyPaneClosed("w2:p1");
+      expect(secondT!.sent.some((e) => e.t === "agent.closed" && (e.d as any).reason === "pane_closed")).toBe(true);
+    } finally {
+      bridge.stop();
     }
   });
 });
