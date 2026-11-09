@@ -193,6 +193,7 @@ export class BridgedAgentSession {
   private seq = 0;
   private disposed = false;
   private git: { branch: string | null; dirty: boolean } | null = null;
+  private gitInFlight: Promise<void> | null = null;
   private transcriptReader: AgyTranscriptReader | null = null;
   private lastTerminalSnapshot = "";
   private lastTerminalSnapshotTs = 0;
@@ -898,10 +899,11 @@ export class BridgedAgentSession {
   private refreshGit(): Promise<void> {
     const cwd = this.info.cwd;
     if (!cwd) return Promise.resolve();
+    if (this.gitInFlight) return this.gitInFlight;
     const hadPrev = this.git !== null;
     const prevBranch = this.git?.branch ?? null;
     const prevDirty = this.git?.dirty ?? false;
-    return new Promise((resolve) => {
+    const p = new Promise<void>((resolve) => {
       execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeout: 2_000 }, (err, stdout) => {
         if (this.disposed) return resolve();
         if (err) {
@@ -920,7 +922,11 @@ export class BridgedAgentSession {
           resolve();
         });
       });
+    }).finally(() => {
+      this.gitInFlight = null;
     });
+    this.gitInFlight = p;
+    return p;
   }
 
   closeFromHerdr(reason: AgentClosedReason = "pane_closed", graceMs = 250): void {
@@ -1080,17 +1086,27 @@ export class HerdrAgentBridge {
     if (changed) this.savePersistedSessions();
   }
 
+  private scheduleNextBridgePoll(): void {
+    if (this.stopped) return;
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    const hasActiveSession = [...this.sessionsByKey.values()].some(
+      (s) => s.discoveredInfo.status === "working" || s.discoveredInfo.status === "waiting_input",
+    );
+    const interval = this.o.pollIntervalMs ?? (hasActiveSession ? 2_500 : 5_000);
+    this.pollTimer = setTimeout(() => {
+      void this.poll().finally(() => this.scheduleNextBridgePoll());
+    }, interval);
+    this.pollTimer.unref?.();
+  }
+
   start(): void {
     this.startGateServer();
-    void this.poll();
-    const interval = this.o.pollIntervalMs ?? 3_000;
-    this.pollTimer = setInterval(() => void this.poll(), interval);
-    this.pollTimer.unref?.();
+    void this.poll().finally(() => this.scheduleNextBridgePoll());
   }
 
   stop(): void {
     this.stopped = true;
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = null;
     if (this.gateServer) {
       try {
