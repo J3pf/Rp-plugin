@@ -322,6 +322,20 @@ export class Connection {
             return;
         this.open();
     }
+    /** Reopen the transport immediately so updated `agent.hello` metadata is registered cleanly. */
+    reconnectNow() {
+        if (this.stopped)
+            return;
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        const prev = this.t;
+        this.t = null;
+        this.welcomed = false;
+        prev?.close();
+        this.open();
+    }
     /** Resolves true as soon as the relay has welcomed us, false after `ms` (or when stopped). */
     whenConnected(ms) {
         if (this.connected)

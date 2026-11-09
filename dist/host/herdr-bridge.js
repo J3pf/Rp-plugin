@@ -33,6 +33,49 @@ export function mapHerdrAgentStatus(rawStatus) {
             return "idle";
     }
 }
+export function herdrPriorityStatusRank(item) {
+    switch (item.status) {
+        case "waiting_input":
+            return 4;
+        case "working":
+            return 3;
+        case "idle":
+            return 2;
+        default:
+            return 1;
+    }
+}
+export function readHerdrPanelSortMode(env = process.env) {
+    const cfgPath = env.HERDR_CONFIG_PATH || path.join(os.homedir(), ".config", "herdr", "config.toml");
+    try {
+        const text = fs.readFileSync(cfgPath, "utf8");
+        const m = /^\s*agent_panel_sort\s*=\s*["']?(priority|spaces|workspaces)["']?/m.exec(text);
+        if (m?.[1] === "spaces" || m?.[1] === "workspaces")
+            return "spaces";
+        if (m?.[1] === "priority")
+            return "priority";
+    }
+    catch {
+        /* ignore missing config */
+    }
+    return "priority";
+}
+export function sortHerdrAgentsForDisplay(agents, mode) {
+    if (mode === "spaces")
+        return [...agents];
+    return agents
+        .map((item, index) => ({ item, index }))
+        .sort((a, b) => {
+        const rankDiff = herdrPriorityStatusRank(b.item) - herdrPriorityStatusRank(a.item);
+        if (rankDiff !== 0)
+            return rankDiff;
+        const seqDiff = (b.item.stateChangeSeq ?? 0) - (a.item.stateChangeSeq ?? 0);
+        if (seqDiff !== 0)
+            return seqDiff;
+        return a.index - b.index;
+    })
+        .map((entry) => entry.item);
+}
 export function extractRecentCommandOutput(terminalText, commandText) {
     if (!commandText)
         return terminalText;
@@ -129,7 +172,7 @@ export class BridgedAgentSession {
     fallbackTurnTs = 0;
     commandTimer = null;
     closeTimer = null;
-    refreshingHello = false;
+    reconnectDebounce = null;
     constructor(info, d, transcriptOverride) {
         this.info = info;
         this.d = d;
@@ -229,7 +272,6 @@ export class BridgedAgentSession {
     updateFromHerdr(next) {
         const prevCwd = this.info.cwd;
         const prevStatus = this.effectiveStatus();
-        const prevEncodedTab = this.encodedTabId();
         const prevWorkspace = this.info.workspaceId;
         const prevPane = this.info.paneId;
         const seqChanged = next.stateChangeSeq !== this.lastStateSeq;
@@ -251,11 +293,15 @@ export class BridgedAgentSession {
         this.info = { ...this.info, ...next };
         this.currentStatus = next.status;
         if (this.conn.connected &&
-            (this.encodedTabId() !== prevEncodedTab ||
-                this.info.workspaceId !== prevWorkspace ||
-                this.info.paneId !== prevPane)) {
-            this.refreshingHello = true;
-            this.conn.sendDirect("agent.hello", this.makeHello());
+            (this.info.workspaceId !== prevWorkspace || this.info.paneId !== prevPane)) {
+            if (this.reconnectDebounce)
+                clearTimeout(this.reconnectDebounce);
+            this.reconnectDebounce = setTimeout(() => {
+                this.reconnectDebounce = null;
+                if (!this.disposed)
+                    this.conn.reconnectNow();
+            }, 250);
+            this.reconnectDebounce.unref?.();
         }
         if (prevCwd !== next.cwd) {
             void this.refreshGit();
@@ -313,12 +359,6 @@ export class BridgedAgentSession {
         };
     }
     onWelcome(w) {
-        if (this.refreshingHello) {
-            this.refreshingHello = false;
-            for (const p of pendingAnswers(w))
-                this.broker.handleAnswer(p.promptId, p.answer);
-            return;
-        }
         this.sendSnapshot(true);
         this.conn.sendDirect("agent.status", { status: this.effectiveStatus() });
         this.conn.needsSnapshot = false;
@@ -739,6 +779,9 @@ export class BridgedAgentSession {
         if (this.closeTimer)
             clearTimeout(this.closeTimer);
         this.closeTimer = null;
+        if (this.reconnectDebounce)
+            clearTimeout(this.reconnectDebounce);
+        this.reconnectDebounce = null;
         if (this.commandTimer)
             clearTimeout(this.commandTimer);
         this.commandTimer = null;
@@ -942,11 +985,12 @@ export class HerdrAgentBridge {
                 if (now >= until)
                     this.closedPanesUntil.delete(paneId);
             }
-            // Preserve the exact visual order returned by `herdr agent list`
-            const discovered = parseHerdrAgentList(res.stdout).filter((item) => {
+            const sortMode = this.o.panelSortMode ?? readHerdrPanelSortMode();
+            const discovered = sortHerdrAgentsForDisplay(parseHerdrAgentList(res.stdout).filter((item) => {
                 const until = this.closedPanesUntil.get(item.paneId);
                 return !until || now >= until;
-            });
+            }), sortMode);
+            const discoveredKeys = new Set(discovered.map((item) => sanitizeIdPart(item.sessionId || `pane-${item.paneId}`)));
             const seenKeys = new Set();
             let newCount = 0;
             for (let idx = 0; idx < discovered.length; idx++) {
@@ -959,13 +1003,18 @@ export class HerdrAgentBridge {
                     existing.updateFromHerdr(item);
                 }
                 else {
-                    // If an on-demand session was created by paneId first and now got a sessionId, close and archive the fallback
-                    const paneFallbackKey = sanitizeIdPart(`pane-${item.paneId}`);
-                    const paneFallback = key !== paneFallbackKey ? this.sessionsByKey.get(paneFallbackKey) : undefined;
-                    if (paneFallback) {
-                        paneFallback.closeFromHerdr("pane_closed");
-                        this.sessionsByKey.delete(paneFallbackKey);
-                        this.persistedSessions.delete(paneFallbackKey);
+                    // If an on-demand fallback or previous session occupied this pane and was superseded, close and archive it
+                    const inheritedAllowed = [];
+                    for (const [prevKey, prevSession] of this.sessionsByKey.entries()) {
+                        if (prevKey !== key && prevSession.paneId === item.paneId && !discoveredKeys.has(prevKey)) {
+                            for (const k of prevSession.allowed.keys())
+                                inheritedAllowed.push(k);
+                            prevSession.closeFromHerdr("pane_closed");
+                            this.sessionsByKey.delete(prevKey);
+                            this.missingPolls.delete(prevKey);
+                            this.gateCreatedAt.delete(prevKey);
+                            this.persistedSessions.delete(prevKey);
+                        }
                     }
                     const startDelayMs = !this.o.connectionFactory ? newCount * 35 : 0;
                     newCount++;
@@ -983,10 +1032,8 @@ export class HerdrAgentBridge {
                             this.notifyPaneClosed(closedPaneId);
                         },
                     });
-                    if (paneFallback) {
-                        for (const k of paneFallback.allowed.keys())
-                            session.allowed.add(k);
-                    }
+                    for (const k of inheritedAllowed)
+                        session.allowed.add(k);
                     this.sessionsByKey.set(key, session);
                 }
                 this.persistedSessions.set(key, item);
@@ -1095,6 +1142,14 @@ export class HerdrAgentBridge {
         }
         const key = sanitizeIdPart(conversationId);
         let session = this.sessionsByKey.get(key);
+        if (!session && typeof req.paneId === "string" && req.paneId) {
+            for (const existing of this.sessionsByKey.values()) {
+                if (existing.paneId === req.paneId) {
+                    session = existing;
+                    break;
+                }
+            }
+        }
         if (!session) {
             const cwd = Array.isArray(req.workspacePaths) && typeof req.workspacePaths[0] === "string" ? req.workspacePaths[0] : process.cwd();
             session = new BridgedAgentSession({

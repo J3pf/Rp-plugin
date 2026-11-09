@@ -1111,7 +1111,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
         expect(orphanT!.sent.some((e) => e.t === "agent.closed" && (e.d as any).reason === "pane_closed")).toBe(true);
       }, { timeout: 2_000, interval: 10 });
 
-      // 2. Fallback pane session and second session preserve exact Herdr visual order (#0001 and #0002)
+      // 2. Priority sort places the working session (w2:p1) first (#0001) and the idle fallback (w1:p1) second (#0002)
       const fallbackT = transports.get("M1:herdr:pane-w1:p1");
       const secondT = transports.get("M1:herdr:conv-second");
       expect(fallbackT).toBeDefined();
@@ -1120,8 +1120,8 @@ describe("herdr-bridge & PreToolUse gate", () => {
       fallbackT!.receive({ v: 1, id: "wf", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
       secondT!.open();
       secondT!.receive({ v: 1, id: "ws", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
-      expect((fallbackT!.sent[0]?.d as any).herdr.tabId).toBe("#0001|w1:t1");
-      expect((secondT!.sent[0]?.d as any).herdr.tabId).toBe("#0002|w2:t1");
+      expect((secondT!.sent[0]?.d as any).herdr.tabId).toBe("#0001|w2:t1");
+      expect((fallbackT!.sent[0]?.d as any).herdr.tabId).toBe("#0002|w1:t1");
 
       // 3. On poll 2, w1:p1 gets sessionId "conv-first" -> pane-w1:p1 sends agent.closed
       await bridge.poll();

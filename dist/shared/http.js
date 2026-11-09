@@ -7,7 +7,7 @@ export async function getProxyAgent() {
         return sharedAgent;
     try {
         const mod = await import("proxy-agent");
-        sharedAgent = new mod.ProxyAgent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 16 });
+        sharedAgent = new mod.ProxyAgent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 128 });
     }
     catch {
         sharedAgent = undefined;
