@@ -161,6 +161,7 @@ export class BridgedAgentSession {
     lastTerminalSnapshot = "";
     lastTerminalSnapshotTs = 0;
     initialFallbackDone = false;
+    initialSnapshotSent = false;
     lastStateSeq = -1;
     startTimer = null;
     pollTimer = null;
@@ -359,13 +360,20 @@ export class BridgedAgentSession {
         };
     }
     onWelcome(w) {
-        this.sendSnapshot(true);
+        const canSkipSnapshot = this.initialSnapshotSent &&
+            !this.conn.needsSnapshot &&
+            typeof w.lastSeq === "number" &&
+            w.lastSeq >= 0;
+        if (!canSkipSnapshot) {
+            this.sendSnapshot(true);
+        }
         this.conn.sendDirect("agent.status", { status: this.effectiveStatus() });
         this.conn.needsSnapshot = false;
         for (const p of pendingAnswers(w))
             this.broker.handleAnswer(p.promptId, p.answer);
     }
     sendSnapshot(direct) {
+        this.initialSnapshotSent = true;
         if (this.transcriptReader) {
             const { entries, truncated, events } = this.transcriptReader.readSnapshot();
             const lastActivityAt = this.transcriptReader.getLastActivityAt();
@@ -475,7 +483,8 @@ export class BridgedAgentSession {
             return;
         if (this.pollTimer)
             clearTimeout(this.pollTimer);
-        const delayMs = this.effectiveStatus() === "working" ? 900 : 4_500;
+        const isWorking = this.effectiveStatus() === "working";
+        const delayMs = isWorking ? 900 : this.watcher ? 15_000 : 4_500;
         this.pollTimer = setTimeout(() => {
             void this.pollTranscriptNow();
             this.scheduleNextPoll();
@@ -510,6 +519,8 @@ export class BridgedAgentSession {
     async pollPaneFallback(commandText) {
         if (this.disposed || !this.info.paneId || this.d.cfg.redactContent)
             return;
+        if (this.initialFallbackDone && !commandText && this.effectiveStatus() !== "working")
+            return;
         try {
             const res = await this.d.runner("herdr", ["pane", "read", "--source", "recent", "--lines", "60", this.info.paneId], {
                 timeoutMs: 3_000,
@@ -534,6 +545,16 @@ export class BridgedAgentSession {
             if (!this.fallbackTurnTs) {
                 this.fallbackTurnTs = this.lastTerminalSnapshotTs;
             }
+            if (commandText) {
+                this.sendEvent({
+                    type: "message_end",
+                    message: {
+                        role: "user",
+                        timestamp: this.fallbackTurnTs,
+                        content: [{ type: "text", text: commandText }],
+                    },
+                });
+            }
             this.sendEvent({
                 type: "message_end",
                 message: {
@@ -542,6 +563,73 @@ export class BridgedAgentSession {
                     content: [{ type: "text", text: "```text\n" + this.lastTerminalSnapshot + "\n```" }],
                 },
             });
+        }
+        catch {
+            /* ignore */
+        }
+    }
+    async handleTermCommand(rawCommand, env) {
+        if (this.disposed || !this.info.paneId || this.d.cfg.redactContent)
+            return;
+        const arg = rawCommand.slice(5).trim().toLowerCase();
+        try {
+            if (arg) {
+                if (arg === "enter") {
+                    await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 3_000, env });
+                }
+                else if (arg === "esc" || arg === "escape") {
+                    await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Escape"], { timeoutMs: 3_000, env });
+                }
+                else if (arg === "ctrl+c" || arg === "c-c") {
+                    await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "C-c"], { timeoutMs: 3_000, env });
+                }
+                else if (arg === "tab") {
+                    await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Tab"], { timeoutMs: 3_000, env });
+                }
+                else if (arg === "y" || arg === "n") {
+                    await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, arg], { timeoutMs: 3_000, env });
+                    await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 3_000, env });
+                }
+                await new Promise((r) => setTimeout(r, 250));
+            }
+            const res = await this.d.runner("herdr", ["pane", "read", "--source", "recent", "--lines", "60", this.info.paneId], {
+                timeoutMs: 3_000,
+                env,
+            });
+            if (this.disposed)
+                return;
+            const now = Date.now();
+            this.sendEvent({
+                type: "message_end",
+                message: {
+                    role: "user",
+                    timestamp: now,
+                    content: [{ type: "text", text: rawCommand }],
+                },
+            });
+            if (res.code === 0) {
+                const parsed = parseJson(res.stdout);
+                const rawText = (typeof parsed?.result?.text === "string" ? parsed.result.text : res.stdout).trim();
+                const cleaned = rawText.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "").trim();
+                const lines = cleaned
+                    .split(/\r?\n/)
+                    .map((l) => l.trimEnd())
+                    .filter((l, idx, arr) => l.length > 0 || (idx > 0 && arr[idx - 1].length > 0));
+                const snippet = truncateBytes(lines.slice(-45).join("\n") || "(terminal vacía)", 16 * 1024).text;
+                this.sendEvent({
+                    type: "message_end",
+                    message: {
+                        role: "assistant",
+                        timestamp: now,
+                        content: [{ type: "text", text: "```text\n" + snippet + "\n```" }],
+                    },
+                });
+            }
+            if (this.currentStatus === "idle") {
+                this.optimisticWorkingUntilMs = 0;
+                this.syncStatus();
+                this.sendEvent({ type: "agent_settled", aborted: false });
+            }
         }
         catch {
             /* ignore */
@@ -601,6 +689,14 @@ export class BridgedAgentSession {
             }
             this.closeFromHerdr("pane_closed");
             this.d.onSessionClosedByCommand?.(this.sessionKey, this.info.paneId);
+            return;
+        }
+        if (b.asCommand && (text.toLowerCase() === "/term" || text.toLowerCase().startsWith("/term "))) {
+            if (!this.info.paneId || this.d.cfg.redactContent) {
+                return ack("rejected", "herdr_unavailable");
+            }
+            ack("delivered");
+            await this.handleTermCommand(text, env);
             return;
         }
         const textArgs = text.startsWith("-") ? ["--", text] : [text];
@@ -823,6 +919,7 @@ export class HerdrAgentBridge {
     runner;
     sockPath;
     stateFile;
+    lastSavedSessionsJson = "";
     constructor(o) {
         this.o = o;
         this.runner = o.runner ?? realRun;
@@ -867,12 +964,16 @@ export class HerdrAgentBridge {
         if (!this.stateFile)
             return;
         try {
+            const items = [...this.persistedSessions.values()];
+            const serialized = JSON.stringify(items, null, 2);
+            if (serialized === this.lastSavedSessionsJson)
+                return;
             const dir = path.dirname(this.stateFile);
             fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
             const tmp = `${this.stateFile}.${process.pid}.tmp`;
-            const items = [...this.persistedSessions.values()];
-            fs.writeFileSync(tmp, JSON.stringify(items, null, 2), { mode: 0o600 });
+            fs.writeFileSync(tmp, serialized, { mode: 0o600 });
             fs.renameSync(tmp, this.stateFile);
+            this.lastSavedSessionsJson = serialized;
         }
         catch {
             /* best effort */

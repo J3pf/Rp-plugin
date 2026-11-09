@@ -32,6 +32,11 @@ export class WsTransport {
                 agent,
                 maxPayload: MAX_FRAME_BYTES,
                 handshakeTimeout: 10_000,
+                perMessageDeflate: {
+                    threshold: 1024,
+                    clientNoContextTakeover: true,
+                    serverNoContextTakeover: true,
+                },
             });
         }
         catch (e) {
