@@ -197,6 +197,7 @@ export class BridgedAgentSession {
   private lastTerminalSnapshot = "";
   private lastTerminalSnapshotTs = 0;
   private initialFallbackDone = false;
+  private initialSnapshotSent = false;
   private lastStateSeq = -1;
   private startTimer: NodeJS.Timeout | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
@@ -408,13 +409,21 @@ export class BridgedAgentSession {
   }
 
   private onWelcome(w: WelcomeBody): void {
-    this.sendSnapshot(true);
+    const canSkipSnapshot =
+      this.initialSnapshotSent &&
+      !this.conn.needsSnapshot &&
+      typeof w.lastSeq === "number" &&
+      w.lastSeq >= 0;
+    if (!canSkipSnapshot) {
+      this.sendSnapshot(true);
+    }
     this.conn.sendDirect("agent.status", { status: this.effectiveStatus() });
     this.conn.needsSnapshot = false;
     for (const p of pendingAnswers(w)) this.broker.handleAnswer(p.promptId, p.answer);
   }
 
   private sendSnapshot(direct: boolean): void {
+    this.initialSnapshotSent = true;
     if (this.transcriptReader) {
       const { entries, truncated, events } = this.transcriptReader.readSnapshot();
       const lastActivityAt = this.transcriptReader.getLastActivityAt();
@@ -515,7 +524,8 @@ export class BridgedAgentSession {
   private scheduleNextPoll(): void {
     if (this.disposed) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
-    const delayMs = this.effectiveStatus() === "working" ? 900 : 4_500;
+    const isWorking = this.effectiveStatus() === "working";
+    const delayMs = isWorking ? 900 : this.watcher ? 15_000 : 4_500;
     this.pollTimer = setTimeout(() => {
       void this.pollTranscriptNow();
       this.scheduleNextPoll();
@@ -548,6 +558,7 @@ export class BridgedAgentSession {
 
   private async pollPaneFallback(commandText?: string): Promise<void> {
     if (this.disposed || !this.info.paneId || this.d.cfg.redactContent) return;
+    if (this.initialFallbackDone && !commandText && this.effectiveStatus() !== "working") return;
     try {
       const res = await this.d.runner("herdr", ["pane", "read", "--source", "recent", "--lines", "60", this.info.paneId], {
         timeoutMs: 3_000,
@@ -877,6 +888,7 @@ export class HerdrAgentBridge {
   private runner: Runner;
   private sockPath: string;
   private stateFile: string | null;
+  private lastSavedSessionsJson = "";
 
   constructor(private o: HerdrBridgeOptions) {
     this.runner = o.runner ?? realRun;
@@ -918,12 +930,15 @@ export class HerdrAgentBridge {
   private savePersistedSessions(): void {
     if (!this.stateFile) return;
     try {
+      const items = [...this.persistedSessions.values()];
+      const serialized = JSON.stringify(items, null, 2);
+      if (serialized === this.lastSavedSessionsJson) return;
       const dir = path.dirname(this.stateFile);
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       const tmp = `${this.stateFile}.${process.pid}.tmp`;
-      const items = [...this.persistedSessions.values()];
-      fs.writeFileSync(tmp, JSON.stringify(items, null, 2), { mode: 0o600 });
+      fs.writeFileSync(tmp, serialized, { mode: 0o600 });
       fs.renameSync(tmp, this.stateFile);
+      this.lastSavedSessionsJson = serialized;
     } catch {
       /* best effort */
     }

@@ -71,6 +71,11 @@ export class WsTransport implements Transport {
         agent,
         maxPayload: MAX_FRAME_BYTES,
         handshakeTimeout: 10_000,
+        perMessageDeflate: {
+          threshold: 1024,
+          clientNoContextTakeover: true,
+          serverNoContextTakeover: true,
+        },
       });
     } catch (e) {
       this.h.onClose({ code: 1006, reason: errMsg(e), opened: false, unsent: [] });
