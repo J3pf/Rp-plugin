@@ -344,8 +344,14 @@ export class BridgedAgentSession {
       this.optimisticWorkingUntilMs = 0;
     }
 
+    const prevTab = this.encodedTabId();
     this.info = { ...this.info, ...next };
+    const nextTab = this.encodedTabId();
     this.currentStatus = next.status;
+
+    if (this.conn.connected && prevTab !== nextTab && this.initialSnapshotSent) {
+      this.conn.sendDirect("agent.hello", this.makeHello());
+    }
 
     if (
       this.conn.connected &&
