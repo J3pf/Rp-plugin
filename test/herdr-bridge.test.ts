@@ -23,6 +23,7 @@ import {
   parseHerdrAgentList,
   parseTerminalContextUsage,
   readExternalAgentContextUsage,
+  readExternalAgentModel,
   runAgyHook,
 } from "../src/host/herdr-bridge.ts";
 import { Connection, type Transport, type TransportHandlers, type TransportName } from "../src/extension/connection.ts";
@@ -393,6 +394,22 @@ describe("agy-transcript", () => {
       tokens: 70_000,
       contextWindow: 200_000,
       percent: 35,
+    });
+
+    const agyDir = path.join(home, ".gemini", "antigravity-cli");
+    fs.mkdirSync(agyDir, { recursive: true });
+    fs.writeFileSync(path.join(agyDir, "settings.json"), JSON.stringify({ model: "Gemini 4 Argon (Medium)" }));
+    expect(readExternalAgentModel("agy", cwd, null, home)).toEqual({
+      provider: "google",
+      id: "Gemini 4 Argon (Medium)",
+    });
+
+    const codexHomeDir = path.join(home, ".codex");
+    fs.mkdirSync(codexHomeDir, { recursive: true });
+    fs.writeFileSync(path.join(codexHomeDir, "config.toml"), 'model = "gpt-5.3-codex"\n');
+    expect(readExternalAgentModel("codex", cwd, null, home)).toEqual({
+      provider: "openai",
+      id: "gpt-5.3-codex",
     });
   });
 });

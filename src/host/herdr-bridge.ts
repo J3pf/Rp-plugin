@@ -314,6 +314,99 @@ export function readExternalAgentContextUsage(
   return parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW);
 }
 
+export function readExternalAgentModel(
+  agent: string,
+  cwd: string,
+  sessionId: string | null,
+  home = os.homedir(),
+): { provider: string; id: string } {
+  if (agent === "agy") {
+    try {
+      const settingsPath = path.join(home, ".gemini", "antigravity-cli", "settings.json");
+      if (fs.existsSync(settingsPath)) {
+        const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as any;
+        if (typeof parsed?.model === "string" && parsed.model.trim()) {
+          return { provider: "google", id: parsed.model.trim() };
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return { provider: "google", id: "antigravity" };
+  }
+  if (agent === "claude") {
+    try {
+      const slug = path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
+      const projDir = path.join(home, ".claude", "projects", slug);
+      if (fs.existsSync(projDir)) {
+        let targetFile: string | null = null;
+        if (sessionId) {
+          const candidate = path.join(projDir, `${sessionId}.jsonl`);
+          if (fs.existsSync(candidate)) targetFile = candidate;
+        }
+        if (!targetFile) {
+          const files = fs
+            .readdirSync(projDir)
+            .filter((f) => f.endsWith(".jsonl"))
+            .map((f) => {
+              const full = path.join(projDir, f);
+              try {
+                return { full, mtimeMs: fs.statSync(full).mtimeMs };
+              } catch {
+                return { full, mtimeMs: 0 };
+              }
+            })
+            .filter((f) => f.mtimeMs > 0)
+            .sort((a, b) => b.mtimeMs - a.mtimeMs);
+          if (files.length > 0) targetFile = files[0]!.full;
+        }
+        if (targetFile) {
+          const lines = readJsonlTailLines(targetFile);
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const line = lines[i]!.trim();
+            if (!line.startsWith("{")) continue;
+            try {
+              const obj = JSON.parse(line) as any;
+              const model = obj?.message?.model ?? obj?.model;
+              if (typeof model === "string" && model.trim()) {
+                return { provider: "anthropic", id: model.trim() };
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+      const claudeSettings = path.join(home, ".claude", "settings.json");
+      if (fs.existsSync(claudeSettings)) {
+        const parsed = JSON.parse(fs.readFileSync(claudeSettings, "utf8")) as any;
+        if (typeof parsed?.model === "string" && parsed.model.trim()) {
+          return { provider: "anthropic", id: parsed.model.trim() };
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return { provider: "anthropic", id: "claude" };
+  }
+  if (agent === "codex") {
+    try {
+      const cfgToml = path.join(home, ".codex", "config.toml");
+      if (fs.existsSync(cfgToml)) {
+        const text = fs.readFileSync(cfgToml, "utf8");
+        const m = /^\s*model\s*=\s*["']([^"']+)["']/m.exec(text);
+        if (m?.[1]?.trim()) {
+          return { provider: "openai", id: m[1].trim() };
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return { provider: "openai", id: "codex" };
+  }
+  return { provider: agent, id: "default" };
+}
+
 export function parseHerdrAgentList(stdout: string): HerdrDiscoveredAgent[] {
   const json = parseJson(stdout);
   const list: any[] = Array.isArray(json?.result?.agents)
@@ -649,7 +742,7 @@ export class BridgedAgentSession {
       cwd: this.info.cwd,
       spawnId: null,
       git: { branch: formattedBranch, dirty: gitDirty },
-      model: this.info.agent === "agy" ? { provider: "google", id: "antigravity" } : { provider: this.info.agent, id: "default" },
+      model: readExternalAgentModel(this.info.agent, this.info.cwd, this.info.sessionId),
       thinking: null,
       status: this.effectiveStatus(),
       openPrompts: this.broker.openPrompts(),
