@@ -16,7 +16,9 @@ import {
   BridgedAgentSession,
   HerdrAgentBridge,
   extractRecentCommandOutput,
+  herdrPriorityStatusRank,
   installAgyHooks,
+  mapHerdrAgentStatus,
   parseHerdrAgentList,
   runAgyHook,
 } from "../src/host/herdr-bridge.ts";
@@ -340,6 +342,22 @@ describe("herdr-bridge & PreToolUse gate", () => {
         stateChangeSeq: 42,
       },
     ]);
+  });
+
+  it("maps herdr agent status to Rp status preserving done", () => {
+    expect(mapHerdrAgentStatus("working")).toBe("working");
+    expect(mapHerdrAgentStatus("done")).toBe("done");
+    expect(mapHerdrAgentStatus("blocked")).toBe("waiting_input");
+    expect(mapHerdrAgentStatus("error")).toBe("error");
+    expect(mapHerdrAgentStatus("idle")).toBe("idle");
+    expect(mapHerdrAgentStatus(null)).toBe("idle");
+    expect(mapHerdrAgentStatus(undefined)).toBe("idle");
+
+    expect(herdrPriorityStatusRank({ status: "waiting_input" })).toBe(4);
+    expect(herdrPriorityStatusRank({ status: "working" })).toBe(3);
+    expect(herdrPriorityStatusRank({ status: "idle" })).toBe(2);
+    expect(herdrPriorityStatusRank({ status: "done" })).toBe(2);
+    expect(herdrPriorityStatusRank({ status: "error" })).toBe(1);
   });
 
   it("sends agent.closed once after a discovered pane disappears, then stops its connection", async () => {

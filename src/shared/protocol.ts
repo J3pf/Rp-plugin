@@ -48,7 +48,7 @@ export const CLOSE = {
 
 export const MAX_FRAME_BYTES = 1024 * 1024;
 
-export type AgentStatus = "idle" | "working" | "waiting_input" | "compacting" | "error";
+export type AgentStatus = "idle" | "working" | "waiting_input" | "compacting" | "error" | "done";
 export type CommChannel = "intercom" | "orchestrator";
 export type CommAction = "send" | "ask" | "reply" | "handover" | "message";
 export type CommDirection = "out" | "in";

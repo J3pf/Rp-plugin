@@ -25,6 +25,8 @@ export function mapHerdrAgentStatus(rawStatus) {
     switch (rawStatus) {
         case "working":
             return "working";
+        case "done":
+            return "done";
         case "blocked":
             return "waiting_input";
         case "error":
@@ -40,6 +42,7 @@ export function herdrPriorityStatusRank(item) {
         case "working":
             return 3;
         case "idle":
+        case "done":
             return 2;
         default:
             return 1;
