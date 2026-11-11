@@ -16,7 +16,7 @@ import { ALLOW, ALLOW_SESSION, DENY, DENY_REASON, allowKey, compilePatterns, dec
 import { pluginVersion } from "../extension/version.ts";
 import { parseJson, pick } from "./backends/herdr.ts";
 import { run as realRun, type Runner } from "./runner.ts";
-import { AgyTranscriptReader, parseAgyArgs, resolveAgyTranscriptPath } from "./agy-transcript.ts";
+import { AgyTranscriptReader, parseAgyArgs, resolveAgyTranscriptPath, type ContextUsageInfo } from "./agy-transcript.ts";
 import { configDir } from "../shared/platform.ts";
 import {
   newId,
@@ -118,6 +118,202 @@ export function extractRecentCommandOutput(terminalText: string, commandText?: s
   return terminalText;
 }
 
+const CLAUDE_DEFAULT_WINDOW = 200_000;
+const CODEX_DEFAULT_WINDOW = 258_400;
+
+function readJsonlTailLines(filePath: string, maxBytes = 64 * 1024): string[] {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size <= 0) return [];
+    const readSize = Math.min(stat.size, maxBytes);
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const buf = Buffer.allocUnsafe(readSize);
+      fs.readSync(fd, buf, 0, readSize, stat.size - readSize);
+      const lines = buf.toString("utf8").split("\n");
+      if (readSize < stat.size && lines.length > 0) lines.shift();
+      return lines;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return [];
+  }
+}
+
+function readClaudeContextUsage(cwd: string, sessionId: string | null, home: string): ContextUsageInfo | null {
+  try {
+    const slug = path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
+    const projDir = path.join(home, ".claude", "projects", slug);
+    if (!fs.existsSync(projDir)) return null;
+    let targetFile: string | null = null;
+    if (sessionId) {
+      const candidate = path.join(projDir, `${sessionId}.jsonl`);
+      if (fs.existsSync(candidate)) targetFile = candidate;
+    }
+    if (!targetFile) {
+      const files = fs
+        .readdirSync(projDir)
+        .filter((f) => f.endsWith(".jsonl"))
+        .map((f) => {
+          const full = path.join(projDir, f);
+          try {
+            return { full, mtimeMs: fs.statSync(full).mtimeMs };
+          } catch {
+            return { full, mtimeMs: 0 };
+          }
+        })
+        .filter((f) => f.mtimeMs > 0)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      if (files.length > 0) targetFile = files[0]!.full;
+    }
+    if (!targetFile) return null;
+    const lines = readJsonlTailLines(targetFile);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]!.trim();
+      if (!line.startsWith("{")) continue;
+      try {
+        const obj = JSON.parse(line) as any;
+        const usage = obj?.message?.usage ?? obj?.usage;
+        if (usage && typeof usage === "object") {
+          const inTok = Number(usage.input_tokens ?? 0) || 0;
+          const cacheCreate = Number(usage.cache_creation_input_tokens ?? 0) || 0;
+          const cacheRead = Number(usage.cache_read_input_tokens ?? 0) || 0;
+          const outTok = Number(usage.output_tokens ?? 0) || 0;
+          const total = Math.max(0, Math.floor(inTok + cacheCreate + cacheRead + outTok));
+          if (total > 0) {
+            const pct = Math.min(100, Math.max(0, Math.round((total / CLAUDE_DEFAULT_WINDOW) * 100)));
+            return { tokens: total, contextWindow: CLAUDE_DEFAULT_WINDOW, percent: pct };
+          }
+        }
+      } catch {
+        /* ignore malformed line */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function readCodexContextUsage(cwd: string, sessionId: string | null, home: string): ContextUsageInfo | null {
+  try {
+    const sessionsRoot = path.join(home, ".codex", "sessions");
+    if (!fs.existsSync(sessionsRoot)) return null;
+    const years = fs.readdirSync(sessionsRoot).sort().reverse();
+    const candidates: Array<{ full: string; mtimeMs: number }> = [];
+    for (const y of years.slice(0, 2)) {
+      const yDir = path.join(sessionsRoot, y);
+      if (!fs.statSync(yDir, { throwIfNoEntry: false })?.isDirectory()) continue;
+      const months = fs.readdirSync(yDir).sort().reverse();
+      for (const m of months.slice(0, 2)) {
+        const mDir = path.join(yDir, m);
+        if (!fs.statSync(mDir, { throwIfNoEntry: false })?.isDirectory()) continue;
+        const days = fs.readdirSync(mDir).sort().reverse();
+        for (const d of days.slice(0, 3)) {
+          const dDir = path.join(mDir, d);
+          if (!fs.statSync(dDir, { throwIfNoEntry: false })?.isDirectory()) continue;
+          for (const f of fs.readdirSync(dDir)) {
+            if (!f.endsWith(".jsonl")) continue;
+            const full = path.join(dDir, f);
+            try {
+              candidates.push({ full, mtimeMs: fs.statSync(full).mtimeMs });
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+    }
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const cand of candidates.slice(0, 8)) {
+      if (sessionId && !path.basename(cand.full).includes(sessionId)) continue;
+      if (!sessionId && cwd) {
+        const headLines = readJsonlTailLines(cand.full, 4096);
+        const firstLine = headLines[0]?.trim();
+        if (firstLine?.startsWith("{")) {
+          try {
+            const meta = JSON.parse(firstLine) as any;
+            if (meta?.type === "session_meta" && meta?.payload?.cwd && path.resolve(meta.payload.cwd) !== path.resolve(cwd)) {
+              continue;
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      const lines = readJsonlTailLines(cand.full);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i]!.trim();
+        if (!line.startsWith("{")) continue;
+        try {
+          const obj = JSON.parse(line) as any;
+          if (obj?.payload?.type === "token_count" && obj?.payload?.info?.last_token_usage) {
+            const total = Math.max(0, Math.floor(Number(obj.payload.info.last_token_usage.total_tokens ?? 0)));
+            const win = Math.max(1, Math.floor(Number(obj.payload.info.model_context_window ?? CODEX_DEFAULT_WINDOW)));
+            if (total > 0) {
+              const pct = Math.min(100, Math.max(0, Math.round((total / win) * 100)));
+              return { tokens: total, contextWindow: win, percent: pct };
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+export function parseTerminalContextUsage(terminalText: string, defaultWindow = CLAUDE_DEFAULT_WINDOW): ContextUsageInfo | null {
+  if (!terminalText) return null;
+  const slashMatch = /(\d+(?:\.\d+)?)\s*k\s*\/\s*(\d+(?:\.\d+)?)\s*k/i.exec(terminalText);
+  if (slashMatch) {
+    const tokens = Math.round(Number.parseFloat(slashMatch[1]!) * 1000);
+    const window = Math.round(Number.parseFloat(slashMatch[2]!) * 1000);
+    if (tokens > 0 && window > 0 && tokens <= window * 2) {
+      const percent = Math.min(100, Math.max(0, Math.round((tokens / window) * 100)));
+      return { tokens, contextWindow: window, percent };
+    }
+  }
+  const leftMatch = /(\d{1,3})%\s+context\s+left/i.exec(terminalText);
+  if (leftMatch) {
+    const leftPct = Number.parseInt(leftMatch[1]!, 10);
+    if (leftPct >= 0 && leftPct <= 100) {
+      const percent = 100 - leftPct;
+      const tokens = Math.round((percent / 100) * defaultWindow);
+      return { tokens, contextWindow: defaultWindow, percent };
+    }
+  }
+  const usedMatch = /context(?:\s+used)?[:\s]+(\d{1,3})%/i.exec(terminalText);
+  if (usedMatch) {
+    const percent = Number.parseInt(usedMatch[1]!, 10);
+    if (percent >= 0 && percent <= 100) {
+      const tokens = Math.round((percent / 100) * defaultWindow);
+      return { tokens, contextWindow: defaultWindow, percent };
+    }
+  }
+  return null;
+}
+
+export function readExternalAgentContextUsage(
+  agent: string,
+  cwd: string,
+  sessionId: string | null,
+  terminalText = "",
+  home = os.homedir(),
+): ContextUsageInfo | null {
+  if (agent === "claude") {
+    return readClaudeContextUsage(cwd, sessionId, home) ?? parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW);
+  }
+  if (agent === "codex") {
+    return readCodexContextUsage(cwd, sessionId, home) ?? parseTerminalContextUsage(terminalText, CODEX_DEFAULT_WINDOW);
+  }
+  return parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW);
+}
+
 export function parseHerdrAgentList(stdout: string): HerdrDiscoveredAgent[] {
   const json = parseJson(stdout);
   const list: any[] = Array.isArray(json?.result?.agents)
@@ -208,6 +404,9 @@ export class BridgedAgentSession {
   private watcher: fs.FSWatcher | null = null;
   private watchDebounce: NodeJS.Timeout | null = null;
   private lastSentName = "";
+  private lastSentTabId: string | null = null;
+  private lastSentContextSpec = "";
+  private externalContextUsage: ContextUsageInfo | null = null;
   private currentStatus: AgentStatus;
   private optimisticWorkingUntilMs = 0;
   private fallbackTurnTs = 0;
@@ -281,12 +480,41 @@ export class BridgedAgentSession {
     return { ...this.info };
   }
 
+  getContextUsage(): ContextUsageInfo | null {
+    return this.transcriptReader?.getContextUsage() ?? this.externalContextUsage;
+  }
+
   private encodedTabId(): string | null {
     const idx = this.info.orderIndex;
-    if (typeof idx === "number" && Number.isFinite(idx) && idx > 0) {
-      return `#${String(Math.floor(idx)).padStart(4, "0")}|${this.info.tabId ?? ""}`;
+    const hasOrder = typeof idx === "number" && Number.isFinite(idx) && idx > 0;
+    const isDone = this.effectiveStatus() === "done";
+    const ctx = this.getContextUsage();
+    const hasCtx = !!ctx && ctx.tokens > 0 && ctx.contextWindow > 0;
+    if (!hasOrder && !isDone && !hasCtx) {
+      return this.info.tabId;
     }
-    return this.info.tabId;
+    const orderPart = hasOrder ? `#${String(Math.floor(idx!)).padStart(4, "0")}` : "";
+    const donePart = isDone ? "~done" : "";
+    const ctxPart = hasCtx ? `@${ctx!.tokens}/${ctx!.contextWindow}` : "";
+    return `${orderPart}${donePart}${ctxPart}|${this.info.tabId ?? ""}`;
+  }
+
+  private syncContextIfChanged(direct = false): void {
+    const ctx = this.getContextUsage();
+    if (!ctx || ctx.tokens <= 0 || ctx.contextWindow <= 0) return;
+    const spec = `${ctx.tokens}/${ctx.contextWindow}`;
+    const nextTab = this.encodedTabId();
+    if (spec !== this.lastSentContextSpec) {
+      this.lastSentContextSpec = spec;
+      if (direct) {
+        this.conn.sendDirect("agent.statuses", { items: { "rp:context": spec } });
+      } else {
+        this.conn.send("agent.statuses", { items: { "rp:context": spec } });
+      }
+    }
+    if (this.conn.connected && this.initialSnapshotSent && nextTab !== this.lastSentTabId) {
+      this.conn.sendDirect("agent.hello", this.makeHello());
+    }
   }
 
   private sessionDisplayName(): string {
@@ -349,8 +577,8 @@ export class BridgedAgentSession {
 
     const prevTab = this.encodedTabId();
     this.info = { ...this.info, ...next };
-    const nextTab = this.encodedTabId();
     this.currentStatus = next.status;
+    const nextTab = this.encodedTabId();
 
     if (this.conn.connected && prevTab !== nextTab && this.initialSnapshotSent) {
       this.conn.sendDirect("agent.hello", this.makeHello());
@@ -389,6 +617,8 @@ export class BridgedAgentSession {
     const subagents = this.transcriptReader?.getSubagents() ?? [];
     const name = this.sessionDisplayName();
     this.lastSentName = name;
+    const encodedTab = this.encodedTabId();
+    this.lastSentTabId = encodedTab;
     const rawBranch = this.git?.branch ?? null;
     const gitDirty = this.git?.dirty ?? false;
     const formattedBranch =
@@ -409,7 +639,7 @@ export class BridgedAgentSession {
       launcher: this.info.agent,
       herdr: {
         paneId: this.info.paneId,
-        tabId: this.encodedTabId(),
+        tabId: encodedTab,
         workspaceId: this.info.workspaceId,
         session: this.d.herdrSession,
       },
@@ -441,6 +671,7 @@ export class BridgedAgentSession {
     const detail = status === "working" ? (this.transcriptReader?.getActiveTask() ?? null) : null;
     this.lastActiveTask = detail;
     this.conn.sendDirect("agent.status", { status, ...(detail ? { detail } : {}) });
+    this.syncContextIfChanged(true);
     this.conn.needsSnapshot = false;
     for (const p of pendingAnswers(w)) this.broker.handleAnswer(p.promptId, p.answer);
   }
@@ -579,6 +810,7 @@ export class BridgedAgentSession {
         }
         if (events.length > 0) {
           this.syncSessionNameIfChanged();
+          this.syncContextIfChanged();
           if (this.effectiveStatus() === "working") {
             const nextTask = this.transcriptReader.getActiveTask();
             if (nextTask !== this.lastActiveTask) {
@@ -590,6 +822,16 @@ export class BridgedAgentSession {
           }
         }
         return;
+      }
+      const extUsage = readExternalAgentContextUsage(
+        this.info.agent,
+        this.info.cwd,
+        this.info.sessionId,
+        this.lastTerminalSnapshot,
+      );
+      if (extUsage) {
+        this.externalContextUsage = extUsage;
+        this.syncContextIfChanged();
       }
       await this.pollPaneFallback();
     } catch (e) {
@@ -611,6 +853,11 @@ export class BridgedAgentSession {
       const text = rawText.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "").trim();
       if (!text) return;
       const snippet = extractRecentCommandOutput(text, commandText);
+      const termUsage = readExternalAgentContextUsage(this.info.agent, this.info.cwd, this.info.sessionId, text);
+      if (termUsage) {
+        this.externalContextUsage = termUsage;
+        this.syncContextIfChanged();
+      }
       if (snippet === this.lastTerminalSnapshot) return;
       this.lastTerminalSnapshot = truncateBytes(snippet, 16 * 1024).text;
       if (!this.initialFallbackDone) {

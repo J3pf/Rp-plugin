@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG, type RpConfig } from "../src/extension/config.ts";
 import { ALLOW, ALLOW_SESSION, DENY } from "../src/extension/prompts/gate.ts";
 import {
+  AGY_CONTEXT_WINDOW,
   AgyTranscriptReader,
   extractAgyUserText,
   normalizeAgyToolCall,
@@ -20,6 +21,8 @@ import {
   installAgyHooks,
   mapHerdrAgentStatus,
   parseHerdrAgentList,
+  parseTerminalContextUsage,
+  readExternalAgentContextUsage,
   runAgyHook,
 } from "../src/host/herdr-bridge.ts";
 import { Connection, type Transport, type TransportHandlers, type TransportName } from "../src/extension/connection.ts";
@@ -289,6 +292,108 @@ describe("agy-transcript", () => {
     expect(resolveAgyTranscriptPath("conv-123", "/tmp/home")).toBe(
       path.join("/tmp/home", ".gemini", "antigravity-cli", "brain", "conv-123", ".system_generated", "logs", "transcript.jsonl"),
     );
+  });
+
+  it("extracts context usage tokens and percent from PLANNER_RESPONSE steps and attaches usage to assistant messages", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-context-"));
+    tmpDirs.push(dir);
+    const tPath = path.join(dir, "transcript.jsonl");
+
+    const steps = [
+      {
+        step_index: 0,
+        type: "USER_INPUT",
+        created_at: "2026-11-11T10:00:00Z",
+        content: "<USER_REQUEST>Hola</USER_REQUEST>",
+      },
+      {
+        step_index: 1,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-11T10:00:05Z",
+        content: "Respuesta con tokens",
+        input_tokens: 12_000,
+        cache_read_tokens: 115_000,
+        output_tokens: 1_000,
+      },
+    ];
+    fs.writeFileSync(tPath, steps.map((s) => JSON.stringify(s)).join("\n") + "\n");
+
+    const reader = new AgyTranscriptReader(tPath);
+    const snap = reader.readSnapshot();
+    expect(reader.getContextUsage()).toEqual({
+      tokens: 128_000,
+      contextWindow: AGY_CONTEXT_WINDOW,
+      percent: 50,
+    });
+    const assistantMsg = snap.entries[1]!.msg as any;
+    expect(assistantMsg.usage).toEqual({
+      input: 12_000,
+      output: 1_000,
+      cacheRead: 115_000,
+      cacheWrite: 0,
+      totalTokens: 128_000,
+      contextWindow: AGY_CONTEXT_WINDOW,
+      contextPercent: 50,
+    });
+  });
+
+  it("reads external context usage for claude, codex, and terminal footers", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "rp-ext-ctx-"));
+    tmpDirs.push(home);
+    const cwd = "/mnt/repo/demo";
+    const claudeDir = path.join(home, ".claude", "projects", "-mnt-repo-demo");
+    fs.mkdirSync(claudeDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(claudeDir, "sess-claude.jsonl"),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          usage: {
+            input_tokens: 10_000,
+            cache_creation_input_tokens: 20_000,
+            cache_read_input_tokens: 49_000,
+            output_tokens: 1_000,
+          },
+        },
+      }) + "\n",
+    );
+    expect(readExternalAgentContextUsage("claude", cwd, "sess-claude", "", home)).toEqual({
+      tokens: 80_000,
+      contextWindow: 200_000,
+      percent: 40,
+    });
+
+    const codexDir = path.join(home, ".codex", "sessions", "2026", "11", "11");
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(codexDir, "rollout-sess-codex.jsonl"),
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            last_token_usage: { total_tokens: 64_600 },
+            model_context_window: 258_400,
+          },
+        },
+      }) + "\n",
+    );
+    expect(readExternalAgentContextUsage("codex", cwd, "sess-codex", "", home)).toEqual({
+      tokens: 64_600,
+      contextWindow: 258_400,
+      percent: 25,
+    });
+
+    expect(parseTerminalContextUsage("Footer: 92k / 200k tokens")).toEqual({
+      tokens: 92_000,
+      contextWindow: 200_000,
+      percent: 46,
+    });
+    expect(parseTerminalContextUsage("65% context left", 200_000)).toEqual({
+      tokens: 70_000,
+      contextWindow: 200_000,
+      percent: 35,
+    });
   });
 });
 

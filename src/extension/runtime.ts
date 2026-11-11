@@ -149,6 +149,7 @@ export class Runtime {
       onAgentSettled: (aborted) => {
         this.comm.onAgentSettled(aborted);
         this.statuses.idle();
+        this.syncContextUsage();
         void this.refreshGit();
         const w = this.settledWaiters.splice(0);
         for (const x of w) x.resolve();
@@ -242,6 +243,7 @@ export class Runtime {
     this.thinking = ctx.thinkingLevel ?? null;
     const theme = this.detectTheme();
     if (theme) this.statuses.observe("pi:theme", theme);
+    this.syncContextUsage();
     void this.refreshGit();
     this.conn.start();
   }
@@ -428,9 +430,54 @@ export class Runtime {
     if (!this.cfg.redactContent) return items;
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(items)) {
-      if (/^(gentle:mode|gentle:vim|vim|pi:theme|rp)$/i.test(k)) out[k] = v;
+      if (/^(gentle:mode|gentle:vim|vim|pi:theme|rp|rp:context)$/i.test(k)) out[k] = v;
     }
     return out;
+  }
+
+  private readContextUsage(): { tokens: number; contextWindow: number } | null {
+    try {
+      const cu = (this.lastCtx as any)?.getContextUsage?.();
+      if (
+        cu &&
+        typeof cu.tokens === "number" &&
+        Number.isFinite(cu.tokens) &&
+        cu.tokens > 0 &&
+        typeof cu.contextWindow === "number" &&
+        Number.isFinite(cu.contextWindow) &&
+        cu.contextWindow > 0
+      ) {
+        return { tokens: Math.floor(cu.tokens), contextWindow: Math.floor(cu.contextWindow) };
+      }
+    } catch {
+      /* ignore */
+    }
+    const branch = this.safeBranch();
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const m = branch[i]?.message;
+      const u = m?.usage;
+      if (m?.role === "assistant" && u && typeof u === "object") {
+        const total =
+          typeof u.totalTokens === "number" && u.totalTokens > 0
+            ? u.totalTokens
+            : (Number(u.input ?? 0) || 0) +
+              (Number(u.output ?? 0) || 0) +
+              (Number(u.cacheRead ?? 0) || 0) +
+              (Number(u.cacheWrite ?? 0) || 0);
+        if (total > 0) {
+          const cw = Number((this.lastCtx as any)?.model?.contextWindow ?? 200_000) || 200_000;
+          return { tokens: Math.floor(total), contextWindow: Math.floor(cw) };
+        }
+      }
+    }
+    return null;
+  }
+
+  private syncContextUsage(): void {
+    const cu = this.readContextUsage();
+    if (cu) {
+      this.statuses.observe("rp:context", `${cu.tokens}/${cu.contextWindow}`);
+    }
   }
 
   private safeBranch(): any[] {
