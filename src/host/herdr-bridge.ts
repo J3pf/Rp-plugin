@@ -1117,48 +1117,45 @@ export class BridgedAgentSession {
     }
     const textArgs = text.startsWith("-") ? ["--", text] : [text];
     try {
+      let deliveredViaAgentPrompt = false;
       if (!b.asCommand) {
         const res = await this.d.runner("herdr", ["agent", "prompt", this.info.paneId, ...textArgs], { timeoutMs: 10_000, env });
         if (res.code === 0) {
-          markWorkingOnDelivery();
-          return ack("delivered");
-        }
-        if (/agent_blocked|blocked/i.test(`${res.stderr} ${res.stdout}`) || this.currentStatus === "waiting_input") {
-          return ack("rejected", "agent_blocked");
+          deliveredViaAgentPrompt = true;
         }
       }
-      // Fallback (or slash command): send literal text + Enter directly to the Herdr pane
-      const sendRes = await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, ...textArgs], { timeoutMs: 5_000, env });
-      if (sendRes.code !== 0) return ack("rejected", "herdr_unavailable");
-      await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 5_000, env });
+      if (!deliveredViaAgentPrompt) {
+        // Fallback (when agent is in blocked/waiting_input state, or slash command):
+        // send literal text + Enter directly to the Herdr pane.
+        const sendRes = await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, ...textArgs], { timeoutMs: 5_000, env });
+        if (sendRes.code !== 0) return ack("rejected", "herdr_unavailable");
+        await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 5_000, env });
+      }
       markWorkingOnDelivery();
       ack("delivered");
 
-      if (b.asCommand) {
-        // Local TUI commands (e.g. /usage, /statusline, /help) execute directly in the CLI terminal
-        // without creating entries in transcript.jsonl. If no transcript events arrive within 800ms,
-        // read the output directly from the pane and settle so the mobile chat displays the result.
-        if (this.commandTimer) clearTimeout(this.commandTimer);
-        this.commandTimer = setTimeout(async () => {
-          this.commandTimer = null;
-          if (this.disposed) return;
-          if (this.transcriptReader) {
-            const events = this.transcriptReader.pollNewEvents();
-            if (events.length > 0) {
-              for (const ev of events) this.sendEvent(ev);
-              this.syncSessionNameIfChanged();
-              return;
-            }
+      if (this.commandTimer) clearTimeout(this.commandTimer);
+      this.commandTimer = setTimeout(async () => {
+        this.commandTimer = null;
+        if (this.disposed) return;
+        if (this.transcriptReader) {
+          const events = this.transcriptReader.pollNewEvents();
+          if (events.length > 0) {
+            for (const ev of events) this.sendEvent(ev);
+            this.syncSessionNameIfChanged();
+            return;
           }
+        }
+        if (b.asCommand) {
           await this.pollPaneFallback(text);
           if (this.currentStatus === "idle" || this.currentStatus === "done") {
             this.optimisticWorkingUntilMs = 0;
             this.syncStatus();
             this.sendEvent({ type: "agent_settled", aborted: false });
           }
-        }, 800);
-        this.commandTimer.unref?.();
-      }
+        }
+      }, 800);
+      this.commandTimer.unref?.();
       return;
     } catch {
       return ack("rejected", "herdr_unavailable");
