@@ -696,7 +696,10 @@ export class BridgedAgentSession {
       this.syncStatus();
       if (this.effectiveStatus() === "working") {
         this.sendEvent({ type: "agent_start" });
-      } else if (prevStatus === "working" && this.effectiveStatus() === "idle") {
+      } else if (
+        prevStatus === "working" &&
+        (this.effectiveStatus() === "idle" || this.effectiveStatus() === "done")
+      ) {
         void this.pollTranscriptNow();
         void this.refreshGit();
         this.sendEvent({ type: "agent_settled", aborted: false });
@@ -1148,7 +1151,7 @@ export class BridgedAgentSession {
             }
           }
           await this.pollPaneFallback(text);
-          if (this.currentStatus === "idle") {
+          if (this.currentStatus === "idle" || this.currentStatus === "done") {
             this.optimisticWorkingUntilMs = 0;
             this.syncStatus();
             this.sendEvent({ type: "agent_settled", aborted: false });
