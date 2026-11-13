@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expandHome, hostConfigPath } from "../shared/platform.js";
+import { TUNNEL_PROVIDERS } from "./serve/index.js";
 export const DEFAULT_HOST_CONFIG = {
     roots: ["~/proyectos"],
     backend: "auto",
@@ -10,6 +11,7 @@ export const DEFAULT_HOST_CONFIG = {
     quotaEnabled: true,
     quotaCommand: "piquota --json",
     quotaIntervalSec: 300,
+    serve: { tunnel: "cloudflared", relayCommand: null, relayPath: null, dataDir: null },
 };
 const BACKENDS = ["auto", "herdr", "tmux", "wt", "console"];
 export function normalizeHostConfig(raw, home) {
@@ -27,6 +29,14 @@ export function normalizeHostConfig(raw, home) {
     const quotaEnabled = typeof r.quotaEnabled === "boolean" ? r.quotaEnabled : d.quotaEnabled;
     const quotaCommand = typeof r.quotaCommand === "string" && r.quotaCommand.trim() ? r.quotaCommand.trim() : d.quotaCommand;
     const quotaIntervalSec = typeof r.quotaIntervalSec === "number" && Number.isFinite(r.quotaIntervalSec) ? Math.max(0, Math.floor(r.quotaIntervalSec)) : d.quotaIntervalSec;
+    const serveIn = r.serve && typeof r.serve === "object" ? r.serve : {};
+    const tunnel = typeof serveIn.tunnel === "string" && TUNNEL_PROVIDERS.includes(serveIn.tunnel) ? serveIn.tunnel : d.serve.tunnel;
+    const serve = {
+        tunnel,
+        relayCommand: typeof serveIn.relayCommand === "string" && serveIn.relayCommand.trim() ? serveIn.relayCommand.trim() : null,
+        relayPath: typeof serveIn.relayPath === "string" && serveIn.relayPath.trim() ? path.resolve(expandHome(serveIn.relayPath.trim(), home)) : null,
+        dataDir: typeof serveIn.dataDir === "string" && serveIn.dataDir.trim() ? path.resolve(expandHome(serveIn.dataDir.trim(), home)) : null,
+    };
     return {
         roots: rootsIn.map((p) => path.resolve(expandHome(p, home))),
         backend: BACKENDS.includes(r.backend) ? r.backend : d.backend,
@@ -36,6 +46,7 @@ export function normalizeHostConfig(raw, home) {
         quotaEnabled,
         quotaCommand,
         quotaIntervalSec,
+        serve,
     };
 }
 /** Usual project folders, most specific first; the default `~/proyectos` is only a guess. */

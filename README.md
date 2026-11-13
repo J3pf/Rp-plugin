@@ -115,7 +115,7 @@ Documentos: [INSTALACION](docs/INSTALACION.md) (instalación y troubleshooting) 
 }
 ```
 Variables: `RP_RELAY_URL`, `RP_DISABLED=1`, `RP_CONFIG`, `RP_DEBUG=1`; flags de Pi `--rp-off`, `--rp-spawn-id` y `--rp-no-auto-host` (omite el autostart para esa ejecución).
-`rp-host` usa `host.json` (mismo directorio). Las carpetas que el teléfono puede explorar se gestionan con `rp-host roots` (`list`, `add <ruta>`, `remove <ruta>`); si no configuras ninguna, usa las carpetas de proyectos habituales que existan (`~/Projects`, `~/dev`, `~/code`, …) y, si no hay ninguna, `rp-host doctor` y la app te piden ejecutar `rp-host roots add <ruta>`. Campos: `roots`, `backend`, `launchers`, `defaultLauncher`, `herdrSession`, `quotaEnabled`, `quotaCommand`, `quotaIntervalSec`.
+`rp-host` usa `host.json` (mismo directorio). Las carpetas que el teléfono puede explorar se gestionan con `rp-host roots` (`list`, `add <ruta>`, `remove <ruta>`); si no configuras ninguna, usa las carpetas de proyectos habituales que existan (`~/Projects`, `~/dev`, `~/code`, …) y, si no hay ninguna, `rp-host doctor` y la app te piden ejecutar `rp-host roots add <ruta>`. Campos: `roots`, `backend`, `launchers`, `defaultLauncher`, `herdrSession`, `quotaEnabled`, `quotaCommand`, `quotaIntervalSec`, `serve`.
 
 ```bash
 rp-host init
@@ -123,6 +123,29 @@ rp-host install
 rp-host doctor       # diagnostica el servicio y devuelve error si hay problemas
 rp-host status
 ```
+
+### Modo directo (`rp-host serve`)
+
+Conecta el móvil sin montar un relay propio: `rp-host serve` levanta un relay **embebido** detrás de un túnel automático y publica su URL. El relay corre como proceso hijo porque su base de datos (`better-sqlite3`) es nativa y no debe entrar como dependencia de una extensión de Pi; el túnel corre como segundo proceso hijo supervisado.
+
+```bash
+rp-host serve                                  # cloudflared (por defecto): URL https://…trycloudflare.com
+rp-host serve --tunnel tailscale               # Tailscale Funnel: URL https://<nodo>.<tailnet>.ts.net
+rp-host serve --tunnel none                    # sin túnel: sólo http://127.0.0.1:<puerto> (pruebas locales)
+rp-host serve --data-dir ~/.rp-direct           # dónde viven la config y los datos del relay embebido
+rp-host serve --relay-command "rp-relay"        # cómo lanzar el relay (por defecto, `rp-relay` del PATH)
+rp-host serve --relay-path /ruta/rp-relay/dist/cli/index.js   # o apuntar a un clon/instalación concreta
+```
+
+Al arrancar escribe una única línea JSON en stdout, pensada para que la extensión pinte el QR de emparejamiento:
+
+```json
+{"publicUrl":"https://x.trycloudflare.com","port":60109,"dataDir":"/home/tu/rp/direct","tunnel":"cloudflared"}
+```
+
+Orden de arranque: se elige un puerto libre en loopback, se levanta el túnel (su URL hace falta antes que la config del relay), se escribe `<data-dir>/relay.json` con perfil `single-host` y `publicUrl` del túnel, y se arranca el relay hasta que responde `/healthz`. Si el relay no llega a estar sano, se cierra el túnel y no queda ningún proceso huérfano. `Ctrl-C`/`SIGTERM` apaga el relay y el túnel en orden.
+
+Requiere el relay instalado aparte (`npm i -g @j3pf/rp-relay`) salvo que uses `--relay-path`. Campos de `host.json`: `serve.tunnel` (`cloudflared`|`tailscale`|`none`), `serve.relayCommand`, `serve.relayPath`, `serve.dataDir`. Variables equivalentes: `RP_SERVE_TUNNEL`, `RP_SERVE_RELAY_COMMAND`, `RP_SERVE_DATA_DIR`.
 
 Después de emparejar el PC con `/rp pair`, `rp-host install` configura el servicio de usuario para cada SO. Linux usa systemd `--user` con PATH capturado y lingering; Windows importa una tarea XML (UTF-16LE con BOM) ejecutada de forma invisible mediante `conhost.exe --headless` (sin ventanas emergentes, sin límite de duración de 72h, con reinicios y ejecución en batería, evitando scripts .vbs propensos a bloqueos corporativos); macOS instala un agente launchd con PATH y logs. Al iniciar una sesión Pi (`session_start`), la extensión comprueba el servicio y, si falta, está obsoleto o no corre, intenta instalarlo/repararlo o iniciarlo en segundo plano sin bloquear ni hacer fallar Pi. La comprobación se limita a una vez cada 10 minutos.
 

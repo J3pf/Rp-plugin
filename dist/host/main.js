@@ -1,4 +1,4 @@
-// rp-host CLI: run | install | uninstall | status | init | agy-hook
+// rp-host CLI: run | serve | install | uninstall | status | init | agy-hook
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,10 +9,16 @@ import { HostConnection } from "./connection.js";
 import { HerdrAgentBridge, installAgyHooks, runAgyHook } from "./herdr-bridge.js";
 import { HostManager } from "./manager.js";
 import { inspectService, installService, resolveStableNodePath, uninstallService } from "./service.js";
+import { TUNNEL_PROVIDERS, resolveServeSettings, startServe } from "./serve/index.js";
 const HELP = `rp-host — create Pi agents from the RP phone app
 
 Usage: rp-host <command>
   run         Connect to the relay and serve spawn requests (default)
+  serve       Direct mode: run an embedded relay behind a tunnel and print its public URL
+              --tunnel <cloudflared|tailscale|none>   tunnel provider (default from host.json)
+              --data-dir <path>                       where the embedded relay keeps its data
+              --relay-command <cmd>                   how to launch the relay (default: rp-relay)
+              --relay-path <path>                     path to a relay dist/cli/index.js
   install     Install as a service (systemd --user / Task Scheduler at logon / launchd)
   uninstall   Remove the service
   status      Show config, available backends and spawned agents
@@ -22,6 +28,48 @@ Usage: rp-host <command>
   agy-hook    Antigravity CLI PreToolUse hook entrypoint
 
 Requires the PC to be paired first (/rp pair inside Pi). Config: host.json next to RP's config.json.`;
+function waitForStopSignal() {
+    return new Promise((resolve) => {
+        const done = () => {
+            process.off("SIGINT", done);
+            process.off("SIGTERM", done);
+            resolve();
+        };
+        process.on("SIGINT", done);
+        process.on("SIGTERM", done);
+    });
+}
+/** Parses `serve` flags; an unknown tunnel provider fails with the accepted list. */
+export function parseServeArgs(argv) {
+    const out = {};
+    for (let i = 0; i < argv.length; i += 1) {
+        const arg = argv[i];
+        const [flag, inline] = arg.includes("=") ? [arg.slice(0, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg, undefined];
+        const value = () => {
+            const v = inline ?? argv[++i];
+            if (!v)
+                throw new Error(`${flag} requires a value`);
+            return v;
+        };
+        if (flag === "--tunnel" || flag === "--no-tunnel") {
+            const tunnel = flag === "--no-tunnel" ? "none" : value();
+            const normalized = tunnel.trim().toLowerCase();
+            if (!TUNNEL_PROVIDERS.includes(normalized)) {
+                throw new Error(`unknown tunnel \"${tunnel}\" (expected ${TUNNEL_PROVIDERS.join(", ")})`);
+            }
+            out.tunnel = normalized;
+        }
+        else if (flag === "--data-dir")
+            out.dataDir = value();
+        else if (flag === "--relay-command")
+            out.relayCommand = value();
+        else if (flag === "--relay-path")
+            out.relayPath = value();
+        else
+            throw new Error(`unknown serve option \"${arg}\"`);
+    }
+    return out;
+}
 async function readStdinText(maxBytes = 2 * 1024 * 1024) {
     const chunks = [];
     let total = 0;
@@ -34,7 +82,7 @@ async function readStdinText(maxBytes = 2 * 1024 * 1024) {
     }
     return Buffer.concat(chunks).toString("utf8");
 }
-export async function main(argv) {
+export async function main(argv, deps = {}) {
     const cmd = argv[0] ?? "run";
     const scriptPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "rp-host.mjs");
     switch (cmd) {
@@ -43,6 +91,25 @@ export async function main(argv) {
         case "help":
             console.log(HELP);
             return;
+        case "serve": {
+            const flags = parseServeArgs(argv.slice(1));
+            const { cfg } = loadHostConfig();
+            const settings = resolveServeSettings({
+                serve: {
+                    tunnel: (flags.tunnel ?? cfg.serve.tunnel),
+                    relayCommand: flags.relayCommand ?? cfg.serve.relayCommand,
+                    relayPath: flags.relayPath ?? cfg.serve.relayPath,
+                    dataDir: flags.dataDir ?? cfg.serve.dataDir,
+                },
+            }, process.env, process.platform);
+            const runServe = deps.startServe ?? startServe;
+            const serve = await runServe({ ...settings, onLog: (m) => console.error(`[rp-host] ${m}`) });
+            // Machine-readable readiness line: the extension parses it to paint the pairing QR (T6).
+            console.log(JSON.stringify({ publicUrl: serve.publicUrl, port: serve.port, dataDir: serve.dataDir, tunnel: serve.provider }));
+            await (deps.waitForStop ?? waitForStopSignal)();
+            await serve.stop();
+            return;
+        }
         case "agy-hook": {
             const stdinText = await readStdinText();
             const { cfg } = loadConfig();

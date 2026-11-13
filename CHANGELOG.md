@@ -5,6 +5,19 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+`rp-host serve`: modo directo, un relay embebido detrás de un túnel automático, sin servidor propio.
+
+### Added
+- **`rp-host serve` levanta un relay embebido detrás de un túnel** y publica su URL en una línea JSON (`publicUrl`, `port`, `dataDir`, `tunnel`) lista para pintar el QR de emparejamiento. El relay corre como **proceso hijo** porque `better-sqlite3` es nativo y no debe entrar como dependencia de una extensión de Pi; el túnel es el segundo proceso hijo, supervisado.
+- **Dos proveedores de túnel**: `cloudflared` (quick tunnel, sin cuenta ni dominio) y `tailscale` (Funnel, usando el DNS del propio nodo). `--tunnel none` deja el relay sólo en loopback para pruebas locales.
+- **Supervisor de procesos hijo reutilizable** (`src/host/serve/supervisor.ts`): líneas de log con prefijo, `waitForLine` para esperar la URL del túnel, reinicio con backoff exponencial y tope de intentos, y apagado determinista que nunca deja huérfanos. Un binario ausente es fatal de inmediato, sin reintentos.
+- **`serve` en `host.json`** (`tunnel`, `relayCommand`, `relayPath`, `dataDir`) con overrides por entorno `RP_SERVE_TUNNEL`, `RP_SERVE_RELAY_COMMAND`, `RP_SERVE_DATA_DIR`. El relay puede llegar del PATH (`rp-relay`) o de un `--relay-path` concreto.
+
+### Notes
+- El relay embebido se configura con perfil `single-host`, `backup.enabled: false` y `publicUrl` del túnel, en `<data-dir>/relay.json` con permisos `600`. Verificado contra `@j3pf/rp-relay` real: arranca, responde `/healthz` y se apaga sin dejar procesos.
+
 ## [0.3.5] - 2026-10-29
 
 `rp-host doctor` keeps its health verdict and now says which project folders it checked; the Windows CI job actually runs the tests.

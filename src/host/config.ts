@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expandHome, hostConfigPath } from "../shared/platform.ts";
+import { type ServeConfig, TUNNEL_PROVIDERS } from "./serve/index.ts";
 
 export type BackendName = "herdr" | "tmux" | "wt" | "console";
 export type BackendSetting = "auto" | BackendName;
@@ -14,6 +15,7 @@ export interface HostConfig {
   quotaEnabled: boolean;
   quotaCommand: string;
   quotaIntervalSec: number;
+  serve: ServeConfig;
 }
 
 export const DEFAULT_HOST_CONFIG: HostConfig = {
@@ -25,6 +27,7 @@ export const DEFAULT_HOST_CONFIG: HostConfig = {
   quotaEnabled: true,
   quotaCommand: "piquota --json",
   quotaIntervalSec: 300,
+  serve: { tunnel: "cloudflared", relayCommand: null, relayPath: null, dataDir: null },
 };
 
 const BACKENDS: BackendSetting[] = ["auto", "herdr", "tmux", "wt", "console"];
@@ -41,6 +44,14 @@ export function normalizeHostConfig(raw: any, home?: string): HostConfig {
   const quotaEnabled = typeof r.quotaEnabled === "boolean" ? r.quotaEnabled : d.quotaEnabled;
   const quotaCommand = typeof r.quotaCommand === "string" && r.quotaCommand.trim() ? r.quotaCommand.trim() : d.quotaCommand;
   const quotaIntervalSec = typeof r.quotaIntervalSec === "number" && Number.isFinite(r.quotaIntervalSec) ? Math.max(0, Math.floor(r.quotaIntervalSec)) : d.quotaIntervalSec;
+  const serveIn = r.serve && typeof r.serve === "object" ? r.serve : {};
+  const tunnel = typeof serveIn.tunnel === "string" && TUNNEL_PROVIDERS.includes(serveIn.tunnel) ? serveIn.tunnel : d.serve.tunnel;
+  const serve: ServeConfig = {
+    tunnel,
+    relayCommand: typeof serveIn.relayCommand === "string" && serveIn.relayCommand.trim() ? serveIn.relayCommand.trim() : null,
+    relayPath: typeof serveIn.relayPath === "string" && serveIn.relayPath.trim() ? path.resolve(expandHome(serveIn.relayPath.trim(), home)) : null,
+    dataDir: typeof serveIn.dataDir === "string" && serveIn.dataDir.trim() ? path.resolve(expandHome(serveIn.dataDir.trim(), home)) : null,
+  };
   return {
     roots: rootsIn.map((p) => path.resolve(expandHome(p, home))),
     backend: BACKENDS.includes(r.backend) ? r.backend : d.backend,
@@ -50,6 +61,7 @@ export function normalizeHostConfig(raw: any, home?: string): HostConfig {
     quotaEnabled,
     quotaCommand,
     quotaIntervalSec,
+    serve,
   };
 }
 
