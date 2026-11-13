@@ -10,6 +10,8 @@ const MAX_SUBAGENTS = 100;
 const MAX_POLL_DELTA_BYTES = 2 * 1024 * 1024;
 const MAX_REMAINDER_BYTES = 1024 * 1024;
 const SAFE_CONV_ID_RE = /^[0-9a-zA-Z_][0-9a-zA-Z_-]{0,127}$/;
+/** Empirical context window before Antigravity CLI (agy) triggers conversation compaction (~256k tokens). */
+export const AGY_CONTEXT_WINDOW = 256_000;
 const USER_REQ_RE = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i;
 /** Extract clean user message text from an agy USER_INPUT content payload. */
 export function extractAgyUserText(rawContent) {
@@ -301,6 +303,7 @@ export class AgyTranscriptReader {
     entries = [];
     subagents = new Map();
     lastTopic = null;
+    lastContextUsage = null;
     constructor(transcriptPath, redact = () => false) {
         this.transcriptPath = transcriptPath;
         this.redact = redact;
@@ -312,6 +315,10 @@ export class AgyTranscriptReader {
         if (this.redact())
             return null;
         return this.lastTopic;
+    }
+    /** Return the most recent context window token usage observed in the transcript, if any. */
+    getContextUsage() {
+        return this.lastContextUsage ? { ...this.lastContextUsage } : null;
     }
     /** Return a compact description of the currently executing tool call, if any. */
     getActiveTask() {
@@ -381,6 +388,7 @@ export class AgyTranscriptReader {
             this.pendingTools = [];
             this.entries = [];
             this.subagents.clear();
+            this.lastContextUsage = null;
         }
         let midLineSeek = false;
         // On first read of a large file (>512 KB), seek to the last 512 KB so startup is fast and light
@@ -486,6 +494,37 @@ export class AgyTranscriptReader {
             return;
         }
         if (step.type === "PLANNER_RESPONSE") {
+            const inTok = typeof step.input_tokens === "number" && Number.isFinite(step.input_tokens)
+                ? Math.max(0, Math.floor(step.input_tokens))
+                : 0;
+            const cacheReadTok = typeof step.cache_read_tokens === "number" && Number.isFinite(step.cache_read_tokens)
+                ? Math.max(0, Math.floor(step.cache_read_tokens))
+                : 0;
+            const cacheWriteTok = typeof step.cache_write_tokens === "number" && Number.isFinite(step.cache_write_tokens)
+                ? Math.max(0, Math.floor(step.cache_write_tokens))
+                : 0;
+            const outTok = typeof step.output_tokens === "number" && Number.isFinite(step.output_tokens)
+                ? Math.max(0, Math.floor(step.output_tokens))
+                : 0;
+            const totalTok = inTok + cacheReadTok + cacheWriteTok + outTok;
+            let stepUsage;
+            if (totalTok > 0) {
+                const pct = Math.min(100, Math.max(0, Math.round((totalTok / AGY_CONTEXT_WINDOW) * 100)));
+                this.lastContextUsage = {
+                    tokens: totalTok,
+                    contextWindow: AGY_CONTEXT_WINDOW,
+                    percent: pct,
+                };
+                stepUsage = {
+                    input: inTok,
+                    output: outTok,
+                    cacheRead: cacheReadTok,
+                    cacheWrite: cacheWriteTok,
+                    totalTokens: totalTok,
+                    contextWindow: AGY_CONTEXT_WINDOW,
+                    contextPercent: pct,
+                };
+            }
             const blocks = [];
             if (!isRedacted && typeof step.thinking === "string" && step.thinking.trim()) {
                 blocks.push({ type: "thinking", thinking: truncateBytes(step.thinking.trim(), LIMITS.resultMaxBytes).text });
@@ -507,8 +546,8 @@ export class AgyTranscriptReader {
             }
             if (blocks.length > 0) {
                 const msg = isRedacted
-                    ? { role: "assistant", timestamp: at }
-                    : { role: "assistant", timestamp: at, content: blocks };
+                    ? { role: "assistant", timestamp: at, ...(stepUsage ? { usage: stepUsage } : {}) }
+                    : { role: "assistant", timestamp: at, content: blocks, ...(stepUsage ? { usage: stepUsage } : {}) };
                 this.entries.push({ eid, kind: "assistant", at, msg });
                 if (!isRedacted) {
                     outEvents.push({ type: "message_end", message: msg });

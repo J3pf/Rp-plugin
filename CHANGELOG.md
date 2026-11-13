@@ -5,6 +5,19 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-11-12
+
+Per-session model detection, context token telemetry, Herdr `done` settling, live order sync, and `agent_blocked` pane delivery fallback.
+
+### Added
+- **Session Context Usage Telemetry**: Extracts and reports context token usage, window size, and percentage across `agy`, `pi`, `claude`, and `codex` sessions (`rp:context` + encoded Herdr tab metadata).
+- **Active Model Detection**: Reads per-session active model names for `agy` (from `conversations/<sessionId>.db` `gen_metadata` and transcript `USER_SETTINGS_CHANGE`, with global `settings.json` fallback), `claude`, and `codex`, and emits live `model_change` updates when changed mid-session.
+- **Herdr `done` Status & Live Order Sync**: Preserves `done` status from Herdr and broadcasts live `orderIndex` changes when Herdr reorders agents.
+
+### Fixed
+- **`agent_blocked` Delivery Fallback**: Falls back to `herdr pane send-text` + `Enter` instead of rejecting with `agent_blocked` when `herdr agent prompt` is blocked (`waiting_input`), and runs the 800ms transcript poll for all delivered messages.
+- **`agent_settled` on `done`**: Emits `agent_settled` when a Herdr agent transitions from `working` to `done` (not only `idle`), clearing stuck thinking indicators on mobile.
+
 ## [0.4.0] - 2026-11-09
 
 Active task streaming, interactive `/term` pane peek, automated Git dirty refresh, and network/reconnect optimizations for Herdr and Pi.

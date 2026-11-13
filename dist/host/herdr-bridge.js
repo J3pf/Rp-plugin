@@ -6,6 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { Connection } from "../extension/connection.js";
 import { resolveInboxDir } from "../extension/config.js";
 import { relayBlobFetcher, resolveAttachments } from "../extension/attachments.js";
@@ -93,6 +94,394 @@ export function extractRecentCommandOutput(terminalText, commandText) {
     }
     return terminalText;
 }
+const CLAUDE_DEFAULT_WINDOW = 200_000;
+const CODEX_DEFAULT_WINDOW = 258_400;
+function readJsonlTailLines(filePath, maxBytes = 64 * 1024) {
+    try {
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile() || stat.size <= 0)
+            return [];
+        const readSize = Math.min(stat.size, maxBytes);
+        const fd = fs.openSync(filePath, "r");
+        try {
+            const buf = Buffer.allocUnsafe(readSize);
+            fs.readSync(fd, buf, 0, readSize, stat.size - readSize);
+            const lines = buf.toString("utf8").split("\n");
+            if (readSize < stat.size && lines.length > 0)
+                lines.shift();
+            return lines;
+        }
+        finally {
+            fs.closeSync(fd);
+        }
+    }
+    catch {
+        return [];
+    }
+}
+function readClaudeContextUsage(cwd, sessionId, home) {
+    try {
+        const slug = path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
+        const projDir = path.join(home, ".claude", "projects", slug);
+        if (!fs.existsSync(projDir))
+            return null;
+        let targetFile = null;
+        if (sessionId) {
+            const candidate = path.join(projDir, `${sessionId}.jsonl`);
+            if (fs.existsSync(candidate))
+                targetFile = candidate;
+        }
+        if (!targetFile) {
+            const files = fs
+                .readdirSync(projDir)
+                .filter((f) => f.endsWith(".jsonl"))
+                .map((f) => {
+                const full = path.join(projDir, f);
+                try {
+                    return { full, mtimeMs: fs.statSync(full).mtimeMs };
+                }
+                catch {
+                    return { full, mtimeMs: 0 };
+                }
+            })
+                .filter((f) => f.mtimeMs > 0)
+                .sort((a, b) => b.mtimeMs - a.mtimeMs);
+            if (files.length > 0)
+                targetFile = files[0].full;
+        }
+        if (!targetFile)
+            return null;
+        const lines = readJsonlTailLines(targetFile);
+        for (let i = lines.length - 1; i >= 0; i--) {
+            const line = lines[i].trim();
+            if (!line.startsWith("{"))
+                continue;
+            try {
+                const obj = JSON.parse(line);
+                const usage = obj?.message?.usage ?? obj?.usage;
+                if (usage && typeof usage === "object") {
+                    const inTok = Number(usage.input_tokens ?? 0) || 0;
+                    const cacheCreate = Number(usage.cache_creation_input_tokens ?? 0) || 0;
+                    const cacheRead = Number(usage.cache_read_input_tokens ?? 0) || 0;
+                    const outTok = Number(usage.output_tokens ?? 0) || 0;
+                    const total = Math.max(0, Math.floor(inTok + cacheCreate + cacheRead + outTok));
+                    if (total > 0) {
+                        const pct = Math.min(100, Math.max(0, Math.round((total / CLAUDE_DEFAULT_WINDOW) * 100)));
+                        return { tokens: total, contextWindow: CLAUDE_DEFAULT_WINDOW, percent: pct };
+                    }
+                }
+            }
+            catch {
+                /* ignore malformed line */
+            }
+        }
+    }
+    catch {
+        /* ignore */
+    }
+    return null;
+}
+function readCodexContextUsage(cwd, sessionId, home) {
+    try {
+        const sessionsRoot = path.join(home, ".codex", "sessions");
+        if (!fs.existsSync(sessionsRoot))
+            return null;
+        const years = fs.readdirSync(sessionsRoot).sort().reverse();
+        const candidates = [];
+        for (const y of years.slice(0, 2)) {
+            const yDir = path.join(sessionsRoot, y);
+            if (!fs.statSync(yDir, { throwIfNoEntry: false })?.isDirectory())
+                continue;
+            const months = fs.readdirSync(yDir).sort().reverse();
+            for (const m of months.slice(0, 2)) {
+                const mDir = path.join(yDir, m);
+                if (!fs.statSync(mDir, { throwIfNoEntry: false })?.isDirectory())
+                    continue;
+                const days = fs.readdirSync(mDir).sort().reverse();
+                for (const d of days.slice(0, 3)) {
+                    const dDir = path.join(mDir, d);
+                    if (!fs.statSync(dDir, { throwIfNoEntry: false })?.isDirectory())
+                        continue;
+                    for (const f of fs.readdirSync(dDir)) {
+                        if (!f.endsWith(".jsonl"))
+                            continue;
+                        const full = path.join(dDir, f);
+                        try {
+                            candidates.push({ full, mtimeMs: fs.statSync(full).mtimeMs });
+                        }
+                        catch {
+                            /* ignore */
+                        }
+                    }
+                }
+            }
+        }
+        candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+        for (const cand of candidates.slice(0, 8)) {
+            if (sessionId && !path.basename(cand.full).includes(sessionId))
+                continue;
+            if (!sessionId && cwd) {
+                const headLines = readJsonlTailLines(cand.full, 4096);
+                const firstLine = headLines[0]?.trim();
+                if (firstLine?.startsWith("{")) {
+                    try {
+                        const meta = JSON.parse(firstLine);
+                        if (meta?.type === "session_meta" && meta?.payload?.cwd && path.resolve(meta.payload.cwd) !== path.resolve(cwd)) {
+                            continue;
+                        }
+                    }
+                    catch {
+                        /* ignore */
+                    }
+                }
+            }
+            const lines = readJsonlTailLines(cand.full);
+            for (let i = lines.length - 1; i >= 0; i--) {
+                const line = lines[i].trim();
+                if (!line.startsWith("{"))
+                    continue;
+                try {
+                    const obj = JSON.parse(line);
+                    if (obj?.payload?.type === "token_count" && obj?.payload?.info?.last_token_usage) {
+                        const total = Math.max(0, Math.floor(Number(obj.payload.info.last_token_usage.total_tokens ?? 0)));
+                        const win = Math.max(1, Math.floor(Number(obj.payload.info.model_context_window ?? CODEX_DEFAULT_WINDOW)));
+                        if (total > 0) {
+                            const pct = Math.min(100, Math.max(0, Math.round((total / win) * 100)));
+                            return { tokens: total, contextWindow: win, percent: pct };
+                        }
+                    }
+                }
+                catch {
+                    /* ignore */
+                }
+            }
+        }
+    }
+    catch {
+        /* ignore */
+    }
+    return null;
+}
+export function parseTerminalContextUsage(terminalText, defaultWindow = CLAUDE_DEFAULT_WINDOW) {
+    if (!terminalText)
+        return null;
+    const slashMatch = /(\d+(?:\.\d+)?)\s*k\s*\/\s*(\d+(?:\.\d+)?)\s*k/i.exec(terminalText);
+    if (slashMatch) {
+        const tokens = Math.round(Number.parseFloat(slashMatch[1]) * 1000);
+        const window = Math.round(Number.parseFloat(slashMatch[2]) * 1000);
+        if (tokens > 0 && window > 0 && tokens <= window * 2) {
+            const percent = Math.min(100, Math.max(0, Math.round((tokens / window) * 100)));
+            return { tokens, contextWindow: window, percent };
+        }
+    }
+    const leftMatch = /(\d{1,3})%\s+context\s+left/i.exec(terminalText);
+    if (leftMatch) {
+        const leftPct = Number.parseInt(leftMatch[1], 10);
+        if (leftPct >= 0 && leftPct <= 100) {
+            const percent = 100 - leftPct;
+            const tokens = Math.round((percent / 100) * defaultWindow);
+            return { tokens, contextWindow: defaultWindow, percent };
+        }
+    }
+    const usedMatch = /context(?:\s+used)?[:\s]+(\d{1,3})%/i.exec(terminalText);
+    if (usedMatch) {
+        const percent = Number.parseInt(usedMatch[1], 10);
+        if (percent >= 0 && percent <= 100) {
+            const tokens = Math.round((percent / 100) * defaultWindow);
+            return { tokens, contextWindow: defaultWindow, percent };
+        }
+    }
+    return null;
+}
+export function readExternalAgentContextUsage(agent, cwd, sessionId, terminalText = "", home = os.homedir()) {
+    if (agent === "claude") {
+        return readClaudeContextUsage(cwd, sessionId, home) ?? parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW);
+    }
+    if (agent === "codex") {
+        return readCodexContextUsage(cwd, sessionId, home) ?? parseTerminalContextUsage(terminalText, CODEX_DEFAULT_WINDOW);
+    }
+    return parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW);
+}
+function extractAgyModelFromGenMetadataBlob(buf) {
+    const tail = buf.subarray(Math.max(0, buf.length - 600));
+    for (const tagByte of [0xaa, 0x9a]) {
+        for (let i = tail.length - 4; i >= 0; i--) {
+            if (tail[i] === tagByte && tail[i + 1] === 0x01) {
+                const len = tail[i + 2];
+                if (len >= 3 && len <= 80 && i + 3 + len <= tail.length) {
+                    const s = tail.subarray(i + 3, i + 3 + len).toString("utf8").trim();
+                    if (/^[A-Za-z0-9][A-Za-z0-9 ._()/-]+$/.test(s) &&
+                        !/^[0-9a-f-]{32,}$/i.test(s) &&
+                        s !== "false" &&
+                        s !== "true") {
+                        return s;
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+function readAgySessionModel(sessionId, home) {
+    if (!sessionId || !/^[a-zA-Z0-9._-]+$/.test(sessionId))
+        return null;
+    let transcriptChangeModel = null;
+    let lastUserInputChangeModel = null;
+    try {
+        const tPath = resolveAgyTranscriptPath(sessionId, home);
+        const lines = readJsonlTailLines(tPath, 256 * 1024);
+        let seenLatestUserInput = false;
+        for (let i = lines.length - 1; i >= 0; i--) {
+            const line = lines[i].trim();
+            if (!line.startsWith("{"))
+                continue;
+            try {
+                const obj = JSON.parse(line);
+                if (obj?.type === "USER_INPUT" && typeof obj?.content === "string") {
+                    const m = /changed setting `Model Selection` from [^\n]+ to ([^\n.<]+)\./i.exec(obj.content);
+                    if (m?.[1]?.trim()) {
+                        const candidate = m[1].trim();
+                        if (!transcriptChangeModel)
+                            transcriptChangeModel = candidate;
+                        if (!seenLatestUserInput)
+                            lastUserInputChangeModel = candidate;
+                    }
+                    seenLatestUserInput = true;
+                    if (transcriptChangeModel)
+                        break;
+                }
+            }
+            catch {
+                /* ignore */
+            }
+        }
+    }
+    catch {
+        /* ignore */
+    }
+    if (lastUserInputChangeModel)
+        return lastUserInputChangeModel;
+    try {
+        const dbPath = path.join(home, ".gemini", "antigravity-cli", "conversations", `${sessionId}.db`);
+        if (fs.existsSync(dbPath)) {
+            const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+            try {
+                const row = db.prepare("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1").get();
+                if (row?.data) {
+                    const fromDb = extractAgyModelFromGenMetadataBlob(Buffer.from(row.data));
+                    if (fromDb)
+                        return fromDb;
+                }
+            }
+            finally {
+                db.close();
+            }
+        }
+    }
+    catch {
+        /* ignore */
+    }
+    return transcriptChangeModel;
+}
+export function readExternalAgentModel(agent, cwd, sessionId, home = os.homedir()) {
+    if (agent === "agy") {
+        const sessionModel = readAgySessionModel(sessionId, home);
+        if (sessionModel) {
+            return { provider: "google", id: sessionModel };
+        }
+        try {
+            const settingsPath = path.join(home, ".gemini", "antigravity-cli", "settings.json");
+            if (fs.existsSync(settingsPath)) {
+                const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+                if (typeof parsed?.model === "string" && parsed.model.trim()) {
+                    return { provider: "google", id: parsed.model.trim() };
+                }
+            }
+        }
+        catch {
+            /* ignore */
+        }
+        return { provider: "google", id: "antigravity" };
+    }
+    if (agent === "claude") {
+        try {
+            const slug = path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
+            const projDir = path.join(home, ".claude", "projects", slug);
+            if (fs.existsSync(projDir)) {
+                let targetFile = null;
+                if (sessionId) {
+                    const candidate = path.join(projDir, `${sessionId}.jsonl`);
+                    if (fs.existsSync(candidate))
+                        targetFile = candidate;
+                }
+                if (!targetFile) {
+                    const files = fs
+                        .readdirSync(projDir)
+                        .filter((f) => f.endsWith(".jsonl"))
+                        .map((f) => {
+                        const full = path.join(projDir, f);
+                        try {
+                            return { full, mtimeMs: fs.statSync(full).mtimeMs };
+                        }
+                        catch {
+                            return { full, mtimeMs: 0 };
+                        }
+                    })
+                        .filter((f) => f.mtimeMs > 0)
+                        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+                    if (files.length > 0)
+                        targetFile = files[0].full;
+                }
+                if (targetFile) {
+                    const lines = readJsonlTailLines(targetFile);
+                    for (let i = lines.length - 1; i >= 0; i--) {
+                        const line = lines[i].trim();
+                        if (!line.startsWith("{"))
+                            continue;
+                        try {
+                            const obj = JSON.parse(line);
+                            const model = obj?.message?.model ?? obj?.model;
+                            if (typeof model === "string" && model.trim()) {
+                                return { provider: "anthropic", id: model.trim() };
+                            }
+                        }
+                        catch {
+                            /* ignore */
+                        }
+                    }
+                }
+            }
+            const claudeSettings = path.join(home, ".claude", "settings.json");
+            if (fs.existsSync(claudeSettings)) {
+                const parsed = JSON.parse(fs.readFileSync(claudeSettings, "utf8"));
+                if (typeof parsed?.model === "string" && parsed.model.trim()) {
+                    return { provider: "anthropic", id: parsed.model.trim() };
+                }
+            }
+        }
+        catch {
+            /* ignore */
+        }
+        return { provider: "anthropic", id: "claude" };
+    }
+    if (agent === "codex") {
+        try {
+            const cfgToml = path.join(home, ".codex", "config.toml");
+            if (fs.existsSync(cfgToml)) {
+                const text = fs.readFileSync(cfgToml, "utf8");
+                const m = /^\s*model\s*=\s*["']([^"']+)["']/m.exec(text);
+                if (m?.[1]?.trim()) {
+                    return { provider: "openai", id: m[1].trim() };
+                }
+            }
+        }
+        catch {
+            /* ignore */
+        }
+        return { provider: "openai", id: "codex" };
+    }
+    return { provider: agent, id: "default" };
+}
 export function parseHerdrAgentList(stdout) {
     const json = parseJson(stdout);
     const list = Array.isArray(json?.result?.agents)
@@ -172,6 +561,10 @@ export class BridgedAgentSession {
     watcher = null;
     watchDebounce = null;
     lastSentName = "";
+    lastSentTabId = null;
+    lastSentContextSpec = "";
+    lastSentModelId = "";
+    externalContextUsage = null;
     currentStatus;
     optimisticWorkingUntilMs = 0;
     fallbackTurnTs = 0;
@@ -237,12 +630,41 @@ export class BridgedAgentSession {
     get discoveredInfo() {
         return { ...this.info };
     }
+    getContextUsage() {
+        return this.transcriptReader?.getContextUsage() ?? this.externalContextUsage;
+    }
     encodedTabId() {
         const idx = this.info.orderIndex;
-        if (typeof idx === "number" && Number.isFinite(idx) && idx > 0) {
-            return `#${String(Math.floor(idx)).padStart(4, "0")}|${this.info.tabId ?? ""}`;
+        const hasOrder = typeof idx === "number" && Number.isFinite(idx) && idx > 0;
+        const isDone = this.effectiveStatus() === "done";
+        const ctx = this.getContextUsage();
+        const hasCtx = !!ctx && ctx.tokens > 0 && ctx.contextWindow > 0;
+        if (!hasOrder && !isDone && !hasCtx) {
+            return this.info.tabId;
         }
-        return this.info.tabId;
+        const orderPart = hasOrder ? `#${String(Math.floor(idx)).padStart(4, "0")}` : "";
+        const donePart = isDone ? "~done" : "";
+        const ctxPart = hasCtx ? `@${ctx.tokens}/${ctx.contextWindow}` : "";
+        return `${orderPart}${donePart}${ctxPart}|${this.info.tabId ?? ""}`;
+    }
+    syncContextIfChanged(direct = false) {
+        const ctx = this.getContextUsage();
+        if (!ctx || ctx.tokens <= 0 || ctx.contextWindow <= 0)
+            return;
+        const spec = `${ctx.tokens}/${ctx.contextWindow}`;
+        const nextTab = this.encodedTabId();
+        if (spec !== this.lastSentContextSpec) {
+            this.lastSentContextSpec = spec;
+            if (direct) {
+                this.conn.sendDirect("agent.statuses", { items: { "rp:context": spec } });
+            }
+            else {
+                this.conn.send("agent.statuses", { items: { "rp:context": spec } });
+            }
+        }
+        if (this.conn.connected && this.initialSnapshotSent && nextTab !== this.lastSentTabId) {
+            this.conn.sendDirect("agent.hello", this.makeHello());
+        }
     }
     sessionDisplayName() {
         if (this.d.cfg.redactContent)
@@ -258,6 +680,16 @@ export class BridgedAgentSession {
         if (nextName && nextName !== this.lastSentName) {
             this.lastSentName = nextName;
             this.sendEvent({ type: "session_info_changed", name: nextName });
+        }
+    }
+    syncModelIfChanged() {
+        const nextModel = readExternalAgentModel(this.info.agent, this.info.cwd, this.info.sessionId);
+        if (nextModel.id && nextModel.id !== this.lastSentModelId) {
+            this.lastSentModelId = nextModel.id;
+            if (this.conn.connected && this.initialSnapshotSent) {
+                this.conn.sendDirect("agent.hello", this.makeHello());
+                this.sendEvent({ type: "model_change", model: nextModel });
+            }
         }
     }
     effectiveStatus() {
@@ -301,8 +733,8 @@ export class BridgedAgentSession {
         }
         const prevTab = this.encodedTabId();
         this.info = { ...this.info, ...next };
-        const nextTab = this.encodedTabId();
         this.currentStatus = next.status;
+        const nextTab = this.encodedTabId();
         if (this.conn.connected && prevTab !== nextTab && this.initialSnapshotSent) {
             this.conn.sendDirect("agent.hello", this.makeHello());
         }
@@ -325,7 +757,8 @@ export class BridgedAgentSession {
             if (this.effectiveStatus() === "working") {
                 this.sendEvent({ type: "agent_start" });
             }
-            else if (prevStatus === "working" && this.effectiveStatus() === "idle") {
+            else if (prevStatus === "working" &&
+                (this.effectiveStatus() === "idle" || this.effectiveStatus() === "done")) {
                 void this.pollTranscriptNow();
                 void this.refreshGit();
                 this.sendEvent({ type: "agent_settled", aborted: false });
@@ -339,9 +772,13 @@ export class BridgedAgentSession {
         const subagents = this.transcriptReader?.getSubagents() ?? [];
         const name = this.sessionDisplayName();
         this.lastSentName = name;
+        const encodedTab = this.encodedTabId();
+        this.lastSentTabId = encodedTab;
         const rawBranch = this.git?.branch ?? null;
         const gitDirty = this.git?.dirty ?? false;
         const formattedBranch = rawBranch && gitDirty && !rawBranch.endsWith(" *") ? `${rawBranch} *` : rawBranch;
+        const model = readExternalAgentModel(this.info.agent, this.info.cwd, this.info.sessionId);
+        this.lastSentModelId = model.id;
         return {
             agentId: this.agentId,
             kind: this.info.agent,
@@ -358,7 +795,7 @@ export class BridgedAgentSession {
             launcher: this.info.agent,
             herdr: {
                 paneId: this.info.paneId,
-                tabId: this.encodedTabId(),
+                tabId: encodedTab,
                 workspaceId: this.info.workspaceId,
                 session: this.d.herdrSession,
             },
@@ -368,7 +805,7 @@ export class BridgedAgentSession {
             cwd: this.info.cwd,
             spawnId: null,
             git: { branch: formattedBranch, dirty: gitDirty },
-            model: this.info.agent === "agy" ? { provider: "google", id: "antigravity" } : { provider: this.info.agent, id: "default" },
+            model,
             thinking: null,
             status: this.effectiveStatus(),
             openPrompts: this.broker.openPrompts(),
@@ -388,6 +825,7 @@ export class BridgedAgentSession {
         const detail = status === "working" ? (this.transcriptReader?.getActiveTask() ?? null) : null;
         this.lastActiveTask = detail;
         this.conn.sendDirect("agent.status", { status, ...(detail ? { detail } : {}) });
+        this.syncContextIfChanged(true);
         this.conn.needsSnapshot = false;
         for (const p of pendingAnswers(w))
             this.broker.handleAnswer(p.promptId, p.answer);
@@ -533,6 +971,8 @@ export class BridgedAgentSession {
                 }
                 if (events.length > 0) {
                     this.syncSessionNameIfChanged();
+                    this.syncContextIfChanged();
+                    this.syncModelIfChanged();
                     if (this.effectiveStatus() === "working") {
                         const nextTask = this.transcriptReader.getActiveTask();
                         if (nextTask !== this.lastActiveTask) {
@@ -544,6 +984,11 @@ export class BridgedAgentSession {
                     }
                 }
                 return;
+            }
+            const extUsage = readExternalAgentContextUsage(this.info.agent, this.info.cwd, this.info.sessionId, this.lastTerminalSnapshot);
+            if (extUsage) {
+                this.externalContextUsage = extUsage;
+                this.syncContextIfChanged();
             }
             await this.pollPaneFallback();
         }
@@ -569,6 +1014,11 @@ export class BridgedAgentSession {
             if (!text)
                 return;
             const snippet = extractRecentCommandOutput(text, commandText);
+            const termUsage = readExternalAgentContextUsage(this.info.agent, this.info.cwd, this.info.sessionId, text);
+            if (termUsage) {
+                this.externalContextUsage = termUsage;
+                this.syncContextIfChanged();
+            }
             if (snippet === this.lastTerminalSnapshot)
                 return;
             this.lastTerminalSnapshot = truncateBytes(snippet, 16 * 1024).text;
@@ -736,51 +1186,48 @@ export class BridgedAgentSession {
         }
         const textArgs = text.startsWith("-") ? ["--", text] : [text];
         try {
+            let deliveredViaAgentPrompt = false;
             if (!b.asCommand) {
                 const res = await this.d.runner("herdr", ["agent", "prompt", this.info.paneId, ...textArgs], { timeoutMs: 10_000, env });
                 if (res.code === 0) {
-                    markWorkingOnDelivery();
-                    return ack("delivered");
-                }
-                if (/agent_blocked|blocked/i.test(`${res.stderr} ${res.stdout}`) || this.currentStatus === "waiting_input") {
-                    return ack("rejected", "agent_blocked");
+                    deliveredViaAgentPrompt = true;
                 }
             }
-            // Fallback (or slash command): send literal text + Enter directly to the Herdr pane
-            const sendRes = await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, ...textArgs], { timeoutMs: 5_000, env });
-            if (sendRes.code !== 0)
-                return ack("rejected", "herdr_unavailable");
-            await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 5_000, env });
+            if (!deliveredViaAgentPrompt) {
+                // Fallback (when agent is in blocked/waiting_input state, or slash command):
+                // send literal text + Enter directly to the Herdr pane.
+                const sendRes = await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, ...textArgs], { timeoutMs: 5_000, env });
+                if (sendRes.code !== 0)
+                    return ack("rejected", "herdr_unavailable");
+                await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 5_000, env });
+            }
             markWorkingOnDelivery();
             ack("delivered");
-            if (b.asCommand) {
-                // Local TUI commands (e.g. /usage, /statusline, /help) execute directly in the CLI terminal
-                // without creating entries in transcript.jsonl. If no transcript events arrive within 800ms,
-                // read the output directly from the pane and settle so the mobile chat displays the result.
-                if (this.commandTimer)
-                    clearTimeout(this.commandTimer);
-                this.commandTimer = setTimeout(async () => {
-                    this.commandTimer = null;
-                    if (this.disposed)
+            if (this.commandTimer)
+                clearTimeout(this.commandTimer);
+            this.commandTimer = setTimeout(async () => {
+                this.commandTimer = null;
+                if (this.disposed)
+                    return;
+                if (this.transcriptReader) {
+                    const events = this.transcriptReader.pollNewEvents();
+                    if (events.length > 0) {
+                        for (const ev of events)
+                            this.sendEvent(ev);
+                        this.syncSessionNameIfChanged();
                         return;
-                    if (this.transcriptReader) {
-                        const events = this.transcriptReader.pollNewEvents();
-                        if (events.length > 0) {
-                            for (const ev of events)
-                                this.sendEvent(ev);
-                            this.syncSessionNameIfChanged();
-                            return;
-                        }
                     }
+                }
+                if (b.asCommand) {
                     await this.pollPaneFallback(text);
-                    if (this.currentStatus === "idle") {
+                    if (this.currentStatus === "idle" || this.currentStatus === "done") {
                         this.optimisticWorkingUntilMs = 0;
                         this.syncStatus();
                         this.sendEvent({ type: "agent_settled", aborted: false });
                     }
-                }, 800);
-                this.commandTimer.unref?.();
-            }
+                }
+            }, 800);
+            this.commandTimer.unref?.();
             return;
         }
         catch {
