@@ -6,6 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { Connection } from "../extension/connection.ts";
 import { resolveInboxDir, type RpConfig } from "../extension/config.ts";
 import { relayBlobFetcher, resolveAttachments } from "../extension/attachments.ts";
@@ -314,6 +315,84 @@ export function readExternalAgentContextUsage(
   return parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW);
 }
 
+function extractAgyModelFromGenMetadataBlob(buf: Buffer): string | null {
+  const tail = buf.subarray(Math.max(0, buf.length - 600));
+  for (const tagByte of [0xaa, 0x9a]) {
+    for (let i = tail.length - 4; i >= 0; i--) {
+      if (tail[i] === tagByte && tail[i + 1] === 0x01) {
+        const len = tail[i + 2]!;
+        if (len >= 3 && len <= 80 && i + 3 + len <= tail.length) {
+          const s = tail.subarray(i + 3, i + 3 + len).toString("utf8").trim();
+          if (
+            /^[A-Za-z0-9][A-Za-z0-9 ._()/-]+$/.test(s) &&
+            !/^[0-9a-f-]{32,}$/i.test(s) &&
+            s !== "false" &&
+            s !== "true"
+          ) {
+            return s;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function readAgySessionModel(sessionId: string | null, home: string): string | null {
+  if (!sessionId || !/^[a-zA-Z0-9._-]+$/.test(sessionId)) return null;
+  let transcriptChangeModel: string | null = null;
+  let lastUserInputChangeModel: string | null = null;
+  try {
+    const tPath = resolveAgyTranscriptPath(sessionId, home);
+    const lines = readJsonlTailLines(tPath, 256 * 1024);
+    let seenLatestUserInput = false;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]!.trim();
+      if (!line.startsWith("{")) continue;
+      try {
+        const obj = JSON.parse(line) as any;
+        if (obj?.type === "USER_INPUT" && typeof obj?.content === "string") {
+          const m = /changed setting `Model Selection` from [^\n]+ to ([^\n.<]+)\./i.exec(obj.content);
+          if (m?.[1]?.trim()) {
+            const candidate = m[1].trim();
+            if (!transcriptChangeModel) transcriptChangeModel = candidate;
+            if (!seenLatestUserInput) lastUserInputChangeModel = candidate;
+          }
+          seenLatestUserInput = true;
+          if (transcriptChangeModel) break;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  if (lastUserInputChangeModel) return lastUserInputChangeModel;
+
+  try {
+    const dbPath = path.join(home, ".gemini", "antigravity-cli", "conversations", `${sessionId}.db`);
+    if (fs.existsSync(dbPath)) {
+      const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+      try {
+        const row = db.prepare("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1").get() as
+          | { data?: Uint8Array | Buffer }
+          | undefined;
+        if (row?.data) {
+          const fromDb = extractAgyModelFromGenMetadataBlob(Buffer.from(row.data));
+          if (fromDb) return fromDb;
+        }
+      } finally {
+        db.close();
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  return transcriptChangeModel;
+}
+
 export function readExternalAgentModel(
   agent: string,
   cwd: string,
@@ -321,6 +400,10 @@ export function readExternalAgentModel(
   home = os.homedir(),
 ): { provider: string; id: string } {
   if (agent === "agy") {
+    const sessionModel = readAgySessionModel(sessionId, home);
+    if (sessionModel) {
+      return { provider: "google", id: sessionModel };
+    }
     try {
       const settingsPath = path.join(home, ".gemini", "antigravity-cli", "settings.json");
       if (fs.existsSync(settingsPath)) {
@@ -499,6 +582,7 @@ export class BridgedAgentSession {
   private lastSentName = "";
   private lastSentTabId: string | null = null;
   private lastSentContextSpec = "";
+  private lastSentModelId = "";
   private externalContextUsage: ContextUsageInfo | null = null;
   private currentStatus: AgentStatus;
   private optimisticWorkingUntilMs = 0;
@@ -626,6 +710,17 @@ export class BridgedAgentSession {
     }
   }
 
+  private syncModelIfChanged(): void {
+    const nextModel = readExternalAgentModel(this.info.agent, this.info.cwd, this.info.sessionId);
+    if (nextModel.id && nextModel.id !== this.lastSentModelId) {
+      this.lastSentModelId = nextModel.id;
+      if (this.conn.connected && this.initialSnapshotSent) {
+        this.conn.sendDirect("agent.hello", this.makeHello());
+        this.sendEvent({ type: "model_change", model: nextModel });
+      }
+    }
+  }
+
   private effectiveStatus(): AgentStatus {
     if (this.broker.openCount > 0) return "waiting_input";
     if (this.currentStatus === "idle" && Date.now() < this.optimisticWorkingUntilMs) {
@@ -719,6 +814,8 @@ export class BridgedAgentSession {
     const gitDirty = this.git?.dirty ?? false;
     const formattedBranch =
       rawBranch && gitDirty && !rawBranch.endsWith(" *") ? `${rawBranch} *` : rawBranch;
+    const model = readExternalAgentModel(this.info.agent, this.info.cwd, this.info.sessionId);
+    this.lastSentModelId = model.id;
     return {
       agentId: this.agentId,
       kind: this.info.agent,
@@ -745,7 +842,7 @@ export class BridgedAgentSession {
       cwd: this.info.cwd,
       spawnId: null,
       git: { branch: formattedBranch, dirty: gitDirty },
-      model: readExternalAgentModel(this.info.agent, this.info.cwd, this.info.sessionId),
+      model,
       thinking: null,
       status: this.effectiveStatus(),
       openPrompts: this.broker.openPrompts(),
@@ -907,6 +1004,7 @@ export class BridgedAgentSession {
         if (events.length > 0) {
           this.syncSessionNameIfChanged();
           this.syncContextIfChanged();
+          this.syncModelIfChanged();
           if (this.effectiveStatus() === "working") {
             const nextTask = this.transcriptReader.getActiveTask();
             if (nextTask !== this.lastActiveTask) {

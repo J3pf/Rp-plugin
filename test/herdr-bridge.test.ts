@@ -398,8 +398,25 @@ describe("agy-transcript", () => {
 
     const agyDir = path.join(home, ".gemini", "antigravity-cli");
     fs.mkdirSync(agyDir, { recursive: true });
-    fs.writeFileSync(path.join(agyDir, "settings.json"), JSON.stringify({ model: "Gemini 4 Argon (Medium)" }));
+    fs.writeFileSync(path.join(agyDir, "settings.json"), JSON.stringify({ model: "Gemini 4 Hydrogen (Medium)" }));
     expect(readExternalAgentModel("agy", cwd, null, home)).toEqual({
+      provider: "google",
+      id: "Gemini 4 Hydrogen (Medium)",
+    });
+
+    // Per-session model from transcript USER_SETTINGS_CHANGE overrides global settings.json
+    const sessionA = "conv-argon";
+    const tPathA = resolveAgyTranscriptPath(sessionA, home);
+    fs.mkdirSync(path.dirname(tPathA), { recursive: true });
+    fs.writeFileSync(
+      tPathA,
+      JSON.stringify({
+        step_index: 1,
+        type: "USER_INPUT",
+        content: "<USER_REQUEST>Hola</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Hydrogen (Medium) to Gemini 4 Argon (Medium).\n</USER_SETTINGS_CHANGE>",
+      }) + "\n",
+    );
+    expect(readExternalAgentModel("agy", cwd, sessionA, home)).toEqual({
       provider: "google",
       id: "Gemini 4 Argon (Medium)",
     });
