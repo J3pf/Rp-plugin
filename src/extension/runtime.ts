@@ -1,5 +1,6 @@
 // Per-session state: created in session_start, destroyed in session_shutdown (PLAN §5).
 import os from "node:os";
+import path from "node:path";
 import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { newId, type AgentEventPayload, type AgentHelloBody, type AgentStatus, type Envelope, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
@@ -10,6 +11,9 @@ import { resolveInboxDir } from "./config.ts";
 import type { StaticEnv, HerdrLocation } from "./environment.ts";
 import { detectPiVersion, detectGentleVersion, detectActiveTheme, gentleVersionSupported, hasGentleAskTools, terminalStdin, toolNames, warnOnce } from "./compat.ts";
 import { Connection, type ConnState, type TransportName } from "./connection.ts";
+import { createSealer, type Sealer } from "./sealing.ts";
+import { loadOrCreateMachineIdentity } from "../shared/e2e/identity.ts";
+import { machineKeyPath } from "../shared/platform.ts";
 import { Forwarder, type ForwardedEvent } from "./forwarder.ts";
 import { buildSnapshotEntries } from "./snapshot.ts";
 import { StatusTracker } from "./status.ts";
@@ -94,6 +98,8 @@ export class Runtime {
   private detectTheme: () => string | null;
   /** Static facts copied from ctx: reading a stale ctx (after reload/dispose) throws in Pi. */
   private info: { mode: string; cwd: string; hasUI: boolean; sessionFile: string | null; sessionName: string | null };
+  /** Content sealing for protocol v2; absent when no machine key can be loaded. */
+  private sealer: Sealer | null = null;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -214,7 +220,9 @@ export class Runtime {
       },
     });
 
+    this.sealer = this.buildSealer();
     const connOpts: ConstructorParameters<typeof Connection>[0] = {
+      sealer: this.sealer ?? undefined,
       relayUrl: cfg.relayUrl!,
       token: cfg.machineToken!,
       agentId: this.agentId,
@@ -226,6 +234,30 @@ export class Runtime {
       onFatal: (code, reason) => this.onFatal(code, reason),
     };
     this.conn = opts.connectionFactory ? opts.connectionFactory(connOpts) : new Connection(connOpts);
+  }
+
+  /**
+   * Loads (or creates) the machine key and builds the sealer. A missing or unreadable key must not
+   * break the session: the plugin then runs in clear, exactly like a v1 client.
+   */
+  private buildSealer(): Sealer | null {
+    try {
+      const { identity } = loadOrCreateMachineIdentity(machineKeyPath());
+      return createSealer({
+        identity,
+        ctx: () => ({
+          agentId: this.agentId,
+          agentLabel: this.info.sessionName ?? `pi@${os.hostname()}`,
+          machineId: this.cfg.machineId ?? "",
+          machineName: this.cfg.machine.name ?? os.hostname(),
+          machineContext: this.cfg.machine.context ?? "personal",
+        }),
+        onLog: (m) => this.notify(m, "info"),
+      });
+    } catch (err) {
+      this.notify(`RP: sin cifrado de extremo a extremo (${(err as Error).message})`, "warning");
+      return null;
+    }
   }
 
   // ---------- lifecycle ----------
@@ -398,6 +430,7 @@ export class Runtime {
   }
 
   private onWelcome(w: WelcomeBody): void {
+    this.sealer?.updateDevices((w as { devices?: unknown }).devices);
     this.sendSnapshot(true);
     this.conn.sendDirect("agent.status", { status: this.statuses.current });
     const items = this.filterStatuses(this.statuses.snapshot());
@@ -479,6 +512,7 @@ export class Runtime {
       model: this.model,
       thinking: this.thinking,
       status: this.statuses.current as AgentStatus,
+      caps: this.sealer?.caps,
       openPrompts: this.broker.openPrompts(),
       todos: this.currentTodos.length > 0 ? { tasks: this.cfg.redactContent ? redactTodoTasks(this.currentTodos) : this.currentTodos } : null,
       subagents: this.subagents.getSnapshot().length > 0 ? this.subagents.getSnapshot() : undefined,

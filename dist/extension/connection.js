@@ -518,8 +518,27 @@ export class Connection {
         }
         return min;
     }
-    /** Send now if connected, otherwise queue (bounded). */
+    /** Send now if connected, otherwise queue (bounded). Bodies are sealed in order when a sealer is set. */
     send(t, d, opts = {}) {
+        const sealer = this.o.sealer;
+        if (!sealer) {
+            this.sendEnvelope(t, d, opts);
+            return;
+        }
+        // One chain keeps sealing order identical to call order: prompt.open never overtakes prompt.settled.
+        this.sealChain = this.sealChain.then(async () => {
+            let body = d;
+            try {
+                body = await sealer.transform(t, d, { id: opts.id });
+            }
+            catch (err) {
+                this.o.onLog?.(`e2e: sealing ${t} failed, sending it in clear: ${err.message}`);
+            }
+            this.sendEnvelope(t, body, opts);
+        });
+    }
+    sealChain = Promise.resolve();
+    sendEnvelope(t, d, opts = {}) {
         const env = envelope(t, d, opts);
         const critical = CRITICAL_TYPES.has(t);
         if (this.connected && this.t?.send(env))

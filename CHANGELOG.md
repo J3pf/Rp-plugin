@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`/rp status`** muestra el endpoint directo y la huella; `/rp off` y `/rp unpair` apagan el stack y borran el estado directo.
 - `rp-relay pair device|machine --json` y `rp-relay qr <texto>`: salida legible por máquina y QR de cualquier texto, para que el plugin componga el QR v2 sin dependencias nuevas.
 
+### Added (T7 — cifrado del lado PC)
+- **Contenido sellado de extremo a extremo** en `src/shared/e2e/`: derivación `ECDH P-256` + `HKDF-SHA256` (salt = SHA-256 de los dos `keyId` ordenados, `info = "rp-e2e-v1"`) y `AES-256-GCM` con AAD atada a emisor, tipo e id. Byte-compatible con `@j3pf/rp-protocol` (probado contra un vector fijo: misma clave, abre lo que sella el relay y re-sella al mismo ciphertext).
+- **Sellado en el punto único del cable** (`Connection.send`): `prompt.open`, `prompt.settled`, `agent.event` y `agent.snapshot` se sellan en una cadena que preserva el orden de llamada, así `prompt.settled` nunca adelanta a su `prompt.open`. Ids, tipos, `kind`, `category`, `danger` y horas siguen legibles para que el relay enrute.
+- **Push con contenido por dispositivo**: `prompt.open.push = [{deviceId, body}]`, una copia sellada por dispositivo con AAD (`t="push"`, `id=promptId`), de modo que la notificación conserva título, agente, máquina y opciones sin que el relay lea nada.
+- **Directorio de dispositivos** desde `agent.welcome.devices` y `caps: ["enc1"]` en `agent.hello`. La clave de máquina vive en `machine.key` junto a la config de RP (o junto a `RP_CONFIG`), compartida por el modo relay y el modo directo: una sola huella por PC.
+- Degradación explícita: sin claves de dispositivo, o con más de un dispositivo `enc1`, el contenido conversacional viaja en claro y se dice; nunca se sella para uno y se deja ilegible para otro.
+
 ### Notes
 - El relay embebido se configura con perfil `single-host`, `backup.enabled: false` y `publicUrl` del túnel, en `<data-dir>/relay.json` con permisos `600`. Verificado contra `@j3pf/rp-relay` real: arranca, responde `/healthz` y se apaga sin dejar procesos.
 

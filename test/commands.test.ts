@@ -239,7 +239,7 @@ describe("serve (modo directo)", () => {
     await commands.get("rp")!.handler("serve --tunnel none --name MiPC", ctx);
 
     expect(startDirect).toHaveBeenCalledOnce();
-    expect(startDirect.mock.calls[0]![0]).toMatchObject({ tunnel: "none", name: "MiPC" });
+    expect((startDirect.mock.calls[0] as unknown[])[0]).toMatchObject({ tunnel: "none", name: "MiPC" });
     expect(stopRuntime).toHaveBeenCalled();
     expect(startRuntime).toHaveBeenCalledOnce();
 

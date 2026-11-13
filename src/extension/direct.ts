@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { b64url } from "../shared/e2e/identity.ts";
+import { machineKeyPath } from "../shared/platform.ts";
 import { loadOrCreateMachineIdentity } from "../shared/e2e/identity.ts";
 import { resolveRelayCommand, splitCommand } from "../host/serve/relay.ts";
 import { type ServeHandle, type ServeOptions, startServe } from "../host/serve/index.ts";
@@ -50,6 +51,8 @@ export interface DirectDeps {
 
 export interface DirectRequest {
   dataDir: string;
+  /** Canonical machine key; defaults to the shared RP config dir (see `machineKeyPath`). */
+  keyPath?: string;
   tunnel: TunnelProviderName;
   relayCommand?: string | null;
   relayPath?: string | null;
@@ -88,7 +91,6 @@ interface StoredMachine {
   pairedAt: string;
 }
 
-const KEY_FILE = "machine.key";
 const MACHINE_FILE = "machine.json";
 
 function relayCliDefault(configPath: string, relayCommand?: string | null, relayPath?: string | null) {
@@ -135,7 +137,7 @@ function writeStoredMachine(file: string, value: StoredMachine): void {
 export async function startDirectMode(req: DirectRequest): Promise<DirectRun> {
   const deps = req.deps ?? {};
   const configPath = path.join(req.dataDir, "relay.json");
-  const identity = loadOrCreateMachineIdentity(path.join(req.dataDir, KEY_FILE)).identity;
+  const identity = loadOrCreateMachineIdentity(req.keyPath ?? machineKeyPath()).identity;
   const runServe = deps.startServe ?? startServe;
   const cli = deps.relayCli ?? ((args: string[], cfg: string) => relayCliDefault(cfg, req.relayCommand, req.relayPath)(args));
   const pair = deps.pairMachine ?? defaultPairMachine;

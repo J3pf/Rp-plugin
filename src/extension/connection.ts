@@ -35,6 +35,8 @@ export interface ConnectionOptions {
   onState?: (state: ConnState, transport: TransportName, detail?: string) => void;
   /** Called once when the connection gives up for good (4001/4002/4003). */
   onFatal?: (code: number, reason: string) => void;
+  /** Seals the content fields of each outbound body before it becomes an envelope (protocol v2). */
+  sealer?: { transform(t: string, d: unknown, opts?: { id?: string }): Promise<unknown> };
   onLog?: (msg: string) => void;
   /** Identify this agent to the long-poll endpoints. */
   agentId: string;
@@ -542,8 +544,28 @@ export class Connection {
     return min;
   }
 
-  /** Send now if connected, otherwise queue (bounded). */
+  /** Send now if connected, otherwise queue (bounded). Bodies are sealed in order when a sealer is set. */
   send<D>(t: string, d: D, opts: { id?: string; re?: string } = {}): void {
+    const sealer = this.o.sealer;
+    if (!sealer) {
+      this.sendEnvelope(t, d, opts);
+      return;
+    }
+    // One chain keeps sealing order identical to call order: prompt.open never overtakes prompt.settled.
+    this.sealChain = this.sealChain.then(async () => {
+      let body: unknown = d;
+      try {
+        body = await sealer.transform(t, d, { id: opts.id });
+      } catch (err) {
+        this.o.onLog?.(`e2e: sealing ${t} failed, sending it in clear: ${(err as Error).message}`);
+      }
+      this.sendEnvelope(t, body, opts);
+    });
+  }
+
+  private sealChain: Promise<void> = Promise.resolve();
+
+  private sendEnvelope<D>(t: string, d: D, opts: { id?: string; re?: string } = {}): void {
     const env = envelope(t, d, opts);
     const critical = CRITICAL_TYPES.has(t);
     if (this.connected && this.t?.send(env)) return;

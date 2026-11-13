@@ -212,6 +212,8 @@ export interface AgentHelloBody {
   agentId: string;
   kind: string;
   instance: string;
+  /** Capabilities of this agent (PROTOCOLO-V2 §6); `enc1` means sealed content is available. */
+  caps?: string[];
   epoch: string;
   pi: { version: string; mode: string };
   plugin: { version: string; features: string[] };

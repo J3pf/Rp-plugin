@@ -19,6 +19,16 @@ export function configPath(env: NodeJS.ProcessEnv = process.env, platform: Platf
   return p.join(configDir(env, platform, home), "config.json");
 }
 
+/**
+ * The P-256 machine key: one identity per PC, next to the RP config (or next to `RP_CONFIG` when
+ * that override is used, which keeps tests and portable installs hermetic).
+ */
+export function machineKeyPath(env: NodeJS.ProcessEnv = process.env, platform: Platform = process.platform, home = os.homedir()): string {
+  const p = platform === "win32" ? path.win32 : path.posix;
+  const dir = env.RP_CONFIG ? p.dirname(env.RP_CONFIG) : configDir(env, platform, home);
+  return p.join(dir, "machine.key");
+}
+
 export function hostConfigPath(env: NodeJS.ProcessEnv = process.env, platform: Platform = process.platform, home = os.homedir()): string {
   const p = platform === "win32" ? path.win32 : path.posix;
   return p.join(configDir(env, platform, home), "host.json");

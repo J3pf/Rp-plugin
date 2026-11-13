@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { b64url } from "../shared/e2e/identity.js";
+import { machineKeyPath } from "../shared/platform.js";
 import { loadOrCreateMachineIdentity } from "../shared/e2e/identity.js";
 import { resolveRelayCommand, splitCommand } from "../host/serve/relay.js";
 import { startServe } from "../host/serve/index.js";
@@ -23,7 +24,6 @@ export function buildPairUri(f) {
         params.push(`n=${encodeURIComponent(f.name)}`);
     return `rp://pair?${params.join("&")}`;
 }
-const KEY_FILE = "machine.key";
 const MACHINE_FILE = "machine.json";
 function relayCliDefault(configPath, relayCommand, relayPath) {
     const prefix = resolveRelayCommand({ relayCommand, relayPath });
@@ -62,7 +62,7 @@ function writeStoredMachine(file, value) {
 export async function startDirectMode(req) {
     const deps = req.deps ?? {};
     const configPath = path.join(req.dataDir, "relay.json");
-    const identity = loadOrCreateMachineIdentity(path.join(req.dataDir, KEY_FILE)).identity;
+    const identity = loadOrCreateMachineIdentity(req.keyPath ?? machineKeyPath()).identity;
     const runServe = deps.startServe ?? startServe;
     const cli = deps.relayCli ?? ((args, cfg) => relayCliDefault(cfg, req.relayCommand, req.relayPath)(args));
     const pair = deps.pairMachine ?? defaultPairMachine;

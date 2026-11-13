@@ -143,6 +143,18 @@ rp://pair?u=<publicUrl>&c=<código>&k=direct&f=<huella>&n=<nombre>
 
 `k=direct` y `f` (huella de la clave de máquina) hacen que la app fije la identidad del endpoint antes de enviar nada: si la clave no coincide, el emparejamiento se rechaza. La app necesita volver a escanear el QR cuando la URL pública cambia; `/rp serve` lo avisa y `/rp status` muestra el endpoint y la huella actuales. `/rp off` y `/rp unpair` apagan el stack.
 
+#### Cifrado de extremo a extremo (`enc1`)
+
+Cuando el móvil anuncia la capacidad `enc1`, la máquina sella el contenido antes de que salga del proceso:
+
+- **Qué se sella**: título, mensaje y etiquetas de opciones de `prompt.open`; `preview` de `prompt.settled`; `text`/`preview`/`detail` de `agent.event`; `lastPreview` de `agent.snapshot`; y el **cuerpo entero del push**, una copia por dispositivo.
+- **Qué no se sella**: ids, tipos, `kind`, `category`, `danger`, estados, horas y tamaños. El relay los necesita para enrutar, guardar y paginar.
+- **Claves**: una clave por par (dispositivo, máquina) con `ECDH P-256` + `HKDF-SHA256` + `AES-256-GCM`; el par se direcciona con el AAD (`keyIdEmisor`, tipo, id), nunca con claves distintas por sentido. El `keyId` de cada clave es la huella de 22 caracteres que va en el QR.
+- **Push**: cada dispositivo recibe su propia copia sellada, así que la notificación conserva título, agente, máquina y opciones. El relay sólo reenvía cadenas opacas.
+- **Degradación**: sin clave de dispositivo (v1) o con más de un dispositivo `enc1` (el `prompt.open` sólo puede llevar un título), el contenido viaja en claro y la UI lo marca; el push por dispositivo sigue sellado siempre que haya claves. El fan-out conversacional multi-dispositivo está en `odd/tasks/multi-endpoint.md`.
+
+La máquina NO depende de `@j3pf/rp-protocol`: replica la cripto en `src/shared/e2e/` y se valida contra el mismo vector de interoperabilidad que la app.
+
 ### Modo directo por CLI (`rp-host serve`)
 
 Conecta el móvil sin montar un relay propio: `rp-host serve` levanta un relay **embebido** detrás de un túnel automático y publica su URL. El relay corre como proceso hijo porque su base de datos (`better-sqlite3`) es nativa y no debe entrar como dependencia de una extensión de Pi; el túnel corre como segundo proceso hijo supervisado.

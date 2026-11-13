@@ -55,6 +55,7 @@ function harness(overrides: { cli?: (args: string[], configPath: string) => Prom
 async function run(h: ReturnType<typeof harness>, dir: string, extra: Record<string, unknown> = {}) {
   return startDirectMode({
     dataDir: dir,
+    keyPath: path.join(dir, "machine.key"),
     tunnel: "cloudflared",
     name: "PC de Jorge",
     context: "personal",

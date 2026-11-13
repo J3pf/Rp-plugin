@@ -7,6 +7,9 @@ import { errMsg, preview, safeUser } from "../shared/util.js";
 import { resolveInboxDir } from "./config.js";
 import { detectPiVersion, detectGentleVersion, detectActiveTheme, gentleVersionSupported, hasGentleAskTools, terminalStdin, toolNames, warnOnce } from "./compat.js";
 import { Connection } from "./connection.js";
+import { createSealer } from "./sealing.js";
+import { loadOrCreateMachineIdentity } from "../shared/e2e/identity.js";
+import { machineKeyPath } from "../shared/platform.js";
 import { Forwarder } from "./forwarder.js";
 import { buildSnapshotEntries } from "./snapshot.js";
 import { StatusTracker } from "./status.js";
@@ -64,6 +67,8 @@ export class Runtime {
     detectTheme;
     /** Static facts copied from ctx: reading a stale ctx (after reload/dispose) throws in Pi. */
     info;
+    /** Content sealing for protocol v2; absent when no machine key can be loaded. */
+    sealer = null;
     constructor(pi, ctx, cfg, env, reason, opts = {}) {
         this.pi = pi;
         this.cfg = cfg;
@@ -173,7 +178,9 @@ export class Runtime {
                 }
             },
         });
+        this.sealer = this.buildSealer();
         const connOpts = {
+            sealer: this.sealer ?? undefined,
             relayUrl: cfg.relayUrl,
             token: cfg.machineToken,
             agentId: this.agentId,
@@ -185,6 +192,30 @@ export class Runtime {
             onFatal: (code, reason) => this.onFatal(code, reason),
         };
         this.conn = opts.connectionFactory ? opts.connectionFactory(connOpts) : new Connection(connOpts);
+    }
+    /**
+     * Loads (or creates) the machine key and builds the sealer. A missing or unreadable key must not
+     * break the session: the plugin then runs in clear, exactly like a v1 client.
+     */
+    buildSealer() {
+        try {
+            const { identity } = loadOrCreateMachineIdentity(machineKeyPath());
+            return createSealer({
+                identity,
+                ctx: () => ({
+                    agentId: this.agentId,
+                    agentLabel: this.info.sessionName ?? `pi@${os.hostname()}`,
+                    machineId: this.cfg.machineId ?? "",
+                    machineName: this.cfg.machine.name ?? os.hostname(),
+                    machineContext: this.cfg.machine.context ?? "personal",
+                }),
+                onLog: (m) => this.notify(m, "info"),
+            });
+        }
+        catch (err) {
+            this.notify(`RP: sin cifrado de extremo a extremo (${err.message})`, "warning");
+            return null;
+        }
     }
     // ---------- lifecycle ----------
     start() {
@@ -366,6 +397,7 @@ export class Runtime {
         });
     }
     onWelcome(w) {
+        this.sealer?.updateDevices(w.devices);
         this.sendSnapshot(true);
         this.conn.sendDirect("agent.status", { status: this.statuses.current });
         const items = this.filterStatuses(this.statuses.snapshot());
@@ -453,6 +485,7 @@ export class Runtime {
             model: this.model,
             thinking: this.thinking,
             status: this.statuses.current,
+            caps: this.sealer?.caps,
             openPrompts: this.broker.openPrompts(),
             todos: this.currentTodos.length > 0 ? { tasks: this.cfg.redactContent ? redactTodoTasks(this.currentTodos) : this.currentTodos } : null,
             subagents: this.subagents.getSnapshot().length > 0 ? this.subagents.getSnapshot() : undefined,
