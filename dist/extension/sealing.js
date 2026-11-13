@@ -53,7 +53,9 @@ export function createSealer(o) {
             allowFreeText: body.allowFreeText === true,
             danger: encoder(body.danger) ?? undefined,
         };
-        const aad = sealedAad(o.identity.keyId, "push", promptId);
+        // No id: the relay assigns pushId after this body is sealed and the device only learns the
+        // promptId by decrypting, so the AAD cannot bind to either. PROTOCOLO-V2 §3 fixes this.
+        const aad = sealedAad(o.identity.keyId, "push");
         // Fan-out per device: N copies of one body, each readable only by its owner (§10).
         return sealedDevices(devices).map((device) => ({
             deviceId: device.deviceId,

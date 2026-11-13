@@ -72,11 +72,11 @@ describe("sealing outbound content", () => {
     const phoneKey = deriveContentKey(createPrivateKey(phone.privateKeyPem), machine.pubkey, phone.keyId);
     const tabletKey = deriveContentKey(createPrivateKey(tablet.privateKeyPem), machine.pubkey, tablet.keyId);
 
-    const body = openJson<Record<string, any>>(phoneKey, forPhone, sealedAad(machine.keyId, "push", "P1"));
+    const body = openJson<Record<string, any>>(phoneKey, forPhone, sealedAad(machine.keyId, "push"));
     expect(body).toMatchObject({ promptId: "P1", title: OPEN_PROMPT.title, agentLabel: "pi@pc", machineName: "PC", kind: "confirm" });
     expect(body?.options).toEqual(OPEN_PROMPT.options);
     // One device's push body must never open with another device's key.
-    expect(openJson(tabletKey, forPhone, sealedAad(machine.keyId, "push", "P1"))).toBeNull();
+    expect(openJson(tabletKey, forPhone, sealedAad(machine.keyId, "push"))).toBeNull();
   });
 
   it("leaves content in clear when no device can receive sealed text", async () => {
