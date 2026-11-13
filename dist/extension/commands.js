@@ -7,12 +7,17 @@ import { httpRequest, toHttpUrl, toWsUrl } from "../shared/http.js";
 import { piHomes } from "../shared/platform.js";
 import { errMsg, splitCommand } from "../shared/util.js";
 import { updateConfigFile } from "./config.js";
+import { setActiveDirect, startDirectMode, stopActiveDirect } from "./direct.js";
+import { loadHostConfig } from "../host/config.js";
+import { resolveServeSettings } from "../host/serve/index.js";
 import { GENTLE_RANGE, detectGentleVersion, gentleVersionSupported, hasGentleAskTools } from "./compat.js";
 import { promptContext } from "./prompts/classify.js";
 import WebSocket from "ws";
 import { getProxyAgent } from "../shared/http.js";
 export const PLUGIN_PACKAGE = "@j3pf/pi-rp";
-const SUBCOMMANDS = ["pair", "status", "doctor", "on", "off", "gate", "test", "unpair"];
+/** Flags that take a value; everything else is a boolean switch. */
+const VALUE_FLAGS = ["name", "context", "tunnel", "data-dir", "relay-path", "relay-command"];
+const SUBCOMMANDS = ["pair", "serve", "status", "doctor", "on", "off", "gate", "test", "unpair"];
 const GATE_MODES = ["auto-detect", "off", "dangerous", "writes", "all"];
 /** Split a command line honoring single/double quotes. */
 export const tokenize = splitCommand;
@@ -25,7 +30,7 @@ export function parseFlags(tokens) {
             const eq = t.indexOf("=");
             if (eq > 0)
                 flags[t.slice(2, eq)] = t.slice(eq + 1);
-            else if (tokens[i + 1] !== undefined && !tokens[i + 1].startsWith("--") && ["name", "context"].includes(t.slice(2)))
+            else if (tokens[i + 1] !== undefined && !tokens[i + 1].startsWith("--") && VALUE_FLAGS.includes(t.slice(2)))
                 flags[t.slice(2)] = tokens[++i];
             else
                 flags[t.slice(2)] = true;
@@ -37,7 +42,7 @@ export function parseFlags(tokens) {
 }
 export function registerCommands(pi, hooks) {
     pi.registerCommand("rp", {
-        description: "RP: pair|status|doctor|on|off|gate|test|unpair",
+        description: "RP: pair|serve|status|doctor|on|off|gate|test|unpair",
         getArgumentCompletions: (prefix) => {
             const items = SUBCOMMANDS.filter((s) => s.startsWith(prefix.trim())).map((s) => ({ value: s, label: s }));
             return items.length ? items : null;
@@ -49,6 +54,8 @@ export function registerCommands(pi, hooks) {
                 switch (sub) {
                     case "pair":
                         return await cmdPair(hooks, tokens, ctx);
+                    case "serve":
+                        return await cmdServe(pi, hooks, tokens, ctx);
                     case "status":
                         return cmdStatus(hooks, ctx);
                     case "doctor":
@@ -115,11 +122,103 @@ async function cmdPair(h, tokens, ctx) {
     await h.stopRuntime();
     h.startRuntime(ctx);
 }
+// ---------- serve (modo directo) ----------
+/**
+ * `/rp serve [--tunnel cloudflared|tailscale|none] [--funnel] [--data-dir <ruta>] [--name N]`
+ *
+ * Levanta el relay embebido detrás de un túnel, empareja esta PC contra él y pinta el QR v2 con
+ * el que el móvil se conecta sin relay propio. El QR lo dibuja el CLI del relay (qrcode-terminal
+ * vive allí, no aquí).
+ */
+async function cmdServe(pi, h, tokens, ctx) {
+    const { flags } = parseFlags(tokens);
+    const flagTunnel = typeof flags.tunnel === "string" ? flags.tunnel : flags.funnel ? "tailscale" : undefined;
+    const hostServe = loadHostConfig().cfg.serve;
+    let settings;
+    try {
+        settings = resolveServeSettings({
+            serve: {
+                tunnel: (flagTunnel ?? hostServe.tunnel),
+                relayCommand: hostServe.relayCommand,
+                relayPath: hostServe.relayPath,
+                dataDir: typeof flags["data-dir"] === "string" ? flags["data-dir"] : (h.cfg.direct?.dataDir || hostServe.dataDir),
+            },
+        }, process.env, process.platform);
+    }
+    catch (e) {
+        ctx.ui.notify(`RP serve: ${errMsg(e)}`, "error");
+        return;
+    }
+    const name = typeof flags.name === "string" ? flags.name : (h.cfg.machine.name ?? os.hostname());
+    const context = typeof flags.context === "string" ? flags.context : (h.cfg.machine.context ?? "personal");
+    const previous = h.cfg.direct?.publicUrl;
+    ctx.ui.setStatus("rp", "RP: levantando modo directo…");
+    ctx.ui.notify(`RP serve: arrancando relay embebido y túnel ${settings.tunnel} (puede tardar unos segundos)…`, "info");
+    const runDirect = h.startDirect ?? startDirectMode;
+    let run;
+    try {
+        run = await runDirect({
+            dataDir: settings.dataDir,
+            tunnel: settings.tunnel,
+            relayCommand: settings.relayCommand,
+            relayPath: settings.relayPath,
+            name,
+            context,
+            onLog: (line) => process.stderr.write(`[rp serve] ${line}\n`),
+        });
+    }
+    catch (e) {
+        ctx.ui.setStatus("rp", undefined);
+        ctx.ui.notify(`RP serve: ${errMsg(e)}`, "error");
+        return;
+    }
+    const saved = updateConfigFile(h.cfgPath, (c) => {
+        // Esta PC habla con su propio relay por loopback: no hace falta salir al túnel.
+        c.relayUrl = run.localUrl;
+        c.machineId = run.machineId;
+        c.machineToken = run.machineToken;
+        c.machine = { name, context };
+        c.direct = {
+            publicUrl: run.publicUrl,
+            tunnel: run.tunnel,
+            dataDir: run.dataDir,
+            port: run.port,
+            keyId: run.keyId,
+            updatedAt: new Date().toISOString(),
+        };
+        c.enabled = true;
+    });
+    Object.assign(h.cfg, {
+        relayUrl: saved.relayUrl,
+        machineId: saved.machineId,
+        machineToken: saved.machineToken,
+        machine: saved.machine,
+        direct: saved.direct,
+        enabled: true,
+    });
+    ctx.ui.setStatus("rp", `RP: modo directo ${run.publicUrl}`);
+    ctx.ui.notify(previous && previous !== run.publicUrl
+        ? `RP: modo directo listo en ${run.publicUrl}. La URL cambió (antes ${previous}): vuelve a escanear el QR con la app.`
+        : `RP: modo directo listo en ${run.publicUrl} (${run.tunnel}). Escanea el QR con la app.`, "info");
+    if (run.machinePaired)
+        ctx.ui.notify(`RP: esta PC quedó emparejada con su relay embebido (huella ${run.keyId}).`, "info");
+    await pi.sendMessage({
+        customType: "rp-direct-qr",
+        content: `Modo directo — ${run.publicUrl}\n\n${run.qr}\n\nRP: la app se empareja escaneando este QR; caduca en 10 minutos y es de un solo uso.`,
+        display: true,
+    });
+    setActiveDirect({ publicUrl: run.publicUrl, stop: run.stop });
+    await h.stopRuntime();
+    h.startRuntime(ctx);
+}
 // ---------- status ----------
 export function formatStatus(h, rt) {
     const lines = [];
     lines.push(`Relay: ${h.cfg.relayUrl ?? "(sin configurar)"}`);
     lines.push(`PC: ${h.cfg.machine.name ?? "?"} · contexto ${h.cfg.machine.context ?? "?"} · ${h.cfg.machineToken ? "emparejada" : "SIN emparejar (/rp pair)"}`);
+    if (h.cfg.direct) {
+        lines.push(`Modo directo: ${h.cfg.direct.publicUrl} · túnel ${h.cfg.direct.tunnel} · huella ${h.cfg.direct.keyId || "?"}`);
+    }
     lines.push(`Habilitado: ${h.cfg.enabled ? "sí" : "no"} · redactContent: ${h.cfg.redactContent}`);
     if (!rt) {
         lines.push("Runtime: inactivo en esta sesión");
@@ -308,6 +407,7 @@ async function cmdOn(h, ctx) {
 }
 async function cmdOff(h, tokens, ctx) {
     const { flags } = parseFlags(tokens);
+    await stopActiveDirect();
     await h.stopRuntime();
     h.cfg.enabled = false;
     if (flags.persist)
@@ -336,14 +436,17 @@ async function cmdTest(h, ctx) {
     ctx.ui.notify(answer === undefined ? "RP test cancelado." : `RP test: "${answer}" (${((Date.now() - t0) / 1000).toFixed(1)} s).`, "info");
 }
 async function cmdUnpair(h, ctx) {
+    await stopActiveDirect();
     await h.stopRuntime();
     updateConfigFile(h.cfgPath, (c) => {
         c.machineId = null;
         c.machineToken = null;
         c.machine = {};
+        c.direct = null;
     });
     h.cfg.machineId = null;
     h.cfg.machineToken = null;
     h.cfg.machine = {};
+    h.cfg.direct = null;
     ctx.ui.notify("RP: credenciales locales borradas. Revoca la PC también desde la app si quieres cerrar el acceso en el relay.", "info");
 }

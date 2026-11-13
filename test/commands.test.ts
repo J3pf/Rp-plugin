@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { tokenize, parseFlags, pairMachine, pluginDeclaredIn, checkDeclared, formatChecks, runDoctor, formatStatus, registerCommands, PLUGIN_PACKAGE } from "../src/extension/commands.ts";
 import { normalizeConfig } from "../src/extension/config.ts";
-import { FakeRelay, baseConfig, makeCtx, makePi } from "./helpers.ts";
+import { FakeRelay, baseConfig, makeCtx, makePi, makeUi } from "./helpers.ts";
 
 let relay: FakeRelay | undefined;
 afterEach(async () => {
@@ -102,6 +102,24 @@ describe("doctor helpers", () => {
     expect(text).toContain("work");
     expect(text).toContain("inactivo");
   });
+
+  it("formatStatus reports the direct-mode endpoint so the QR can be re-issued without guessing", () => {
+    const text = formatStatus(
+      {
+        cfg: normalizeConfig({
+          relayUrl: "http://127.0.0.1:4321",
+          machineToken: "t",
+          direct: { publicUrl: "https://direct.example", tunnel: "cloudflared", dataDir: "/tmp/d", port: 4321, keyId: "fingerprint", updatedAt: "" },
+        }),
+        cfgPath: "x",
+        getRuntime: () => undefined,
+        startRuntime() {},
+        stopRuntime: async () => {},
+      },
+      undefined,
+    );
+    expect(text).toContain("Modo directo: https://direct.example · túnel cloudflared · huella fingerprint");
+  });
 });
 
 describe("/rp command", () => {
@@ -180,5 +198,112 @@ describe("/rp command", () => {
     expect(s.ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("desconocido"), "warning");
     await s.run("test");
     expect(s.ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("no está activo"), "warning");
+  });
+});
+
+describe("serve (modo directo)", () => {
+  it("persists the endpoint, prints the QR and restarts the runtime against the embedded relay", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rpservecmd-"));
+    const cfgPath = path.join(dir, "config.json");
+    const cfg = baseConfig("https://relay.example");
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg));
+    const startRuntime = vi.fn();
+    const stopRuntime = vi.fn(async () => {});
+    const startDirect = vi.fn(async () => ({
+      publicUrl: "https://direct.example",
+      localUrl: "http://127.0.0.1:4321",
+      port: 4321,
+      dataDir: path.join(dir, "direct"),
+      tunnel: "cloudflared" as const,
+      pubkey: "PUBKEY",
+      keyId: "fingerprint0123456789",
+      machineId: "mach-9",
+      machineToken: "tok-9",
+      machinePaired: true,
+      qr: "▄▀▄▀",
+      uri: "rp://pair?u=https%3A%2F%2Fdirect.example&c=DEVI2345&k=direct&f=fingerprint0123456789",
+      deviceCode: "DEVI2345",
+      stop: vi.fn(async () => {}),
+    }));
+    const { pi, commands, sent } = makePi();
+    registerCommands(pi as never, {
+      cfg: cfg as never,
+      cfgPath,
+      getRuntime: () => undefined,
+      startRuntime,
+      stopRuntime,
+      startDirect: startDirect as never,
+    });
+    const ctx = makeCtx() as never;
+
+    await commands.get("rp")!.handler("serve --tunnel none --name MiPC", ctx);
+
+    expect(startDirect).toHaveBeenCalledOnce();
+    expect(startDirect.mock.calls[0]![0]).toMatchObject({ tunnel: "none", name: "MiPC" });
+    expect(stopRuntime).toHaveBeenCalled();
+    expect(startRuntime).toHaveBeenCalledOnce();
+
+    const saved = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+    expect(saved.relayUrl).toBe("http://127.0.0.1:4321");
+    expect(saved.machineId).toBe("mach-9");
+    expect(saved.direct).toMatchObject({ publicUrl: "https://direct.example", tunnel: "cloudflared", keyId: "fingerprint0123456789" });
+    expect(sent.at(-1)!.message.content).toContain("▄▀▄▀");
+    expect(sent.at(-1)!.message.content).toContain("https://direct.example");
+  });
+
+  it("warns that the app must rescan when the public URL changed", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rpservecmd2-"));
+    const cfgPath = path.join(dir, "config.json");
+    const withDirect = baseConfig("https://relay.example", {
+      direct: { publicUrl: "https://old.example", tunnel: "cloudflared", dataDir: dir, port: 1, keyId: "k", updatedAt: "" },
+    });
+    fs.writeFileSync(cfgPath, JSON.stringify(withDirect));
+    const ui = makeUi();
+    const { pi, commands } = makePi();
+    registerCommands(pi as never, {
+      cfg: withDirect as never,
+      cfgPath,
+      getRuntime: () => undefined,
+      startRuntime: vi.fn(),
+      stopRuntime: vi.fn(async () => {}),
+      startDirect: (async () => ({
+        publicUrl: "https://new.example",
+        localUrl: "http://127.0.0.1:4322",
+        port: 4322,
+        dataDir: dir,
+        tunnel: "cloudflared" as const,
+        pubkey: "P",
+        keyId: "kkkkkkkkkkkkkkkkkkkkkk",
+        machineId: "m",
+        machineToken: "t",
+        machinePaired: false,
+        qr: "QR",
+        uri: "rp://pair?u=x",
+        deviceCode: "D",
+        stop: vi.fn(async () => {}),
+      })) as never,
+    });
+    await commands.get("rp")!.handler("serve", makeCtx({ ui }) as never);
+    expect(ui.mocks.notify.mock.calls.some((c: any[]) => String(c[0]).includes("La URL cambió"))).toBe(true);
+  });
+
+  it("rejects an unknown tunnel provider without starting anything", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rpservecmd3-"));
+    const cfgPath = path.join(dir, "config.json");
+    fs.writeFileSync(cfgPath, JSON.stringify(baseConfig("https://relay.example")));
+    const ui = makeUi();
+    const startDirect = vi.fn();
+    const { pi, commands } = makePi();
+    registerCommands(pi as never, {
+      cfg: baseConfig("https://relay.example") as never,
+      cfgPath,
+      getRuntime: () => undefined,
+      startRuntime: vi.fn(),
+      stopRuntime: vi.fn(async () => {}),
+      startDirect: startDirect as never,
+    });
+    await commands.get("rp")!.handler("serve --tunnel ngrok", makeCtx({ ui }) as never);
+    expect(startDirect).not.toHaveBeenCalled();
+    expect(ui.mocks.notify.mock.calls.some((c: any[]) => String(c[0]).includes("unknown serve.tunnel"))).toBe(true);
   });
 });

@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Supervisor de procesos hijo reutilizable** (`src/host/serve/supervisor.ts`): líneas de log con prefijo, `waitForLine` para esperar la URL del túnel, reinicio con backoff exponencial y tope de intentos, y apagado determinista que nunca deja huérfanos. Un binario ausente es fatal de inmediato, sin reintentos.
 - **`serve` en `host.json`** (`tunnel`, `relayCommand`, `relayPath`, `dataDir`) con overrides por entorno `RP_SERVE_TUNNEL`, `RP_SERVE_RELAY_COMMAND`, `RP_SERVE_DATA_DIR`. El relay puede llegar del PATH (`rp-relay`) o de un `--relay-path` concreto.
 
+### Added (T6 — `/rp serve`)
+- **`/rp serve [--funnel|--tunnel cloudflared|tailscale|none]`**: levanta el relay embebido detrás del túnel, empareja esta PC contra él por **loopback** (nunca a través del túnel) y pinta el QR v2 `rp://pair?u=&c=&k=direct&f=&n=` en la conversación. El QR lo dibuja el CLI del relay, así que el plugin no gana `qrcode-terminal` como dependencia.
+- **Identidad de máquina P-256** en `<data-dir>/machine.key` (permisos `600`), con huella `keyId` = 22 caracteres de base64url(SHA-256(SPKI DER)). Un fichero corrupto **no** se regenera en silencio: regenerar invalidaría todos los pines y todo el contenido sellado.
+- **Emparejamiento persistente**: `machine.json` (600) guarda `machineId`/`machineToken`/`keyId`, así un reinicio no re-empareja la PC y un cambio de URL del túnel sólo obliga a re-escanear el QR en el móvil (aviso explícito).
+- **`/rp status`** muestra el endpoint directo y la huella; `/rp off` y `/rp unpair` apagan el stack y borran el estado directo.
+- `rp-relay pair device|machine --json` y `rp-relay qr <texto>`: salida legible por máquina y QR de cualquier texto, para que el plugin componga el QR v2 sin dependencias nuevas.
+
 ### Notes
 - El relay embebido se configura con perfil `single-host`, `backup.enabled: false` y `publicUrl` del túnel, en `<data-dir>/relay.json` con permisos `600`. Verificado contra `@j3pf/rp-relay` real: arranca, responde `/healthz` y se apaga sin dejar procesos.
 

@@ -27,6 +27,7 @@ export const DEFAULT_CONFIG = {
     delivery: { method: "auto", interactive: true },
     subagents: "skip",
     inboxDir: null,
+    direct: null,
 };
 const GATE_MODES = ["auto-detect", "off", "dangerous", "writes", "all"];
 const DELIVERY = ["auto", "api", "interactive", "herdr"];
@@ -64,6 +65,22 @@ export function normalizeConfig(raw) {
         },
         subagents: r.subagents === "connect" ? "connect" : "skip",
         inboxDir: typeof r.inboxDir === "string" && r.inboxDir ? r.inboxDir : null,
+        direct: normalizeDirect(r.direct),
+    };
+}
+function normalizeDirect(raw) {
+    if (!raw || typeof raw !== "object")
+        return null;
+    const d = raw;
+    if (typeof d.publicUrl !== "string" || !d.publicUrl)
+        return null;
+    return {
+        publicUrl: d.publicUrl,
+        tunnel: typeof d.tunnel === "string" ? d.tunnel : "cloudflared",
+        dataDir: typeof d.dataDir === "string" ? d.dataDir : "",
+        port: typeof d.port === "number" ? d.port : 0,
+        keyId: typeof d.keyId === "string" ? d.keyId : "",
+        updatedAt: typeof d.updatedAt === "string" ? d.updatedAt : "",
     };
 }
 /** Sync, read-only load (the extension factory must not do I/O beyond this). Applies env overrides. */

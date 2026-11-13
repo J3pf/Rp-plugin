@@ -273,6 +273,7 @@ export function makePi(tools: any[] = []) {
     }),
     getAllTools: vi.fn(() => tools),
     sendUserMessage: vi.fn((content: any, opts?: any) => sent.push({ content, opts })),
+    sendMessage: vi.fn(async (message: any) => sent.push({ message })),
     appendEntry: vi.fn((type: string, data: any) => entries.push({ type: "custom", customType: type, data })),
     exec: vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false })),
     setModel: vi.fn(async (_m: any) => true),

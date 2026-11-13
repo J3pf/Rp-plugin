@@ -124,7 +124,26 @@ rp-host doctor       # diagnostica el servicio y devuelve error si hay problemas
 rp-host status
 ```
 
-### Modo directo (`rp-host serve`)
+### Modo directo (`/rp serve`)
+
+Si no tienes dónde montar el relay, `/rp serve` levanta uno embebido detrás de un túnel y te da un QR para el móvil:
+
+```bash
+/rp serve                 # cloudflared (por defecto)
+/rp serve --funnel        # Tailscale Funnel
+/rp serve --tunnel none   # sin túnel, sólo para probar en local
+/rp serve --data-dir ~/.rp-direct --name "Mi PC"
+```
+
+Qué hace, en orden: crea (o reutiliza) el par de claves P-256 de esta máquina en `<data-dir>/machine.key` con permisos `600`; levanta el túnel y el relay embebido; empareja **esta PC** contra su propio relay por loopback y guarda `machineId`/`machineToken` en `<data-dir>/machine.json` (por eso un reinicio no vuelve a emparejar, y la URL puede cambiar sin perder la PC); pide un código de dispositivo de 10 minutos y pinta el QR v2 en la conversación:
+
+```
+rp://pair?u=<publicUrl>&c=<código>&k=direct&f=<huella>&n=<nombre>
+```
+
+`k=direct` y `f` (huella de la clave de máquina) hacen que la app fije la identidad del endpoint antes de enviar nada: si la clave no coincide, el emparejamiento se rechaza. La app necesita volver a escanear el QR cuando la URL pública cambia; `/rp serve` lo avisa y `/rp status` muestra el endpoint y la huella actuales. `/rp off` y `/rp unpair` apagan el stack.
+
+### Modo directo por CLI (`rp-host serve`)
 
 Conecta el móvil sin montar un relay propio: `rp-host serve` levanta un relay **embebido** detrás de un túnel automático y publica su URL. El relay corre como proceso hijo porque su base de datos (`better-sqlite3`) es nativa y no debe entrar como dependencia de una extensión de Pi; el túnel corre como segundo proceso hijo supervisado.
 
