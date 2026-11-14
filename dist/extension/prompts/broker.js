@@ -29,8 +29,13 @@ export class Broker {
         const cls = this.d.classifier.classifyDialog(req.kind, req.title, message);
         const redact = !!this.d.redact?.();
         let options;
-        if (req.kind === "select")
-            options = req.options.map((label, i) => ({ id: String(i), label }));
+        if (req.kind === "select") {
+            const keepLabels = cls.source?.tool === "gate" || cls.source?.tool === "agy-gate";
+            options = req.options.map((label, i) => ({
+                id: String(i),
+                label: redact && !keepLabels ? `[option ${i + 1}]` : label,
+            }));
+        }
         else if (req.kind === "confirm") {
             const perm = cls.category === "permission";
             options = [
@@ -40,16 +45,19 @@ export class Broker {
         }
         const expiresAt = req.opts?.timeout ? (this.d.now ?? Date.now)() + req.opts.timeout : null;
         const rawMsg = cls.message ?? message;
+        const title = redact
+            ? (cls.tool ? `⚠ ${cls.tool.name}: [redacted]` : "[redacted]")
+            : req.title;
         return {
             cls,
             body: {
                 kind: req.kind,
                 category: cls.category,
-                title: req.title,
+                title,
                 message: redact && rawMsg ? "[redacted]" : rawMsg,
                 options,
                 allowFreeText: req.kind === "input" || (req.kind === "select" && !!req.allowFreeText),
-                placeholder: req.kind === "input" ? (req.placeholder ?? null) : null,
+                placeholder: req.kind === "input" ? (redact && req.placeholder ? "[redacted]" : (req.placeholder ?? null)) : null,
                 questions: null,
                 source: cls.source,
                 tool: cls.tool ? (redact && cls.tool.args ? { ...cls.tool, args: { redacted: true } } : cls.tool) : undefined,
@@ -58,43 +66,64 @@ export class Broker {
             },
         };
     }
-    register(body, req, herdrReported, isAdapter = false) {
+    register(body, req, herdrReported, isAdapter = false, hasLocalUi = false) {
         let resolveRemote;
         const remoteAnswer = new Promise((r) => (resolveRemote = r));
-        const p = { id: body.promptId, body, req, isAdapter, closed: false, answered: false, remoteAnswer, resolveRemote, openedAt: (this.d.now ?? Date.now)() };
+        const p = {
+            id: body.promptId,
+            body,
+            req,
+            isAdapter,
+            hasLocalUi,
+            closed: false,
+            answered: false,
+            remoteAnswer,
+            resolveRemote,
+            openedAt: (this.d.now ?? Date.now)(),
+        };
         this.prompts.set(p.id, p);
         this.d.send("prompt.open", body);
         this.d.herdr?.block(p.id, body.title, herdrReported);
         this.d.onChange?.(this.prompts.size);
         return p;
     }
-    open(req) {
+    open(req, hasLocalUi = false) {
         const { body, cls } = this.build(req);
-        return this.register({ promptId: newId(), agentId: this.d.agentId, ...body }, req, cls.herdrReported, false);
+        return this.register({ promptId: newId(), agentId: this.d.agentId, ...body }, req, cls.herdrReported, false, hasLocalUi);
     }
     /** Open a prompt described by an adapter (custom() dialogs). */
-    openSpec(spec) {
+    openSpec(spec, hasLocalUi = true) {
         const redact = !!this.d.redact?.();
-        const stripPreview = (opts) => redact && opts ? opts.map(({ preview: _p, ...rest }) => rest) : opts;
+        const sanitizeOptions = (opts) => redact && opts
+            ? opts.map(({ preview: _p, description: _d, ...rest }, i) => ({
+                ...rest,
+                label: `[option ${i + 1}]`,
+            }))
+            : opts;
         const body = {
             promptId: newId(),
             agentId: this.d.agentId,
             kind: spec.kind,
             category: spec.category ?? "question",
-            title: spec.title,
+            title: redact ? "[redacted]" : spec.title,
             message: redact && spec.message ? "[redacted]" : spec.message,
-            options: stripPreview(spec.options),
+            options: sanitizeOptions(spec.options),
             allowFreeText: !!spec.allowFreeText,
             placeholder: null,
             questions: spec.questions
-                ? spec.questions.map((q) => ({ ...q, options: stripPreview(q.options) ?? [] }))
+                ? spec.questions.map((q, qi) => ({
+                    ...q,
+                    question: redact ? `[question ${qi + 1}]` : q.question,
+                    header: redact && q.header ? "[redacted]" : q.header,
+                    options: sanitizeOptions(q.options) ?? [],
+                }))
                 : null,
             source: spec.source,
             danger: spec.danger ?? "low",
             expiresAt: null,
         };
         const herdrReported = spec.herdrReported ?? (spec.source?.extension !== "@eko24ive/pi-ask");
-        return this.register(body, null, herdrReported, true);
+        return this.register(body, null, herdrReported, true, hasLocalUi);
     }
     close(p) {
         if (p.closed)
@@ -139,7 +168,13 @@ export class Broker {
         if (p && !p.answered) {
             p.answered = true;
             p.cancelledBySystem = true;
-            p.resolveRemote({ cancelled: true });
+            if (p.hasLocalUi) {
+                // Retire only the mobile mirror so an active local PC dialog stays open for the user.
+                this.close(p);
+            }
+            else {
+                p.resolveRemote({ cancelled: true });
+            }
         }
     }
     /**
@@ -147,26 +182,33 @@ export class Broker {
      * (json/print modes): then only the phone can answer.
      */
     async race(req, runLocal) {
-        const p = this.open(req);
+        const p = this.open(req, runLocal !== null);
         const ac = new AbortController();
         const started = (this.d.now ?? Date.now)();
         const timeoutMs = req.opts?.timeout;
         const callerSignal = req.opts?.signal;
         const racers = [p.remoteAnswer.then((a) => ({ src: "remote", a }))];
         let timer;
+        let onAbort;
         if (runLocal) {
             racers.push(runLocal(ac.signal).then((v) => ({ src: "local", v })));
         }
         else {
             // headless: Pi's own timeout/signal never fire for us, so honor them here
-            if (timeoutMs)
-                racers.push(new Promise((r) => (timer = setTimeout(() => r({ src: "timeout" }), timeoutMs))));
+            if (timeoutMs) {
+                racers.push(new Promise((r) => {
+                    timer = setTimeout(() => r({ src: "timeout" }), timeoutMs);
+                    timer.unref?.();
+                }));
+            }
             if (callerSignal) {
                 racers.push(new Promise((r) => {
                     if (callerSignal.aborted)
                         r({ src: "cancelled" });
-                    else
-                        callerSignal.addEventListener("abort", () => r({ src: "cancelled" }), { once: true });
+                    else {
+                        onAbort = () => r({ src: "cancelled" });
+                        callerSignal.addEventListener("abort", onAbort, { once: true });
+                    }
                 }));
             }
         }
@@ -175,13 +217,16 @@ export class Broker {
             w = await Promise.race(racers);
         }
         catch (e) {
-            this.resolved(p, "cancelled", null);
+            if (!p.closed)
+                this.resolved(p, "cancelled", null);
             this.close(p);
             throw e;
         }
         finally {
             if (timer)
                 clearTimeout(timer);
+            if (callerSignal && onAbort)
+                callerSignal.removeEventListener("abort", onAbort);
         }
         if (w.src === "remote") {
             ac.abort();
@@ -191,12 +236,14 @@ export class Broker {
             return toLocalValue(req, w.a);
         }
         if (w.src === "timeout") {
-            this.resolved(p, "timeout", null);
+            if (!p.closed)
+                this.resolved(p, "timeout", null);
             this.close(p);
             return emptyValue(req);
         }
         if (w.src === "cancelled") {
-            this.resolved(p, "cancelled", null);
+            if (!p.closed)
+                this.resolved(p, "cancelled", null);
             this.close(p);
             return emptyValue(req);
         }
@@ -207,17 +254,20 @@ export class Broker {
             by = "cancelled";
         else if (timeoutMs && (v === undefined || v === false) && (this.d.now ?? Date.now)() - started >= timeoutMs - 50)
             by = "timeout";
-        this.resolved(p, by, by === "local" ? fromLocal(req, v) : null);
+        if (!p.closed)
+            this.resolved(p, by, by === "local" ? fromLocal(req, v) : null);
         this.close(p);
         return v;
     }
     /** Close everything on shutdown: the relay cancels orphaned prompts after 2 min, but tell it now. */
-    shutdown() {
+    shutdown(opts = {}) {
         for (const p of [...this.prompts.values()]) {
             this.resolved(p, "cancelled", null);
             p.answered = true;
             p.cancelledBySystem = true;
-            p.resolveRemote({ cancelled: true });
+            if (!(opts.keepLocal && p.hasLocalUi)) {
+                p.resolveRemote({ cancelled: true });
+            }
             this.close(p);
         }
     }

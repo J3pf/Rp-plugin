@@ -2,7 +2,7 @@
 import WebSocket from "ws";
 import { CLOSE, CRITICAL_TYPES, MAX_FRAME_BYTES, envelope, newId, parseEnvelope } from "../shared/protocol.js";
 import { backoffDelay, errMsg } from "../shared/util.js";
-import { getProxyAgent, httpRequest, toHttpUrl, toWsUrl } from "../shared/http.js";
+import { WsKeepalive, getProxyAgent, httpRequest, toHttpUrl, toWsUrl } from "../shared/http.js";
 export class WsTransport {
     url;
     token;
@@ -11,8 +11,8 @@ export class WsTransport {
     ws = null;
     opened = false;
     closed = false;
-    watchdog = null;
-    pingTimer = null;
+    /** The relay pings every 25 s, client pings every 20 s; silence beyond 45 s means a dead socket. */
+    keepalive = new WsKeepalive(45_000, 20_000);
     constructor(url, token, h) {
         this.url = url;
         this.token = token;
@@ -48,14 +48,13 @@ export class WsTransport {
             this.opened = true;
             // RP must never keep Pi alive: an open socket alone does not hold the event loop
             ws._socket?.unref?.();
-            this.arm();
-            this.startHeartbeat();
+            this.keepalive.start(ws, WebSocket.OPEN);
             this.h.onOpen();
         });
-        ws.on("ping", () => this.arm());
-        ws.on("pong", () => this.arm());
+        ws.on("ping", () => this.keepalive.arm(ws));
+        ws.on("pong", () => this.keepalive.arm(ws));
         ws.on("message", (data) => {
-            this.arm();
+            this.keepalive.arm(ws);
             const env = parseEnvelope(data.toString("utf8"));
             if (env)
                 this.h.onMessage(env);
@@ -64,8 +63,7 @@ export class WsTransport {
             /* 'close' always follows */
         });
         ws.on("close", (code, reason) => {
-            this.stopHeartbeat();
-            this.clearWatchdog();
+            this.keepalive.stop();
             if (this.closed && !this.opened)
                 return;
             this.closed = true;
@@ -86,36 +84,6 @@ export class WsTransport {
             }
         });
     }
-    startHeartbeat() {
-        this.stopHeartbeat();
-        this.pingTimer = setInterval(() => {
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                try {
-                    this.ws.ping();
-                }
-                catch {
-                    this.ws.terminate();
-                }
-            }
-        }, 20_000);
-        this.pingTimer.unref?.();
-    }
-    stopHeartbeat() {
-        if (this.pingTimer)
-            clearInterval(this.pingTimer);
-        this.pingTimer = null;
-    }
-    /** The relay pings every 25 s, client pings every 20 s; silence beyond 45 s means a dead socket. */
-    arm() {
-        this.clearWatchdog();
-        this.watchdog = setTimeout(() => this.ws?.terminate(), 45_000);
-        this.watchdog.unref?.();
-    }
-    clearWatchdog() {
-        if (this.watchdog)
-            clearTimeout(this.watchdog);
-        this.watchdog = null;
-    }
     send(env) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN)
             return false;
@@ -134,8 +102,7 @@ export class WsTransport {
     }
     close() {
         this.closed = true;
-        this.stopHeartbeat();
-        this.clearWatchdog();
+        this.keepalive.stop();
         try {
             this.ws?.close(1000);
             const ws = this.ws;

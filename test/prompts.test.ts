@@ -5,6 +5,7 @@ import { AdapterRegistry, gentleAskUserChoice, gentleAskUserQuestion, piAskUser 
 import { Gate, ALLOW, ALLOW_SESSION, DENY, DENY_REASON, allowKey, allowedFromBranch, decide, effectiveMode, compilePatterns, summarize } from "../src/extension/prompts/gate.ts";
 import { shouldRegisterAskUser, runAskUser, askUserToolDefinition } from "../src/extension/prompts/askUser.ts";
 import { installMirror } from "../src/extension/prompts/mirror.ts";
+import { DEFAULT_CONFIG } from "../src/extension/config.ts";
 import { StatusTracker } from "../src/extension/status.ts";
 import { HerdrBlocker } from "../src/extension/herdr.ts";
 import { baseConfig, makeCtx, makeUi, FakeBus } from "./helpers.ts";
@@ -101,11 +102,19 @@ describe("Broker.race", () => {
     await expect(p3).resolves.toBe(false);
     vi.useRealTimers();
   });
-  it("prompt.cancel from the relay resolves as cancelled without sending prompt.ack", async () => {
+  it("prompt.cancel retires only mobile mirror when local UI is active and resolves false in headless mode", async () => {
     const { broker, of } = mkBroker();
-    const p = broker.race({ kind: "confirm", title: "t", message: "m" }, () => new Promise<boolean>(() => {}));
+    let settled = false;
+    const pLocal = broker.race({ kind: "confirm", title: "t", message: "m" }, () => new Promise<boolean>(() => {}));
+    void pLocal.then(() => { settled = true; });
     broker.handleCancel(of("prompt.open")[0].promptId);
-    await expect(p).resolves.toBe(false);
+    await Promise.resolve();
+    expect(broker.openCount).toBe(0);
+    expect(settled).toBe(false);
+
+    const pHeadless = broker.race<boolean>({ kind: "confirm", title: "t2", message: "m2" }, null);
+    broker.handleCancel(of("prompt.open")[1].promptId);
+    await expect(pHeadless).resolves.toBe(false);
     expect(of("prompt.ack")).toHaveLength(0);
   });
   it("concurrent prompts are independent; openPrompts() feeds agent.hello", async () => {
@@ -683,6 +692,21 @@ describe("gate", () => {
   it("allowed keys are rebuilt from the session branch", () => {
     const s = allowedFromBranch([{ type: "custom", customType: "rp.allow", data: { key: "bash:sudo" } }, { type: "custom", customType: "other", data: { key: "x" } }, { type: "message" }]);
     expect([...s]).toEqual(["bash:sudo"]);
+  });
+  it("flags split rm -r flags, narrows allowKey for destructive/runner commands, and redacts prompt bodies when redactContent is enabled", async () => {
+    const patterns = compilePatterns(DEFAULT_CONFIG.gate.dangerousPatterns);
+    expect(decide("dangerous", DEFAULT_CONFIG.gate, patterns, "bash", { command: "rm --force -r build" }).ask).toBe(true);
+    expect(decide("dangerous", DEFAULT_CONFIG.gate, patterns, "bash", { command: "git push --force-with-lease origin main" }).ask).toBe(true);
+    expect(allowKey("bash", { command: "rm tmp.txt" })).toBe("bash:rm tmp.txt");
+    expect(allowKey("bash", { command: "npx cowsay hi" })).toBe("bash:npx cowsay hi");
+
+    const { broker, of } = mkBroker({ redact: () => true });
+    const p = broker.race({ kind: "select", title: "Secret title", options: ["secret-a", "secret-b"] }, null);
+    const open = of("prompt.open")[0];
+    expect(open.title).toBe("[redacted]");
+    expect(open.options.map((o: any) => o.label)).toEqual(["[option 1]", "[option 2]"]);
+    broker.handleCancel(open.promptId);
+    await expect(p).resolves.toBeUndefined();
   });
 });
 

@@ -102,11 +102,11 @@ export class AdapterRegistry implements CustomInterceptor {
     let answeredRemotely = false;
     const prompt = p;
     void prompt.remoteAnswer.then((answer) => {
-      if (prompt.closed && !prompt.cancelledBySystem) return;
+      if (prompt.closed || prompt.cancelledBySystem) return;
       answeredRemotely = true;
       const result = cur.adapter.toResult(cur.args, answer);
       doneRef?.(result);
-      if (!prompt.cancelledBySystem) this.broker.ack(prompt.id, true);
+      this.broker.ack(prompt.id, true);
     });
 
     try {
@@ -136,7 +136,7 @@ export class AdapterRegistry implements CustomInterceptor {
     const p: OpenPrompt = this.broker.openSpec(cur.adapter.toPrompt(cur.args));
     let answeredRemotely = false;
     void p.remoteAnswer.then((a) => {
-      if (p.closed && !p.cancelledBySystem) return;
+      if (p.closed || p.cancelledBySystem) return;
       answeredRemotely = true;
       const res = cur.adapter.toResult(cur.args, a);
       if (doneRef) {
@@ -145,7 +145,7 @@ export class AdapterRegistry implements CustomInterceptor {
         hasPendingResult = true;
         pendingResult = res;
       }
-      if (!p.cancelledBySystem) this.broker.ack(p.id, true);
+      this.broker.ack(p.id, true);
     });
     try {
       const v = await runOrig(wrapped as any);

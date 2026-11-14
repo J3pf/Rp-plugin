@@ -15,36 +15,60 @@ export default function rp(pi) {
         return;
     let rt;
     let lastReason = "startup";
+    let shuttingDown = false;
+    let lifecycle = Promise.resolve();
+    const enqueueLifecycle = (fn) => {
+        const next = lifecycle.then(fn, fn);
+        lifecycle = next.catch(() => { });
+        return next;
+    };
     const canRun = () => cfg.enabled && !!cfg.machineToken && !!cfg.relayUrl && !pi.getFlag("rp-off");
     const start = (ctx, reason = lastReason) => {
-        if (rt || !canRun())
+        if (rt || shuttingDown || !canRun())
             return;
         rt = new Runtime(pi, ctx, cfg, env, reason);
         rt.start();
     };
-    const stop = async (closeInHerdr = false) => {
+    const stop = async (closeInHerdr = false, keepLocalPrompts = false) => {
         const r = rt;
         rt = undefined;
-        await r?.dispose(closeInHerdr);
+        await r?.dispose(closeInHerdr, keepLocalPrompts);
     };
     registerCommands(pi, {
         cfg,
         cfgPath,
         getRuntime: () => rt,
         startRuntime: (ctx) => {
-            void ensureHostAutostart({ cfg, pi });
-            start(ctx);
+            shuttingDown = false;
+            void enqueueLifecycle(() => {
+                void ensureHostAutostart({ cfg, pi });
+                start(ctx);
+            });
         },
-        stopRuntime: () => stop(false),
+        stopRuntime: () => enqueueLifecycle(() => stop(false, true)),
     });
     pi.on("session_start", async (ev, ctx) => {
+        shuttingDown = false;
         lastReason = ev.reason;
-        void ensureHostAutostart({ cfg, pi });
-        await stop(false); // a reload leaves the previous runtime invalid
-        start(ctx, ev.reason);
+        await enqueueLifecycle(async () => {
+            if (shuttingDown)
+                return;
+            void ensureHostAutostart({ cfg, pi });
+            let nextSid;
+            try {
+                nextSid = ctx.sessionManager.getSessionId();
+            }
+            catch {
+                nextSid = undefined;
+            }
+            const switchedSession = !!(rt && nextSid && rt.sessionId !== nextSid);
+            await stop(switchedSession, false); // a reload or session switch leaves the previous runtime invalid
+            start(ctx, ev.reason);
+        });
     });
     pi.on("session_shutdown", async () => {
-        await stop(true);
+        shuttingDown = true;
+        await enqueueLifecycle(() => stop(true, false));
     });
     for (const name of FORWARDED_EVENTS)
         pi.on(name, (ev, ctx) => rt?.forward(name, ev, ctx));

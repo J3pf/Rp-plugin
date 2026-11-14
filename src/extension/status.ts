@@ -37,11 +37,13 @@ export class StatusTracker {
   }
 
   working(detail?: string): void {
+    this.compacting = false;
     this.base = "working";
     this.detail = detail;
     this.push();
   }
   idle(): void {
+    this.compacting = false;
     this.base = "idle";
     this.detail = undefined;
     this.push();

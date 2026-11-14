@@ -1,7 +1,18 @@
 /** `herdr agent prompt <pane> <text>`: types into the pane and presses Enter (COMPATIBILIDAD H3). No shell involved. */
-export async function deliverHerdr(pi, paneId, text) {
+export async function deliverHerdr(pi, paneId, text, draftUi) {
     if (!paneId || paneId.startsWith("-"))
         return { ok: false, error: "herdr_unavailable" };
+    let savedDraft = "";
+    if (draftUi) {
+        try {
+            savedDraft = draftUi.getText();
+            if (savedDraft)
+                draftUi.setText("");
+        }
+        catch {
+            savedDraft = "";
+        }
+    }
     const textArgs = text.startsWith("-") ? ["--", text] : [text];
     try {
         const r = await pi.exec("herdr", ["agent", "prompt", paneId, ...textArgs], { timeout: 10_000 });
@@ -13,5 +24,15 @@ export async function deliverHerdr(pi, paneId, text) {
     }
     catch {
         return { ok: false, error: "herdr_unavailable" };
+    }
+    finally {
+        if (savedDraft) {
+            try {
+                draftUi?.setText(savedDraft);
+            }
+            catch {
+                /* editor restore is best-effort */
+            }
+        }
     }
 }

@@ -181,7 +181,7 @@ export function checkDeclared(env = process.env): Check[] {
   ] as const) {
     const r = pluginDeclaredIn(dir);
     if (r.found) out.push({ level: "ok", label: `Plugin declarado en ${label}`, detail: r.file });
-    else out.push({ level: label === "Pi" ? "warn" : "warn", label: `Plugin NO declarado en ${label}`, detail: `${r.file}${r.error ? ` (${r.error})` : ""} → ejecuta: ${hint}` });
+    else out.push({ level: "warn", label: `Plugin NO declarado en ${label}`, detail: `${r.file}${r.error ? ` (${r.error})` : ""} → ejecuta: ${hint}` });
   }
   return out;
 }

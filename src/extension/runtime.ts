@@ -1,10 +1,10 @@
 // Per-session state: created in session_start, destroyed in session_shutdown (PLAN §5).
 import os from "node:os";
-import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { newId, type AgentEventPayload, type AgentHelloBody, type AgentStatus, type Envelope, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
 import { parseTodoTasks, redactTodoTasks, replayTodoBranch } from "./todos.ts";
 import { LruSet, errMsg, preview, safeUser } from "../shared/util.ts";
+import { readGitHeadAndDirty } from "../host/git.ts";
 import type { RpConfig } from "./config.ts";
 import { resolveInboxDir } from "./config.ts";
 import type { StaticEnv, HerdrLocation } from "./environment.ts";
@@ -84,6 +84,8 @@ export class Runtime {
   private thinking: string | null = null;
   private dialogDepth = 0;
   private terminalWaits = 0;
+  private terminalWaitTracked: boolean[] = [];
+  private gitInFlight: Promise<void> | null = null;
   private dialogWaiters: Array<Waiter<boolean>> = [];
   private settledWaiters: Array<Waiter<void>> = [];
   private inputWaiters: Array<{ text: string; resolve: (v: boolean) => void; timer: NodeJS.Timeout }> = [];
@@ -248,14 +250,14 @@ export class Runtime {
     this.conn.start();
   }
 
-  async dispose(closeInHerdr = false): Promise<void> {
+  async dispose(closeInHerdr = false, keepLocalPrompts = false): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     const hadOpenPrompts = this.broker.openCount > 0;
     const shouldSendClosed = closeInHerdr && !!this.env.herdr?.paneId && this.conn.connected;
     this.comm.reset();
     try {
-      this.broker.shutdown();
+      this.broker.shutdown({ keepLocal: keepLocalPrompts });
       this.herdrBlocker.releaseAll();
       this.forwarder.dispose();
       this.statuses.dispose();
@@ -314,9 +316,15 @@ export class Runtime {
     } else {
       this.touch(ctx);
     }
-    if (name === "model_select" && ev?.model) this.model = { provider: ev.model.provider, id: ev.model.id };
+    if (name === "model_select" && ev?.model) {
+      this.model = { provider: ev.model.provider, id: ev.model.id };
+      this.syncContextUsage();
+    }
     if (name === "thinking_level_select") this.thinking = ev?.level ?? null;
-    if (name === "session_compact") this.statuses.setCompacting(false);
+    if (name === "session_compact") {
+      this.statuses.setCompacting(false);
+      this.syncContextUsage();
+    }
     try {
       if (name === "message_end") this.comm.onMessage(ev?.message);
     } catch {
@@ -353,7 +361,7 @@ export class Runtime {
     if (ev?.source !== "interactive") return;
     const text = normalizeText(String(ev.text ?? ""));
     let i = this.inputWaiters.findIndex((w) => w.text === text);
-    if (i < 0 && text.length > 0 && this.inputWaiters.length === 1) i = 0;
+    if (i < 0 && text.length > 0 && this.inputWaiters.length === 1 && text.endsWith(this.inputWaiters[0]!.text)) i = 0;
     if (i >= 0) {
       const [w] = this.inputWaiters.splice(i, 1);
       clearTimeout(w!.timer);
@@ -368,15 +376,24 @@ export class Runtime {
     else this.dialogDepth = Math.max(0, this.dialogDepth - 1);
     if (this.dialogDepth === 0) for (const w of this.dialogWaiters.splice(0)) w.resolve(true);
     const kind = ev?.kind;
-    if ((kind === "custom" || kind === "editor") && !this.broker.hasAdapterPrompt()) {
-      this.terminalWaits = Math.max(0, this.terminalWaits + (active ? 1 : -1));
-      this.updateWaiting();
-      this.emitEvent({
-        type: "terminal_wait",
-        kind,
-        title: this.cfg.redactContent ? null : (ev?.title ?? null),
-        active,
-      });
+    if (kind === "custom" || kind === "editor") {
+      let track: boolean;
+      if (active) {
+        track = !this.adapters.active() && !this.broker.hasAdapterPrompt();
+        this.terminalWaitTracked.push(track);
+      } else {
+        track = this.terminalWaitTracked.pop() ?? (!this.broker.hasAdapterPrompt() && this.terminalWaits > 0);
+      }
+      if (track) {
+        this.terminalWaits = Math.max(0, this.terminalWaits + (active ? 1 : -1));
+        this.updateWaiting();
+        this.emitEvent({
+          type: "terminal_wait",
+          kind,
+          title: this.cfg.redactContent ? null : (ev?.title ?? null),
+          active,
+        });
+      }
     }
   }
 
@@ -415,12 +432,8 @@ export class Runtime {
   private sendSnapshot(direct: boolean): void {
     const { entries, truncated } = buildSnapshotEntries(this.safeBranch(), this.cfg.redactContent);
     if (direct) {
-      if (this.conn.needsSnapshot) {
-        this.conn.dropQueuedEventsUpTo(this.seq);
-      }
-      const minQueued = this.conn.minQueuedEventSeq();
-      const snapSeq = minQueued !== null ? Math.max(0, minQueued - 1) : this.seq;
-      this.conn.sendDirect("agent.snapshot", { epoch: this.epoch, seq: snapSeq, entries, truncated });
+      this.conn.dropQueuedEventsUpTo(this.seq);
+      this.conn.sendDirect("agent.snapshot", { epoch: this.epoch, seq: this.seq, entries, truncated });
     } else {
       this.conn.send("agent.snapshot", { epoch: this.epoch, seq: this.seq, entries, truncated });
     }
@@ -537,20 +550,24 @@ export class Runtime {
   }
 
   private refreshGit(): Promise<void> {
+    if (this.gitInFlight) return this.gitInFlight;
     const cwd = this.info.cwd;
-    const run = (args: string[]) =>
-      new Promise<string | null>((resolve) =>
-        execFile("git", args, { cwd, timeout: 3000, windowsHide: true }, (err, stdout) => resolve(err ? null : String(stdout).trim())),
-      );
-    return (async () => {
-      const branch = await run(["rev-parse", "--abbrev-ref", "HEAD"]);
-      if (branch === null) {
-        this.git = null;
-        return;
+    const prev = this.git;
+    const run = (async () => {
+      const next = await readGitHeadAndDirty(cwd, true);
+      if (this.disposed) return;
+      this.git = next;
+      const changed =
+        prev !== null &&
+        (prev.branch !== (next?.branch ?? null) || prev.dirty !== (next?.dirty ?? false));
+      if (changed && this.conn?.connected) {
+        this.conn.sendDirect("agent.hello", this.makeHello());
       }
-      const status = await run(["status", "--porcelain"]);
-      this.git = { branch, dirty: !!status };
-    })();
+    })().finally(() => {
+      if (this.gitInFlight === run) this.gitInFlight = null;
+    });
+    this.gitInFlight = run;
+    return run;
   }
 
   // ---------- dialogs helpers used by gate / rp_ask_user ----------

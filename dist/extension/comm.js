@@ -1,73 +1,16 @@
 import { newId } from "../shared/protocol.js";
+import { LruMap, LruSet } from "../shared/util.js";
 const INTERCOM_ACTIONS = new Set(["send", "ask", "reply", "handover"]);
 const MAX_TEXT_LENGTH = 2000;
 const DEFAULT_CAPACITY = 500;
-/** Map with an LRU eviction bound, refreshing entries on access and update. */
-export class BoundedMap extends Map {
-    capacity;
-    constructor(maxCapacity = DEFAULT_CAPACITY) {
-        super();
-        this.capacity = Number.isFinite(maxCapacity) ? Math.max(0, Math.floor(maxCapacity)) : DEFAULT_CAPACITY;
-    }
-    get(key) {
-        if (!super.has(key))
-            return undefined;
-        const value = super.get(key);
-        super.delete(key);
-        super.set(key, value);
-        return value;
-    }
-    has(key) {
-        if (!super.has(key))
-            return false;
-        const value = super.get(key);
-        super.delete(key);
-        super.set(key, value);
-        return true;
-    }
-    set(key, value) {
-        super.delete(key);
-        super.set(key, value);
-        if (this.size > this.capacity) {
-            const oldest = this.keys().next();
-            if (!oldest.done)
-                super.delete(oldest.value);
-        }
-        return this;
-    }
-}
-/** Set with an LRU eviction bound, refreshing entries on access and update. */
-export class BoundedSet extends Set {
-    capacity;
-    constructor(maxCapacity = DEFAULT_CAPACITY) {
-        super();
-        this.capacity = Number.isFinite(maxCapacity) ? Math.max(0, Math.floor(maxCapacity)) : DEFAULT_CAPACITY;
-    }
-    has(value) {
-        if (!super.has(value))
-            return false;
-        super.delete(value);
-        super.add(value);
-        return true;
-    }
-    add(value) {
-        super.delete(value);
-        super.add(value);
-        if (this.size > this.capacity) {
-            const oldest = this.values().next();
-            if (!oldest.done)
-                super.delete(oldest.value);
-        }
-        return this;
-    }
-}
+export { LruMap as BoundedMap, LruSet as BoundedSet } from "../shared/util.js";
 /** Correlates inter-agent tool calls into outgoing CommEvents. */
 export class CommTracker {
     deps;
-    activeCalls = new BoundedMap();
-    inboundMessages = new BoundedMap();
-    seenInboundMessageIds = new BoundedSet();
-    knownPeers = new BoundedMap();
+    activeCalls = new LruMap(DEFAULT_CAPACITY);
+    inboundMessages = new LruMap(DEFAULT_CAPACITY);
+    seenInboundMessageIds = new LruSet(DEFAULT_CAPACITY);
+    knownPeers = new LruMap(DEFAULT_CAPACITY);
     now;
     constructor(deps) {
         this.deps = deps;

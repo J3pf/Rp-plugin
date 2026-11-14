@@ -38,11 +38,13 @@ export class StatusTracker {
         this.emitStatus(status, detail);
     }
     working(detail) {
+        this.compacting = false;
         this.base = "working";
         this.detail = detail;
         this.push();
     }
     idle() {
+        this.compacting = false;
         this.base = "idle";
         this.detail = undefined;
         this.push();

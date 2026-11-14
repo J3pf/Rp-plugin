@@ -166,7 +166,7 @@ export function checkDeclared(env = process.env) {
         if (r.found)
             out.push({ level: "ok", label: `Plugin declarado en ${label}`, detail: r.file });
         else
-            out.push({ level: label === "Pi" ? "warn" : "warn", label: `Plugin NO declarado en ${label}`, detail: `${r.file}${r.error ? ` (${r.error})` : ""} → ejecuta: ${hint}` });
+            out.push({ level: "warn", label: `Plugin NO declarado en ${label}`, detail: `${r.file}${r.error ? ` (${r.error})` : ""} → ejecuta: ${hint}` });
     }
     return out;
 }

@@ -186,7 +186,13 @@ export class Deliverer {
                     lastError = "interactive_unavailable";
                     continue;
                 }
-                const r = await deliverHerdr(this.d.pi, this.d.herdr?.paneId ?? null, text);
+                const draftUi = ctx.hasUI
+                    ? {
+                        getText: () => ctx.ui.getEditorText(),
+                        setText: (t) => ctx.ui.setEditorText(t),
+                    }
+                    : undefined;
+                const r = await deliverHerdr(this.d.pi, this.d.herdr?.paneId ?? null, text, draftUi);
                 if (r.ok) {
                     this.record(msg, "herdr");
                     this.d.sendAck({ clientMsgId: id, disposition: "typed", method: "herdr", error: null });

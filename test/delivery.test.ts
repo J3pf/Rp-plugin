@@ -112,13 +112,16 @@ describe("deliverInteractive", () => {
     expect(await deliverInteractive(m2.deps, "x", "auto")).toMatchObject({ ok: false });
     expect(m2.emitted).toHaveLength(0);
   });
-  it("follow-up while working waits for agent_settled; steer types immediately", async () => {
+  it("follow-up while working waits for agent_settled; steer types immediately; auto rejects immediately when busy", async () => {
     const settled = vi.fn(async () => {});
     const m = mk({ deps: { waitSettled: settled } });
     m.ctx.setIdle(false);
     await deliverInteractive(m.deps, "x", "followUp");
     expect(settled).toHaveBeenCalledTimes(1);
     await deliverInteractive(m.deps, "y", "steer");
+    expect(settled).toHaveBeenCalledTimes(1);
+    const autoBusy = await deliverInteractive(m.deps, "z", "auto");
+    expect(autoBusy).toMatchObject({ ok: false, error: "interactive_unavailable" });
     expect(settled).toHaveBeenCalledTimes(1);
   });
   it("refuses outside the TUI, when disabled, or without stdin", async () => {

@@ -40,6 +40,13 @@ const INTERPRETER_CMDS = new Set([
   "python",
   "python3",
   "node",
+  "deno",
+  "bun",
+  "npx",
+  "tsx",
+  "uv",
+  "uvx",
+  "pipx",
   "perl",
   "ruby",
   "php",
@@ -52,6 +59,8 @@ const INTERPRETER_CMDS = new Set([
   "xargs",
   "find",
 ]);
+const DESTRUCTIVE_VERBS = new Set(["rm", "rmdir", "mv", "chmod", "chown", "kill", "pkill", "dd", "mkfs"]);
+const VERSIONED_INTERPRETER_RE = /^python\d+(?:\.\d+)?$/;
 
 export interface GateToolInfo {
   annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
@@ -88,7 +97,10 @@ export function allowKey(toolName: string, input: any): string {
     }
     const first = cmd.split(/\s+/)[0] ?? "";
     const base = path.posix.basename(first.replace(/\\/g, "/")).replace(/\.exe$/i, "").toLowerCase();
-    if (INTERPRETER_CMDS.has(base) && /\s/.test(cmd)) {
+    if (DESTRUCTIVE_VERBS.has(base)) {
+      return `${toolName}:${cmd}`;
+    }
+    if ((INTERPRETER_CMDS.has(base) || VERSIONED_INTERPRETER_RE.test(base)) && /\s/.test(cmd)) {
       return `${toolName}:${cmd}`;
     }
     return `${toolName}:${first}`;

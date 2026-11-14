@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { LruMap } from "../shared/util.ts";
 import { GENTLE_ASK_TOOLS } from "./environment.ts";
 
 /** Tested range of gentle-pi (PLAN §8.5). */
@@ -53,15 +54,7 @@ export function hasGentleAskTools(pi: ExtensionAPI): boolean {
   return GENTLE_ASK_TOOLS.some((n) => names.includes(n));
 }
 
-const pkgCache = new Map<string, { dir: string; json: any } | null>();
-function setPkgCache(key: string, val: { dir: string; json: any } | null): void {
-  pkgCache.delete(key);
-  pkgCache.set(key, val);
-  if (pkgCache.size > 200) {
-    const first = pkgCache.keys().next();
-    if (!first.done) pkgCache.delete(first.value);
-  }
-}
+const pkgCache = new LruMap<string, { dir: string; json: any } | null>(200);
 
 /** Walk upwards from a path to find the owning package.json (used to read the gentle-pi version). */
 export function findPackageJson(startPath: string, name?: string): { dir: string; json: any } | null {
@@ -79,7 +72,7 @@ export function findPackageJson(startPath: string, name?: string): { dir: string
       const json = JSON.parse(fs.readFileSync(f, "utf8"));
       if (!name || json.name === name) {
         const res = { dir, json };
-        setPkgCache(cacheKey, res);
+        pkgCache.set(cacheKey, res);
         return res;
       }
     } catch {
@@ -89,7 +82,7 @@ export function findPackageJson(startPath: string, name?: string): { dir: string
     if (parent === dir) break;
     dir = parent;
   }
-  setPkgCache(cacheKey, null);
+  pkgCache.set(cacheKey, null);
   return null;
 }
 
@@ -140,22 +133,6 @@ export function mirrorTookEffect(ctx: ExtensionContext, wrapper: unknown): boole
 /** Process stdin used by the TUI of the same process (pi-tui/src/terminal.ts). */
 export function terminalStdin(): NodeJS.ReadStream | null {
   return process.stdin && typeof process.stdin.emit === "function" ? process.stdin : null;
-}
-
-export function readEditorText(ctx: ExtensionContext): string {
-  try {
-    return ctx.ui.getEditorText();
-  } catch {
-    return "";
-  }
-}
-
-export function writeEditorText(ctx: ExtensionContext, text: string): void {
-  try {
-    ctx.ui.setEditorText(text);
-  } catch {
-    /* ignore */
-  }
 }
 
 export interface DetectThemeOptions {

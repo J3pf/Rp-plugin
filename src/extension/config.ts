@@ -38,9 +38,10 @@ export const DEFAULT_CONFIG: RpConfig = {
   gate: {
     mode: "auto-detect",
     dangerousPatterns: [
-      "\\brm\\b\\s+(-[a-zA-Z0-9]+\\s+)*(-[a-zA-Z0-9]*r|--recursive\\b)",
+      "\\brm\\b[^;&|\\n]*\\s(-[a-zA-Z0-9]*[rR]|--recursive\\b)",
       "\\bsudo\\b",
-      "\\bgit\\s+push\\b.*(\\s--force|\\s-f\\b)",
+      "\\bgit\\s+push\\b.*(\\s--force(?:-with-lease)?|\\s-f\\b|\\s\\+[a-zA-Z0-9_./-]+)",
+      "\\bgit\\s+(?:reset\\s+--hard|clean\\b[^;&|\\n]*\\s-[a-zA-Z0-9]*[fF])",
       "\\bchmod\\b.*777",
       "\\bdd\\b",
       "\\bmkfs",

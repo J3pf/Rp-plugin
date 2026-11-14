@@ -1,4 +1,5 @@
 import { newId, type CommEvent, type CommPeer } from "../shared/protocol.ts";
+import { LruMap, LruSet } from "../shared/util.ts";
 export type { CommEvent, CommPeer } from "../shared/protocol.ts";
 
 export interface CommTrackerDeps {
@@ -23,75 +24,14 @@ const INTERCOM_ACTIONS = new Set(["send", "ask", "reply", "handover"]);
 const MAX_TEXT_LENGTH = 2000;
 const DEFAULT_CAPACITY = 500;
 
-/** Map with an LRU eviction bound, refreshing entries on access and update. */
-export class BoundedMap<K, V> extends Map<K, V> {
-  private readonly capacity: number;
-
-  constructor(maxCapacity = DEFAULT_CAPACITY) {
-    super();
-    this.capacity = Number.isFinite(maxCapacity) ? Math.max(0, Math.floor(maxCapacity)) : DEFAULT_CAPACITY;
-  }
-
-  override get(key: K): V | undefined {
-    if (!super.has(key)) return undefined;
-    const value = super.get(key)!;
-    super.delete(key);
-    super.set(key, value);
-    return value;
-  }
-
-  override has(key: K): boolean {
-    if (!super.has(key)) return false;
-    const value = super.get(key)!;
-    super.delete(key);
-    super.set(key, value);
-    return true;
-  }
-
-  override set(key: K, value: V): this {
-    super.delete(key);
-    super.set(key, value);
-    if (this.size > this.capacity) {
-      const oldest = this.keys().next();
-      if (!oldest.done) super.delete(oldest.value);
-    }
-    return this;
-  }
-}
-
-/** Set with an LRU eviction bound, refreshing entries on access and update. */
-export class BoundedSet<T> extends Set<T> {
-  private readonly capacity: number;
-
-  constructor(maxCapacity = DEFAULT_CAPACITY) {
-    super();
-    this.capacity = Number.isFinite(maxCapacity) ? Math.max(0, Math.floor(maxCapacity)) : DEFAULT_CAPACITY;
-  }
-
-  override has(value: T): boolean {
-    if (!super.has(value)) return false;
-    super.delete(value);
-    super.add(value);
-    return true;
-  }
-
-  override add(value: T): this {
-    super.delete(value);
-    super.add(value);
-    if (this.size > this.capacity) {
-      const oldest = this.values().next();
-      if (!oldest.done) super.delete(oldest.value);
-    }
-    return this;
-  }
-}
+export { LruMap as BoundedMap, LruSet as BoundedSet } from "../shared/util.ts";
 
 /** Correlates inter-agent tool calls into outgoing CommEvents. */
 export class CommTracker {
-  private readonly activeCalls = new BoundedMap<string, CommEvent>();
-  private readonly inboundMessages = new BoundedMap<string, CommPeer>();
-  private readonly seenInboundMessageIds = new BoundedSet<string>();
-  private readonly knownPeers = new BoundedMap<string, CommPeer>();
+  private readonly activeCalls = new LruMap<string, CommEvent>(DEFAULT_CAPACITY);
+  private readonly inboundMessages = new LruMap<string, CommPeer>(DEFAULT_CAPACITY);
+  private readonly seenInboundMessageIds = new LruSet<string>(DEFAULT_CAPACITY);
+  private readonly knownPeers = new LruMap<string, CommPeer>(DEFAULT_CAPACITY);
   private readonly now: () => number;
 
   constructor(private readonly deps: CommTrackerDeps) {
