@@ -550,6 +550,7 @@ export class BridgedAgentSession {
   private sendSnapshot(direct: boolean): void {
     this.initialSnapshotSent = true;
     if (this.transcriptReader) {
+      const hadRunning = this.transcriptReader.hasRunningSubagents();
       const { entries, truncated, events } = this.transcriptReader.readSnapshot();
       const lastActivityAt = this.transcriptReader.getLastActivityAt();
       const body = {
@@ -562,14 +563,26 @@ export class BridgedAgentSession {
       if (direct) {
         this.conn.dropQueuedEventsUpTo(this.seq);
         this.conn.sendDirect("agent.snapshot", { ...body, seq: this.seq });
-        for (const ev of events) {
-          if (ev.type === "subagent_update") this.sendEvent(ev);
+        for (const sub of this.dedupeSubagentUpdates(events, this.transcriptReader.getSubagents())) {
+          this.sendEvent(sub);
         }
       } else {
         this.conn.send("agent.snapshot", body);
+        const emittedSubIds = new Set<string>();
         for (const ev of events) {
+          if (ev.type === "subagent_update" && typeof ev.taskId === "string") {
+            emittedSubIds.add(ev.taskId);
+          }
           this.sendEvent(ev);
         }
+        for (const sub of this.transcriptReader.getSubagents()) {
+          if (!emittedSubIds.has(sub.taskId)) {
+            this.sendEvent(sub as unknown as Record<string, unknown>);
+          }
+        }
+      }
+      if (!hadRunning && this.transcriptReader.hasRunningSubagents()) {
+        this.scheduleNextPoll();
       }
       this.syncSessionNameIfChanged();
       return;
@@ -638,10 +651,27 @@ export class BridgedAgentSession {
     }
   }
 
+  private dedupeSubagentUpdates(
+    events: Record<string, unknown>[],
+    subagents: ReturnType<AgyTranscriptReader["getSubagents"]>,
+  ): Record<string, unknown>[] {
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const sub of subagents) {
+      byId.set(sub.taskId, sub as unknown as Record<string, unknown>);
+    }
+    for (const ev of events) {
+      if (ev.type === "subagent_update" && typeof ev.taskId === "string") {
+        byId.set(ev.taskId, ev);
+      }
+    }
+    return [...byId.values()];
+  }
+
   private scheduleNextPoll(): void {
     if (this.disposed) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
-    const isWorking = this.effectiveStatus() === "working";
+    const isWorking =
+      this.effectiveStatus() === "working" || (this.transcriptReader?.hasRunningSubagents() ?? false);
     const delayMs = isWorking ? 900 : this.watcher ? 15_000 : 4_500;
     this.pollTimer = setTimeout(() => {
       void this.pollTranscriptNow().finally(() => this.scheduleNextPoll());
@@ -661,6 +691,7 @@ export class BridgedAgentSession {
       try {
         if (this.transcriptReader) {
           if (!this.watcher) this.setupFileWatcher();
+          const hadRunning = this.transcriptReader.hasRunningSubagents();
           const prevOffset = this.transcriptReader.byteOffset;
           const events = this.transcriptReader.pollNewEvents();
           const offsetAdvanced = this.transcriptReader.byteOffset !== prevOffset;
@@ -673,6 +704,9 @@ export class BridgedAgentSession {
             ) {
               shouldRefreshGit = true;
             }
+          }
+          if (!hadRunning && this.transcriptReader.hasRunningSubagents()) {
+            this.scheduleNextPoll();
           }
           if (offsetAdvanced || events.length > 0) {
             this.syncSessionNameIfChanged();

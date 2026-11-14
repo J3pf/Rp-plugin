@@ -2,6 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG, type RpConfig } from "../src/extension/config.ts";
 import { ALLOW, ALLOW_SESSION, DENY } from "../src/extension/prompts/gate.ts";
@@ -10,6 +11,7 @@ import {
   AgyTranscriptReader,
   extractAgyUserText,
   normalizeAgyToolCall,
+  normalizeAgyToolCalls,
   parseAgyArgs,
   resolveAgyTranscriptPath,
 } from "../src/host/agy-transcript.ts";
@@ -337,6 +339,404 @@ describe("agy-transcript", () => {
       contextPercent: 50,
     });
   });
+
+  it("expands parallel Subagents arrays via normalizeAgyToolCalls and resolves truncated invoke_subagent tool_calls from transcript_full.jsonl", () => {
+    const norms = normalizeAgyToolCalls(20, 0, {
+      name: "invoke_subagent",
+      args: {
+        Subagents: JSON.stringify([
+          { Role: "Explorer", TypeName: "explore", Prompt: "Find files" },
+          { role: "Reviewer", typeName: "review", prompt: "Check diffs" },
+        ]),
+      },
+    });
+    expect(norms).toHaveLength(2);
+    expect(norms[0]).toMatchObject({
+      toolCallId: "agy:20:0:sub:0",
+      name: "subagent_run",
+      args: { agent: "explore", label: "Explorer", task: "Find files" },
+      subagentSpec: { role: "Explorer", typeName: "explore", prompt: "Find files" },
+    });
+    expect(norms[1]).toMatchObject({
+      toolCallId: "agy:20:0:sub:1",
+      name: "subagent_run",
+      args: { agent: "review", label: "Reviewer", task: "Check diffs" },
+      subagentSpec: { role: "Reviewer", typeName: "review", prompt: "Check diffs" },
+    });
+
+    // Single-element Subagents preserves baseId for backwards compatibility
+    const single = normalizeAgyToolCalls(21, 0, {
+      name: "invoke_subagent",
+      args: { Subagents: [{ Role: "Solo", TypeName: "worker", Prompt: "Do it" }] },
+    });
+    expect(single).toHaveLength(1);
+    expect(single[0]!.toolCallId).toBe("agy:21:0");
+
+    // Truncated invoke_subagent more than 5 lines from tail still resolves from transcript_full.jsonl
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-sub-trunc-"));
+    tmpDirs.push(dir);
+    const parentDir = path.join(dir, "parent-conv");
+    fs.mkdirSync(parentDir, { recursive: true });
+    const tPath = path.join(parentDir, "transcript.jsonl");
+    const fullPath = path.join(parentDir, "transcript_full.jsonl");
+
+    const paddingSteps = Array.from({ length: 7 }, (_, i) => ({
+      step_index: i + 1,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: `2026-11-14T10:00:0${i + 1}Z`,
+      content: `Note ${i}`,
+    }));
+    const truncatedSpawnStep = {
+      step_index: 0,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: "2026-11-14T10:00:00Z",
+      truncated_fields: ["tool_calls"],
+      tool_calls: [{ name: "invoke_subagent", args: { Subagents: "[]" } }],
+    };
+    const fullSpawnStep = {
+      ...truncatedSpawnStep,
+      truncated_fields: undefined,
+      tool_calls: [
+        {
+          name: "invoke_subagent",
+          args: {
+            Subagents: JSON.stringify([
+              { Role: "Alpha", TypeName: "explore", Prompt: "Scan A" },
+              { Role: "Beta", TypeName: "research", Prompt: "Scan B" },
+            ]),
+          },
+        },
+      ],
+    };
+
+    fs.writeFileSync(tPath, [truncatedSpawnStep, ...paddingSteps].map((s) => JSON.stringify(s)).join("\n") + "\n");
+    fs.writeFileSync(fullPath, [fullSpawnStep, ...paddingSteps].map((s) => JSON.stringify(s)).join("\n") + "\n");
+
+    const reader = new AgyTranscriptReader(tPath);
+    const events = reader.pollNewEvents();
+    const subs = events.filter((e) => e.type === "subagent_update");
+    expect(subs).toHaveLength(2);
+    expect(subs.map((s) => s.taskId)).toEqual(["agy:0:0:sub:0", "agy:0:0:sub:1"]);
+    expect(subs.map((s) => s.label)).toEqual(["Alpha", "Beta"]);
+    expect(reader.hasRunningSubagents()).toBe(true);
+  });
+
+  it("tracks async GENERIC spawn ack, live child transcript telemetry, and SYSTEM_MESSAGE completion", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-sub-life-"));
+    tmpDirs.push(dir);
+    const parentDir = path.join(dir, "parent-conv");
+    const child1Dir = path.join(dir, "child-conv-1");
+    const child2Dir = path.join(dir, "child-conv-2");
+    fs.mkdirSync(parentDir, { recursive: true });
+    fs.mkdirSync(child1Dir, { recursive: true });
+    fs.mkdirSync(child2Dir, { recursive: true });
+
+    const parentPath = path.join(parentDir, "transcript.jsonl");
+    const parentFullPath = path.join(parentDir, "transcript_full.jsonl");
+    const child1Path = path.join(child1Dir, "transcript.jsonl");
+    const child2Path = path.join(child2Dir, "transcript.jsonl");
+
+    const step0 = {
+      step_index: 0,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: "2026-11-14T10:00:00.000Z",
+      tool_calls: [
+        {
+          name: "invoke_subagent",
+          args: {
+            Subagents: JSON.stringify([
+              { Role: "Auditor", TypeName: "research", Prompt: "Audit code" },
+              { Role: "Tester", TypeName: "test", Prompt: "Run checks" },
+            ]),
+          },
+        },
+      ],
+    };
+    const step1 = {
+      step_index: 1,
+      type: "GENERIC",
+      status: "DONE",
+      created_at: "2026-11-14T10:00:01.000Z",
+      content:
+        "Created the following subagents:\n" +
+        JSON.stringify({ conversationId: "child-conv-1", logAbsoluteUri: pathToFileURL(child1Path).href }) +
+        "\n" +
+        JSON.stringify({ conversationId: "child-conv-2", logAbsoluteUri: pathToFileURL(child2Path).href }),
+    };
+
+    fs.writeFileSync(parentPath, [step0, step1].map((s) => JSON.stringify(s)).join("\n") + "\n");
+
+    const reader = new AgyTranscriptReader(parentPath);
+    const initialEvents = reader.pollNewEvents();
+    // GENERIC ack keeps both subagents running and emits tool_execution_end for each
+    expect(initialEvents.filter((e) => e.type === "tool_execution_end").map((e) => e.toolCallId)).toEqual([
+      "agy:0:0:sub:0",
+      "agy:0:0:sub:1",
+    ]);
+    expect(reader.hasRunningSubagents()).toBe(true);
+    expect(reader.getSubagents().every((s) => s.status === "running")).toBe(true);
+
+    // Child 1 writes steps while parent transcript has NO new bytes (deltaBytes === 0)
+    fs.writeFileSync(
+      child1Path,
+      [
+        {
+          step_index: 0,
+          type: "USER_INPUT",
+          content: "User changed setting `Model Selection` from Gemini 2.5 Flash to Claude Sonnet 4.5.",
+        },
+        {
+          step_index: 1,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-14T10:00:02.000Z",
+          thinking: "Inspecting repository layout",
+          input_tokens: 1200,
+          output_tokens: 300,
+          cache_read_tokens: 5000,
+          cache_write_tokens: 200,
+          tool_calls: [{ name: "view_file", args: { AbsolutePath: '"/repo/a.ts"' } }],
+        },
+        {
+          step_index: 2,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-14T10:00:03.000Z",
+          input_tokens: 800,
+          output_tokens: 150,
+          tool_calls: [{ name: "run_command", args: { CommandLine: '"npm test"' } }],
+        },
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+    );
+
+    const childPollEvents = reader.pollNewEvents();
+    const child1Update = childPollEvents.find((e) => e.type === "subagent_update" && e.taskId === "agy:0:0:sub:0") as any;
+    expect(child1Update).toBeDefined();
+    expect(child1Update.status).toBe("running");
+    expect(child1Update.model).toBe("Claude Sonnet 4.5");
+    expect(child1Update.thinking).toBe("Inspecting repository layout");
+    expect(child1Update.turns).toBe(2);
+    expect(child1Update.toolCalls).toBe(2);
+    expect(child1Update.tools).toEqual(["read", "bash"]);
+    expect(child1Update.tokens).toEqual({
+      input: 2000,
+      output: 450,
+      cacheRead: 5000,
+      cacheWrite: 200,
+      total: 7650,
+    });
+
+    // Child 1 finishes via SYSTEM_MESSAGE (with truncated_fields resolved from transcript_full.jsonl)
+    // and Child 2 writes final tool before SYSTEM_MESSAGE arrives
+    fs.writeFileSync(
+      child2Path,
+      JSON.stringify({
+        step_index: 0,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-14T10:00:04.000Z",
+        tool_calls: [{ name: "grep_search", args: { Query: '"TODO"' } }],
+      }) + "\n",
+    );
+    const sys1Trunc = {
+      step_index: 2,
+      source: "SYSTEM",
+      type: "SYSTEM_MESSAGE",
+      created_at: "2026-11-14T10:00:10.000Z",
+      truncated_fields: ["content"],
+      content: "<SYSTEM_MESSAGE>\n[Message] sender=child-conv-1 content=Trunc...",
+    };
+    const sys1Full = {
+      ...sys1Trunc,
+      truncated_fields: undefined,
+      content:
+        "The following is a <SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-14T10:00:10Z sender=child-conv-1 priority=HIGH content=Full audit findings from child 1\n</SYSTEM_MESSAGE>",
+    };
+    const sys2 = {
+      step_index: 3,
+      source: "SYSTEM",
+      type: "SYSTEM_MESSAGE",
+      created_at: "2026-11-14T10:00:15.000Z",
+      content:
+        "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-14T10:00:15Z sender=child-conv-2 content=All checks green\n</SYSTEM_MESSAGE>",
+    };
+    fs.writeFileSync(parentFullPath, [step0, step1, sys1Full, sys2].map((s) => JSON.stringify(s)).join("\n") + "\n");
+    fs.appendFileSync(parentPath, [sys1Trunc, sys2].map((s) => JSON.stringify(s)).join("\n") + "\n");
+
+    const doneEvents = reader.pollNewEvents();
+    const done1 = doneEvents.find((e) => e.type === "subagent_update" && e.taskId === "agy:0:0:sub:0") as any;
+    const done2 = doneEvents.find((e) => e.type === "subagent_update" && e.taskId === "agy:0:0:sub:1") as any;
+    expect(done1).toMatchObject({
+      status: "completed",
+      result: "Full audit findings from child 1",
+      turns: 2,
+      toolCalls: 2,
+    });
+    expect(done1.durationMs).toBeGreaterThanOrEqual(10_000);
+    expect(done2).toMatchObject({
+      status: "completed",
+      result: "All checks green",
+      tools: ["grep"],
+      toolCalls: 1,
+      turns: 1,
+    });
+    expect(reader.hasRunningSubagents()).toBe(false);
+  });
+
+  it("masks subagent label, thinking, result, and error when redactContent is enabled, and marks GENERIC error cleanly", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-sub-redact-"));
+    tmpDirs.push(dir);
+    const parentDir = path.join(dir, "parent");
+    const childDir = path.join(dir, "child-r1");
+    fs.mkdirSync(parentDir, { recursive: true });
+    fs.mkdirSync(childDir, { recursive: true });
+    const parentPath = path.join(parentDir, "transcript.jsonl");
+    const childPath = path.join(childDir, "transcript.jsonl");
+
+    fs.writeFileSync(
+      parentPath,
+      [
+        {
+          step_index: 0,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-14T10:00:00Z",
+          tool_calls: [{ name: "invoke_subagent", args: { Role: "SecretRole", TypeName: "worker", Prompt: "Secret" } }],
+        },
+        {
+          step_index: 1,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-14T10:00:01Z",
+          content: JSON.stringify({ conversationId: "child-r1", logAbsoluteUri: pathToFileURL(childPath).href }),
+        },
+        {
+          step_index: 2,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-14T10:00:02Z",
+          tool_calls: [{ name: "invoke_subagent", args: { Role: "FailRole", TypeName: "worker", Prompt: "Fail" } }],
+        },
+        {
+          step_index: 3,
+          type: "GENERIC",
+          status: "ERROR",
+          created_at: "2026-11-14T10:00:03Z",
+          content: "sensitive error message",
+        },
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+    );
+    fs.writeFileSync(
+      childPath,
+      JSON.stringify({
+        step_index: 0,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-14T10:00:02Z",
+        thinking: "Secret thoughts",
+        tool_calls: [{ name: "run_command", args: { CommandLine: '"ls"' } }],
+      }) + "\n",
+    );
+
+    const reader = new AgyTranscriptReader(parentPath, () => true);
+    reader.pollNewEvents();
+    fs.appendFileSync(
+      parentPath,
+      JSON.stringify({
+        step_index: 4,
+        source: "SYSTEM",
+        type: "SYSTEM_MESSAGE",
+        created_at: "2026-11-14T10:00:05Z",
+        content: "<SYSTEM_MESSAGE>\n[Message] sender=child-r1 content=secret output\n</SYSTEM_MESSAGE>",
+      }) + "\n",
+    );
+    reader.pollNewEvents();
+
+    const subs = reader.getSubagents();
+    expect(subs).toHaveLength(2);
+    expect(subs[0]!.label).toBe("[redacted]");
+    expect(subs[0]!.thinking).toBeUndefined();
+    expect(subs[0]!.result).toBeUndefined();
+    expect(subs[0]!.tools).toEqual(["bash"]);
+    expect(subs[1]!.status).toBe("error");
+    expect(subs[1]!.label).toBe("[redacted]");
+    expect(subs[1]!.error).toBeUndefined();
+  });
+
+  it("rejects path traversal and out-of-scope logAbsoluteUri in GENERIC spawn ack", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-sub-sec-"));
+    tmpDirs.push(dir);
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-sub-home-"));
+    tmpDirs.push(homeDir);
+    const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(homeDir);
+
+    try {
+      const parentDir = path.join(dir, "parent");
+      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-outside-"));
+      tmpDirs.push(outsideDir);
+      fs.mkdirSync(parentDir, { recursive: true });
+
+      const parentPath = path.join(parentDir, "transcript.jsonl");
+      const outsideTranscript = path.join(outsideDir, "transcript.jsonl");
+      fs.writeFileSync(
+        outsideTranscript,
+        JSON.stringify({
+          step_index: 0,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-14T10:00:01Z",
+          thinking: "LEAKED_OUTSIDE_THINKING",
+          tool_calls: [{ name: "run_command", args: { CommandLine: '"cat /etc/shadow"' } }],
+        }) + "\n",
+      );
+
+      fs.writeFileSync(
+        parentPath,
+        [
+          {
+            step_index: 0,
+            type: "PLANNER_RESPONSE",
+            created_at: "2026-11-14T10:00:00Z",
+            tool_calls: [
+              {
+                name: "invoke_subagent",
+                args: {
+                  Subagents: JSON.stringify([
+                    { Role: "OutsideUri", TypeName: "worker", Prompt: "Test 1" },
+                    { Role: "TraversalId", TypeName: "worker", Prompt: "Test 2" },
+                  ]),
+                },
+              },
+            ],
+          },
+          {
+            step_index: 1,
+            type: "GENERIC",
+            status: "DONE",
+            created_at: "2026-11-14T10:00:01Z",
+            content:
+              JSON.stringify({ conversationId: "valid-child-id", logAbsoluteUri: pathToFileURL(outsideTranscript).href }) +
+              "\n" +
+              JSON.stringify({ conversationId: "../../etc/passwd", logAbsoluteUri: "file:///etc/passwd" }),
+          },
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+      );
+
+      const reader = new AgyTranscriptReader(parentPath);
+      reader.pollNewEvents();
+      const subs = reader.getSubagents();
+      // Neither subagent should ever read from outsideTranscript or /etc/passwd
+      expect(subs.every((s) => !s.thinking?.includes("LEAKED_OUTSIDE_THINKING"))).toBe(true);
+      expect(subs[0]!.tools).toEqual([]);
+      // Invalid conversationId "../../etc/passwd" is rejected as non-ack -> done, not running
+      expect(subs[1]!.status).toBe("done");
+    } finally {
+      homeSpy.mockRestore();
+    }
+  });
+
 
   it("reads external context usage for claude, codex, and terminal footers", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "rp-ext-ctx-"));
@@ -1571,6 +1971,121 @@ describe("herdr-bridge & PreToolUse gate", () => {
         session.stop();
       }
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-emits AGY subagents after early pollTranscriptNow on snapshot/resync and keeps fast 900ms polling while running", async () => {
+    vi.useFakeTimers();
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-sub-home-"));
+    tmpDirs.push(homeDir);
+    const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(homeDir);
+    try {
+      const parentConv = "conv-parent-sub";
+      const childConv = "conv-child-sub";
+      const parentPath = resolveAgyTranscriptPath(parentConv, homeDir);
+      const childPath = resolveAgyTranscriptPath(childConv, homeDir);
+      fs.mkdirSync(path.dirname(parentPath), { recursive: true });
+      fs.mkdirSync(path.dirname(childPath), { recursive: true });
+
+      fs.writeFileSync(
+        parentPath,
+        [
+          {
+            step_index: 0,
+            type: "PLANNER_RESPONSE",
+            created_at: "2026-11-14T10:00:00Z",
+            tool_calls: [{ name: "invoke_subagent", args: { Role: "Researcher", TypeName: "research", Prompt: "Check" } }],
+          },
+          {
+            step_index: 1,
+            type: "GENERIC",
+            status: "DONE",
+            created_at: "2026-11-14T10:00:01Z",
+            content: JSON.stringify({ conversationId: childConv, logAbsoluteUri: pathToFileURL(childPath).href }),
+          },
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+      );
+
+      const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+      const t = { instance: null as FakeTransport | null };
+      const session = new BridgedAgentSession(
+        { agent: "agy", sessionId: parentConv, status: "idle", cwd: homeDir, paneId: "w1:p1", tabId: null, workspaceId: "w1", title: null, stateChangeSeq: 0 },
+        {
+          relayUrl: "https://relay.example.com",
+          machineId: "M1",
+          token: "T1",
+          cfg,
+          herdrSession: null,
+          runner: async () => ({ code: 0, stdout: "{}", stderr: "" }),
+          connectionFactory: (opts) =>
+            new Connection({
+              ...opts,
+              transportFactory: (_name, handlers) => {
+                const ft = new FakeTransport("ws", handlers);
+                t.instance = ft;
+                return ft;
+              },
+            }),
+        },
+      );
+
+      try {
+        // Early poll before welcome queues events that dropQueuedEventsUpTo(this.seq) clears
+        await session.pollTranscriptNow();
+
+        t.instance!.open();
+        t.instance!.receive({ v: 1, id: "w", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+
+        const snap = t.instance!.sent.find((e) => e.t === "agent.snapshot");
+        expect(snap).toBeDefined();
+        const snapSeq = (snap!.d as any).seq as number;
+        const subEventsAfterSnap = t.instance!.sent.filter(
+          (e) => e.t === "agent.event" && (e.d as any).e?.type === "subagent_update" && (e.d as any).seq > snapSeq,
+        );
+        expect(subEventsAfterSnap).toHaveLength(1);
+        expect((subEventsAfterSnap[0]!.d as any).e).toMatchObject({
+          taskId: "agy:0:0",
+          label: "Researcher",
+          status: "running",
+        });
+
+        // Fast 900ms polling runs even though session status is "idle", picking up child transcript updates
+        fs.writeFileSync(
+          childPath,
+          JSON.stringify({
+            step_index: 0,
+            type: "PLANNER_RESPONSE",
+            created_at: "2026-11-14T10:00:02Z",
+            tool_calls: [{ name: "view_file", args: { AbsolutePath: '"/repo/x.ts"' } }],
+          }) + "\n",
+        );
+        await vi.advanceTimersByTimeAsync(950);
+        const childUpdated = t.instance!.sent.filter(
+          (e) => e.t === "agent.event" && (e.d as any).e?.type === "subagent_update" && ((e.d as any).e?.tools?.length ?? 0) > 0,
+        );
+        expect(childUpdated.length).toBeGreaterThanOrEqual(1);
+        expect((childUpdated[childUpdated.length - 1]!.d as any).e.tools).toEqual(["read"]);
+
+        // Resync (sendSnapshot(false)) also emits current subagents after the new agent.snapshot
+        const prevSentCount = t.instance!.sent.length;
+        t.instance!.receive({ v: 1, id: "r1", t: "agent.resync", ts: Date.now(), d: {} });
+        const afterResync = t.instance!.sent.slice(prevSentCount);
+        const resyncSnap = afterResync.find((e) => e.t === "agent.snapshot");
+        expect(resyncSnap).toBeDefined();
+        const resyncSnapSeq = (resyncSnap!.d as any).seq as number;
+        const resyncSub = afterResync.find(
+          (e) => e.t === "agent.event" && (e.d as any).e?.type === "subagent_update" && (e.d as any).seq > resyncSnapSeq,
+        );
+        expect(resyncSub).toBeDefined();
+        expect((resyncSub!.d as any).e.tools).toEqual(["read"]);
+      } finally {
+        session.stop();
+      }
+    } finally {
+      homeSpy.mockRestore();
       vi.useRealTimers();
     }
   });

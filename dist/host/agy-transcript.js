@@ -2,13 +2,19 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 import { SNAPSHOT_LIMIT } from "../extension/snapshot.js";
 import { LIMITS } from "../extension/forwarder.js";
 import { SAFE_CONV_ID_RE, truncateBytes } from "../shared/util.js";
+import { readExternalAgentModel } from "./bridge/external-metadata.js";
 import { isInside } from "./validate.js";
 const MAX_SUBAGENTS = 100;
+const MAX_SUBAGENT_TOOLS = 100;
+const MAX_SUBAGENT_THINKING_BYTES = 1024;
+const MAX_SUBAGENT_RESULT_BYTES = 4096;
 const MAX_POLL_DELTA_BYTES = 2 * 1024 * 1024;
 const MAX_REMAINDER_BYTES = 1024 * 1024;
+const MODEL_CHANGE_RE = /changed setting `Model Selection` from [^\n]+? to ([^\n<]+?)\.(?:\s|$)/i;
 /** Empirical context window before Antigravity CLI (agy) triggers conversation compaction (~256k tokens). */
 export const AGY_CONTEXT_WINDOW = 256_000;
 const USER_REQ_RE = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i;
@@ -161,23 +167,8 @@ export function normalizeAgyToolCall(stepIndex, callIndex, rawCall) {
                     ...(parsed.SearchDirectory ? { path: parsed.SearchDirectory } : {}),
                 },
             };
-        case "invoke_subagent": {
-            const subs = Array.isArray(parsed.Subagents) ? parsed.Subagents : [];
-            const first = subs[0] && typeof subs[0] === "object" ? subs[0] : {};
-            const role = String(first.Role ?? parsed.Role ?? parsed.toolSummary ?? "Subagent");
-            const typeName = String(first.TypeName ?? parsed.TypeName ?? "subagent");
-            const prompt = String(first.Prompt ?? parsed.Prompt ?? "");
-            return {
-                toolCallId,
-                name: "subagent_run",
-                args: {
-                    agent: typeName,
-                    label: role,
-                    task: truncateBytes(prompt, 500).text,
-                },
-                subagentSpec: { role, typeName, prompt },
-            };
-        }
+        case "invoke_subagent":
+            return normalizeInvokeSubagentEntry(rawCall.id && String(rawCall.id).trim() ? String(rawCall.id).trim() : `agy:${stepIndex}:${callIndex}`, {}, parsed, Array.isArray(parsed.Subagents) ? parsed.Subagents : []);
         default: {
             const safeArgs = {};
             for (const [k, v] of Object.entries(parsed)) {
@@ -190,6 +181,37 @@ export function normalizeAgyToolCall(stepIndex, callIndex, rawCall) {
             };
         }
     }
+}
+function normalizeInvokeSubagentEntry(toolCallId, entry, parsed, subs) {
+    const first = subs[0] && typeof subs[0] === "object" ? subs[0] : {};
+    const src = Object.keys(entry).length > 0 ? entry : first;
+    const role = String(src.Role ?? src.role ?? parsed.Role ?? parsed.role ?? parsed.toolSummary ?? "Subagent");
+    const typeName = String(src.TypeName ?? src.typeName ?? src.type_name ?? parsed.TypeName ?? parsed.typeName ?? "subagent");
+    const prompt = String(src.Prompt ?? src.prompt ?? parsed.Prompt ?? parsed.prompt ?? "");
+    return {
+        toolCallId,
+        name: "subagent_run",
+        args: {
+            agent: typeName,
+            label: role,
+            task: truncateBytes(prompt, 500).text,
+        },
+        subagentSpec: { role, typeName, prompt },
+    };
+}
+/** Expand a raw agy tool call into one or more normalized tool calls (e.g. parallel `invoke_subagent` `Subagents`). */
+export function normalizeAgyToolCalls(stepIndex, callIndex, rawCall) {
+    const rawName = String(rawCall.name ?? "tool");
+    if (rawName !== "invoke_subagent") {
+        return [normalizeAgyToolCall(stepIndex, callIndex, rawCall)];
+    }
+    const baseId = rawCall.id && String(rawCall.id).trim() ? String(rawCall.id).trim() : `agy:${stepIndex}:${callIndex}`;
+    const parsed = parseAgyArgs(rawCall.args ?? rawCall.arguments);
+    const subs = Array.isArray(parsed.Subagents) ? parsed.Subagents : [];
+    if (subs.length > 1) {
+        return subs.map((entry, si) => normalizeInvokeSubagentEntry(`${baseId}:sub:${si}`, entry && typeof entry === "object" ? entry : {}, parsed, subs));
+    }
+    return [normalizeInvokeSubagentEntry(baseId, {}, parsed, subs)];
 }
 /** Produce a compact human-readable label for an active tool call. */
 export function summarizeAgyToolTask(name, args) {
@@ -231,8 +253,8 @@ export function resolveAgyTranscriptPath(conversationId, home = os.homedir()) {
     }
     return resolved;
 }
-/** Read a specific step_index from transcript_full.jsonl when truncated_fields is present. */
-function readFullStep(transcriptPath, stepIndex) {
+/** Build a step_index -> AgyStepRaw map from the last 512 KB of transcript_full.jsonl. */
+function readFullStepsMap(transcriptPath) {
     const fullPath = path.join(path.dirname(transcriptPath), "transcript_full.jsonl");
     try {
         const stat = fs.statSync(fullPath);
@@ -243,31 +265,226 @@ function readFullStep(transcriptPath, stepIndex) {
         try {
             const buf = Buffer.allocUnsafe(tailBytes);
             fs.readSync(fd, buf, 0, tailBytes, stat.size - tailBytes);
-            const text = buf.toString("utf8");
-            const lines = text.split("\n");
+            const lines = buf.toString("utf8").split("\n");
             const minIdx = tailBytes < stat.size ? 1 : 0;
-            for (let i = lines.length - 1; i >= minIdx; i--) {
+            const map = new Map();
+            for (let i = minIdx; i < lines.length; i++) {
                 const line = lines[i].trim();
                 if (!line.startsWith("{"))
                     continue;
                 try {
                     const parsed = JSON.parse(line);
-                    if (parsed.step_index === stepIndex)
-                        return parsed;
+                    if (typeof parsed.step_index === "number") {
+                        map.set(parsed.step_index, parsed);
+                    }
                 }
                 catch {
                     /* ignore partial line */
                 }
             }
+            return map;
         }
         finally {
             fs.closeSync(fd);
         }
     }
     catch {
-        /* full transcript unavailable */
+        return null;
     }
-    return null;
+}
+function readTranscriptChunk(filePath, offset, remainder) {
+    let stat;
+    try {
+        stat = fs.statSync(filePath);
+    }
+    catch {
+        return null;
+    }
+    if (!stat.isFile())
+        return null;
+    let reset = false;
+    let curOffset = offset;
+    let curRemainder = remainder;
+    if (stat.size < curOffset) {
+        reset = true;
+        curOffset = 0;
+        curRemainder = "";
+    }
+    let midLineSeek = false;
+    if (curOffset === 0 && stat.size > 512 * 1024) {
+        curOffset = stat.size - 512 * 1024;
+        curRemainder = "";
+        midLineSeek = true;
+    }
+    else if (stat.size - curOffset > MAX_POLL_DELTA_BYTES) {
+        curOffset = stat.size - MAX_POLL_DELTA_BYTES;
+        curRemainder = "";
+        midLineSeek = true;
+    }
+    const deltaBytes = stat.size - curOffset;
+    if (deltaBytes <= 0) {
+        return { reset, nextOffset: curOffset, nextRemainder: curRemainder, lines: [] };
+    }
+    let chunk = "";
+    const fd = fs.openSync(filePath, "r");
+    try {
+        const buf = Buffer.allocUnsafe(deltaBytes);
+        const bytesRead = fs.readSync(fd, buf, 0, deltaBytes, curOffset);
+        curOffset += bytesRead;
+        chunk = curRemainder + buf.subarray(0, bytesRead).toString("utf8");
+    }
+    finally {
+        fs.closeSync(fd);
+    }
+    const lines = chunk.split("\n");
+    let nextRemainder = lines.pop() ?? "";
+    if (Buffer.byteLength(nextRemainder, "utf8") > MAX_REMAINDER_BYTES) {
+        nextRemainder = "";
+    }
+    if (midLineSeek && lines.length > 0) {
+        lines.shift();
+    }
+    return { reset, nextOffset: curOffset, nextRemainder, lines };
+}
+function toNonNegInt(v) {
+    return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.floor(v)) : 0;
+}
+function extractSpawnedRef(obj, out) {
+    if (!obj || typeof obj !== "object")
+        return;
+    if (Array.isArray(obj)) {
+        for (const item of obj)
+            extractSpawnedRef(item, out);
+        return;
+    }
+    const rec = obj;
+    if (typeof rec.conversationId !== "string")
+        return;
+    const conversationId = rec.conversationId.trim();
+    if (!SAFE_CONV_ID_RE.test(conversationId)) {
+        out.push(null);
+        return;
+    }
+    out.push({
+        conversationId,
+        logAbsoluteUri: typeof rec.logAbsoluteUri === "string" ? rec.logAbsoluteUri.trim() : undefined,
+    });
+}
+function parseSpawnedSubagentRefs(rawOut) {
+    if (!rawOut)
+        return [];
+    const refs = [];
+    let inString = false;
+    let escaped = false;
+    let depth = 0;
+    let start = -1;
+    let openChar = "";
+    for (let i = 0; i < rawOut.length; i++) {
+        const ch = rawOut[i];
+        if (inString) {
+            if (escaped)
+                escaped = false;
+            else if (ch === "\\")
+                escaped = true;
+            else if (ch === '"')
+                inString = false;
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+            continue;
+        }
+        if (depth === 0 && (ch === "{" || ch === "[")) {
+            depth = 1;
+            start = i;
+            openChar = ch;
+        }
+        else if (depth > 0) {
+            if (ch === openChar)
+                depth++;
+            else if ((openChar === "{" && ch === "}") || (openChar === "[" && ch === "]")) {
+                depth--;
+                if (depth === 0 && start >= 0) {
+                    try {
+                        extractSpawnedRef(JSON.parse(rawOut.slice(start, i + 1)), refs);
+                    }
+                    catch {
+                        /* ignore malformed JSON fragment */
+                    }
+                    start = -1;
+                }
+            }
+        }
+    }
+    if (refs.length > 0)
+        return refs;
+    // Regex fallback for non-JSON or truncated fragments
+    const re = /"conversationId"\s*:\s*"([^"]+)"(?:[\s\S]{0,400}?"logAbsoluteUri"\s*:\s*"([^"]+)")?/g;
+    let m;
+    while ((m = re.exec(rawOut)) !== null) {
+        const conversationId = m[1].trim();
+        if (!SAFE_CONV_ID_RE.test(conversationId)) {
+            refs.push(null);
+        }
+        else {
+            refs.push({ conversationId, logAbsoluteUri: m[2]?.trim() });
+        }
+    }
+    return refs;
+}
+function parseSystemWakeup(raw) {
+    if (!raw)
+        return null;
+    const senderMatch = /\bsender=([^\s\]\n<>]+)/.exec(raw);
+    const sender = senderMatch?.[1]?.trim();
+    if (!sender || !SAFE_CONV_ID_RE.test(sender))
+        return null;
+    let content = "";
+    const contentIdx = raw.search(/\bcontent=/);
+    if (contentIdx >= 0) {
+        let rest = raw.slice(contentIdx + "content=".length);
+        const closeIdx = rest.lastIndexOf("</SYSTEM_MESSAGE>");
+        if (closeIdx >= 0)
+            rest = rest.slice(0, closeIdx);
+        content = rest.trim();
+    }
+    return { sender, content };
+}
+function subagentChanged(a, b) {
+    if (a.status !== b.status ||
+        a.label !== b.label ||
+        a.model !== b.model ||
+        a.thinking !== b.thinking ||
+        a.turns !== b.turns ||
+        a.toolCalls !== b.toolCalls ||
+        a.endedAt !== b.endedAt ||
+        a.durationMs !== b.durationMs ||
+        a.result !== b.result ||
+        a.error !== b.error) {
+        return true;
+    }
+    const at = a.tools ?? [];
+    const bt = b.tools ?? [];
+    if (at.length !== bt.length)
+        return true;
+    for (let i = 0; i < at.length; i++) {
+        if (at[i] !== bt[i])
+            return true;
+    }
+    const ak = a.tokens;
+    const bk = b.tokens;
+    if (Boolean(ak) !== Boolean(bk))
+        return true;
+    if (ak && bk) {
+        if (ak.total !== bk.total ||
+            ak.input !== bk.input ||
+            ak.output !== bk.output ||
+            ak.cacheRead !== bk.cacheRead ||
+            ak.cacheWrite !== bk.cacheWrite) {
+            return true;
+        }
+    }
+    return false;
 }
 export const MAX_SNAPSHOT_BYTES = 220 * 1024;
 function compactSnapshotEntry(entry, isRecent) {
@@ -301,14 +518,40 @@ export class AgyTranscriptReader {
     pendingTools = [];
     entries = [];
     subagents = new Map();
+    convToTaskId = new Map();
+    childCursors = new Map();
     lastTopic = null;
     lastContextUsage = null;
     constructor(transcriptPath, redact = () => false) {
         this.transcriptPath = transcriptPath;
         this.redact = redact;
     }
+    hasRunningSubagents() {
+        if (this.childCursors.size > 0)
+            return true;
+        for (const sub of this.subagents.values()) {
+            if (sub.status === "running")
+                return true;
+        }
+        return false;
+    }
     getSubagents() {
-        return [...this.subagents.values()];
+        const isRedacted = this.redact();
+        return Array.from(this.subagents.values(), (sub) => this.cloneSubagent(sub, isRedacted));
+    }
+    cloneSubagent(sub, isRedacted = this.redact()) {
+        const copy = {
+            ...sub,
+            ...(sub.tools ? { tools: [...sub.tools] } : {}),
+            ...(sub.tokens ? { tokens: { ...sub.tokens } } : {}),
+        };
+        if (isRedacted) {
+            copy.label = "[redacted]";
+            delete copy.thinking;
+            delete copy.result;
+            delete copy.error;
+        }
+        return copy;
     }
     getSessionTopic() {
         if (this.redact())
@@ -371,95 +614,200 @@ export class AgyTranscriptReader {
         picked.reverse();
         return { entries: picked, truncated, events };
     }
-    /** Read any newly appended lines from transcript.jsonl and convert them into live events. */
+    /** Read any newly appended lines from transcript.jsonl and active child transcripts, converting them into live events. */
     pollNewEvents() {
-        let stat;
-        try {
-            stat = fs.statSync(this.transcriptPath);
-        }
-        catch {
-            return [];
-        }
-        if (!stat.isFile())
-            return [];
-        // If file was truncated/replaced, reset state
-        if (stat.size < this.offset) {
-            this.offset = 0;
-            this.remainder = "";
-            this.lastStepIndex = -1;
-            this.pendingTools = [];
-            this.entries = [];
-            this.subagents.clear();
-            this.lastContextUsage = null;
-        }
-        let midLineSeek = false;
-        // On first read of a large file (>512 KB), seek to the last 512 KB so startup is fast and light
-        if (this.offset === 0 && stat.size > 512 * 1024) {
-            this.offset = stat.size - 512 * 1024;
-            this.remainder = "";
-            midLineSeek = true;
-        }
-        else if (stat.size - this.offset > MAX_POLL_DELTA_BYTES) {
-            // Cap single-poll read size to prevent OOM on sudden multi-MB bursts
-            this.offset = stat.size - MAX_POLL_DELTA_BYTES;
-            this.remainder = "";
-            midLineSeek = true;
-        }
-        const deltaBytes = stat.size - this.offset;
-        if (deltaBytes <= 0)
-            return [];
-        let chunk = "";
-        const fd = fs.openSync(this.transcriptPath, "r");
-        try {
-            const buf = Buffer.allocUnsafe(deltaBytes);
-            const bytesRead = fs.readSync(fd, buf, 0, deltaBytes, this.offset);
-            this.offset += bytesRead;
-            chunk = this.remainder + buf.subarray(0, bytesRead).toString("utf8");
-        }
-        finally {
-            fs.closeSync(fd);
-        }
-        const lines = chunk.split("\n");
-        this.remainder = lines.pop() ?? "";
-        if (Buffer.byteLength(this.remainder, "utf8") > MAX_REMAINDER_BYTES) {
-            this.remainder = "";
-        }
-        if (midLineSeek && lines.length > 0) {
-            // Discard first partial line after seeking into the middle of the file
-            lines.shift();
-        }
         const liveEvents = [];
-        for (let li = 0; li < lines.length; li++) {
-            const line = lines[li].trim();
-            if (!line.startsWith("{"))
-                continue;
-            let step;
+        const chunk = readTranscriptChunk(this.transcriptPath, this.offset, this.remainder);
+        if (chunk) {
+            if (chunk.reset) {
+                this.lastStepIndex = -1;
+                this.pendingTools = [];
+                this.entries = [];
+                this.subagents.clear();
+                this.convToTaskId.clear();
+                this.childCursors.clear();
+                this.lastContextUsage = null;
+            }
+            this.offset = chunk.nextOffset;
+            this.remainder = chunk.nextRemainder;
+            if (chunk.lines.length > 0) {
+                let fullStepsMap;
+                for (let li = 0; li < chunk.lines.length; li++) {
+                    const line = chunk.lines[li].trim();
+                    if (!line.startsWith("{"))
+                        continue;
+                    let step;
+                    try {
+                        step = JSON.parse(line);
+                    }
+                    catch {
+                        continue;
+                    }
+                    const idx = typeof step.step_index === "number" ? step.step_index : this.lastStepIndex + 1;
+                    if (idx <= this.lastStepIndex)
+                        continue;
+                    this.lastStepIndex = idx;
+                    const truncFields = Array.isArray(step.truncated_fields) ? step.truncated_fields : null;
+                    const hasTrunc = Boolean(truncFields && (truncFields.includes("content") || truncFields.includes("tool_calls")));
+                    const isTailLine = li >= chunk.lines.length - 5;
+                    const isTailPlannerOrSys = (isTailLine && (step.type === "PLANNER_RESPONSE" || step.type === "SYSTEM_MESSAGE")) ||
+                        (step.type === "SYSTEM_MESSAGE" && this.convToTaskId.size > 0);
+                    const isSubagentToolCall = step.type === "PLANNER_RESPONSE" &&
+                        Boolean(truncFields?.includes("tool_calls")) &&
+                        Array.isArray(step.tool_calls) &&
+                        step.tool_calls.some((tc) => tc?.name === "invoke_subagent");
+                    if (hasTrunc && (isTailPlannerOrSys || isSubagentToolCall)) {
+                        if (fullStepsMap === undefined) {
+                            fullStepsMap = readFullStepsMap(this.transcriptPath);
+                        }
+                        const full = fullStepsMap?.get(idx);
+                        if (full)
+                            step = full;
+                    }
+                    this.processStep(step, idx, liveEvents);
+                }
+                if (this.entries.length > SNAPSHOT_LIMIT * 2) {
+                    this.entries = this.entries.slice(this.entries.length - SNAPSHOT_LIMIT - 20);
+                }
+            }
+        }
+        this.pollActiveChildren(liveEvents);
+        return liveEvents;
+    }
+    resolveChildTranscriptPath(convId, logAbsoluteUri) {
+        if (!SAFE_CONV_ID_RE.test(convId))
+            return null;
+        if (logAbsoluteUri && typeof logAbsoluteUri === "string") {
             try {
-                step = JSON.parse(line);
+                const url = new URL(logAbsoluteUri);
+                if (url.protocol === "file:") {
+                    const candidate = path.resolve(fileURLToPath(url));
+                    if (path.basename(candidate) === "transcript.jsonl") {
+                        const brainRoot = path.resolve(os.homedir(), ".gemini", "antigravity-cli", "brain");
+                        const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
+                        if (isInside(brainRoot, candidate) || isInside(siblingRoot, candidate)) {
+                            return candidate;
+                        }
+                    }
+                }
             }
             catch {
-                continue;
+                /* fall back to canonical path below */
             }
-            const idx = typeof step.step_index === "number" ? step.step_index : this.lastStepIndex + 1;
-            if (idx <= this.lastStepIndex)
-                continue;
-            this.lastStepIndex = idx;
-            // Only resolve from transcript_full.jsonl for recent tail lines (last 5 lines) to avoid bulk I/O during initial load
-            if (li >= lines.length - 5 &&
-                step.type === "PLANNER_RESPONSE" &&
-                Array.isArray(step.truncated_fields) &&
-                (step.truncated_fields.includes("content") || step.truncated_fields.includes("tool_calls"))) {
-                const full = readFullStep(this.transcriptPath, idx);
-                if (full)
-                    step = full;
+        }
+        try {
+            return resolveAgyTranscriptPath(convId);
+        }
+        catch {
+            return null;
+        }
+    }
+    pollActiveChildren(outEvents) {
+        if (this.childCursors.size === 0)
+            return;
+        for (const convId of this.childCursors.keys()) {
+            this.pollChildCursor(convId, outEvents, true);
+        }
+    }
+    pollChildCursor(convId, outEvents, emitIfChanged) {
+        const cursor = this.childCursors.get(convId);
+        if (!cursor)
+            return;
+        const isRedacted = this.redact();
+        const chunk = readTranscriptChunk(cursor.transcriptPath, cursor.offset, cursor.remainder);
+        if (chunk) {
+            if (chunk.reset) {
+                cursor.lastStepIndex = -1;
+                cursor.tools = [];
+                cursor.toolCalls = 0;
+                cursor.turns = 0;
+                cursor.tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+                cursor.thinking = undefined;
             }
-            this.processStep(step, idx, liveEvents);
+            cursor.offset = chunk.nextOffset;
+            cursor.remainder = chunk.nextRemainder;
+            for (const rawLine of chunk.lines) {
+                const line = rawLine.trim();
+                if (!line.startsWith("{"))
+                    continue;
+                let step;
+                try {
+                    step = JSON.parse(line);
+                }
+                catch {
+                    continue;
+                }
+                const idx = typeof step.step_index === "number" ? step.step_index : cursor.lastStepIndex + 1;
+                if (idx <= cursor.lastStepIndex)
+                    continue;
+                cursor.lastStepIndex = idx;
+                if (step.type === "USER_INPUT" && typeof step.content === "string") {
+                    const m = MODEL_CHANGE_RE.exec(step.content);
+                    if (m?.[1]?.trim()) {
+                        cursor.model = m[1].trim();
+                    }
+                    continue;
+                }
+                if (step.type === "PLANNER_RESPONSE") {
+                    cursor.turns += 1;
+                    if (!isRedacted && typeof step.thinking === "string" && step.thinking.trim()) {
+                        cursor.thinking = truncateBytes(step.thinking.trim(), MAX_SUBAGENT_THINKING_BYTES).text;
+                    }
+                    const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+                    for (let ci = 0; ci < calls.length; ci++) {
+                        const norm = normalizeAgyToolCall(idx, ci, calls[ci]);
+                        cursor.toolCalls += 1;
+                        cursor.tools.push(norm.name);
+                    }
+                    if (cursor.tools.length > MAX_SUBAGENT_TOOLS) {
+                        cursor.tools.splice(0, cursor.tools.length - MAX_SUBAGENT_TOOLS);
+                    }
+                    const inTok = toNonNegInt(step.input_tokens);
+                    const cacheReadTok = toNonNegInt(step.cache_read_tokens);
+                    const cacheWriteTok = toNonNegInt(step.cache_write_tokens);
+                    const outTok = toNonNegInt(step.output_tokens);
+                    const stepTotal = inTok + cacheReadTok + cacheWriteTok + outTok;
+                    if (stepTotal > 0) {
+                        cursor.tokens.input += inTok;
+                        cursor.tokens.output += outTok;
+                        cursor.tokens.cacheRead += cacheReadTok;
+                        cursor.tokens.cacheWrite += cacheWriteTok;
+                        cursor.tokens.total += stepTotal;
+                    }
+                }
+            }
         }
-        // Cap stored entries in memory
-        if (this.entries.length > SNAPSHOT_LIMIT * 2) {
-            this.entries = this.entries.slice(this.entries.length - SNAPSHOT_LIMIT - 20);
+        if (!cursor.model && !cursor.modelChecked) {
+            cursor.modelChecked = true;
+            const ext = readExternalAgentModel("agy", "", cursor.convId);
+            if (ext.id && ext.id !== "antigravity") {
+                cursor.model = ext.id;
+            }
         }
-        return liveEvents;
+        const sub = this.subagents.get(cursor.taskId);
+        if (!sub)
+            return;
+        const next = {
+            ...sub,
+            label: isRedacted ? "[redacted]" : sub.label,
+            tools: [...cursor.tools],
+            ...(cursor.toolCalls > 0 ? { toolCalls: cursor.toolCalls } : {}),
+            ...(cursor.turns > 0 ? { turns: cursor.turns } : {}),
+            ...(cursor.tokens.total > 0 ? { tokens: { ...cursor.tokens } } : {}),
+            ...(cursor.model ? { model: cursor.model } : {}),
+            ...(!isRedacted && cursor.thinking ? { thinking: cursor.thinking } : {}),
+        };
+        if (isRedacted) {
+            delete next.thinking;
+            delete next.result;
+            delete next.error;
+        }
+        if (subagentChanged(sub, next)) {
+            this.setSubagent(cursor.taskId, next);
+            if (emitIfChanged) {
+                outEvents.push(this.cloneSubagent(next, isRedacted));
+            }
+        }
     }
     processStep(step, stepIndex, outEvents) {
         const at = stepTimestampMs(step, stepIndex);
@@ -495,19 +843,43 @@ export class AgyTranscriptReader {
             }
             return;
         }
+        if (step.type === "SYSTEM_MESSAGE") {
+            const parsed = parseSystemWakeup(typeof step.content === "string" ? step.content : "");
+            if (!parsed)
+                return;
+            const taskId = this.convToTaskId.get(parsed.sender);
+            if (!taskId)
+                return;
+            this.pollChildCursor(parsed.sender, outEvents, false);
+            this.convToTaskId.delete(parsed.sender);
+            this.childCursors.delete(parsed.sender);
+            const sub = this.subagents.get(taskId);
+            if (sub) {
+                const completed = {
+                    ...sub,
+                    label: isRedacted ? "[redacted]" : sub.label,
+                    status: "completed",
+                    endedAt: at,
+                    durationMs: Math.max(0, at - (sub.startedAt ?? at)),
+                    ...(!isRedacted && parsed.content
+                        ? { result: truncateBytes(parsed.content, MAX_SUBAGENT_RESULT_BYTES).text }
+                        : {}),
+                };
+                if (isRedacted) {
+                    delete completed.thinking;
+                    delete completed.result;
+                    delete completed.error;
+                }
+                this.setSubagent(taskId, completed);
+                outEvents.push(this.cloneSubagent(completed, isRedacted));
+            }
+            return;
+        }
         if (step.type === "PLANNER_RESPONSE") {
-            const inTok = typeof step.input_tokens === "number" && Number.isFinite(step.input_tokens)
-                ? Math.max(0, Math.floor(step.input_tokens))
-                : 0;
-            const cacheReadTok = typeof step.cache_read_tokens === "number" && Number.isFinite(step.cache_read_tokens)
-                ? Math.max(0, Math.floor(step.cache_read_tokens))
-                : 0;
-            const cacheWriteTok = typeof step.cache_write_tokens === "number" && Number.isFinite(step.cache_write_tokens)
-                ? Math.max(0, Math.floor(step.cache_write_tokens))
-                : 0;
-            const outTok = typeof step.output_tokens === "number" && Number.isFinite(step.output_tokens)
-                ? Math.max(0, Math.floor(step.output_tokens))
-                : 0;
+            const inTok = toNonNegInt(step.input_tokens);
+            const cacheReadTok = toNonNegInt(step.cache_read_tokens);
+            const cacheWriteTok = toNonNegInt(step.cache_write_tokens);
+            const outTok = toNonNegInt(step.output_tokens);
             const totalTok = inTok + cacheReadTok + cacheWriteTok + outTok;
             let stepUsage;
             if (totalTok > 0) {
@@ -535,16 +907,18 @@ export class AgyTranscriptReader {
                 blocks.push({ type: "text", text: truncateBytes(step.content.trim(), LIMITS.resultMaxBytes).text });
             }
             const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-            const normalizedCalls = [];
+            const expandedPerCall = [];
             for (let i = 0; i < calls.length; i++) {
-                const norm = normalizeAgyToolCall(stepIndex, i, calls[i]);
-                normalizedCalls.push(norm);
-                blocks.push({
-                    type: "toolCall",
-                    id: norm.toolCallId,
-                    name: norm.name,
-                    arguments: isRedacted ? {} : norm.args,
-                });
+                const norms = normalizeAgyToolCalls(stepIndex, i, calls[i]);
+                expandedPerCall.push(norms);
+                for (const norm of norms) {
+                    blocks.push({
+                        type: "toolCall",
+                        id: norm.toolCallId,
+                        name: norm.name,
+                        arguments: isRedacted ? {} : norm.args,
+                    });
+                }
             }
             if (blocks.length > 0) {
                 const msg = isRedacted
@@ -555,32 +929,39 @@ export class AgyTranscriptReader {
                     outEvents.push({ type: "message_end", message: msg });
                 }
             }
-            for (const norm of normalizedCalls) {
+            for (const norms of expandedPerCall) {
+                if (norms.length === 0)
+                    continue;
+                const first = norms[0];
+                const subagentIds = norms.filter((n) => Boolean(n.subagentSpec)).map((n) => n.toolCallId);
                 this.pendingTools.push({
-                    toolCallId: norm.toolCallId,
-                    name: norm.name,
-                    args: norm.args,
+                    toolCallId: first.toolCallId,
+                    name: first.name,
+                    args: first.args,
                     at,
-                    subagentSpec: norm.subagentSpec,
+                    subagentSpec: first.subagentSpec,
+                    ...(subagentIds.length > 0 ? { subagentIds } : {}),
                 });
-                outEvents.push({
-                    type: "tool_execution_start",
-                    toolCallId: norm.toolCallId,
-                    toolName: norm.name,
-                    ...(isRedacted ? {} : { args: norm.args }),
-                });
-                if (norm.subagentSpec) {
-                    const sub = {
-                        type: "subagent_update",
-                        taskId: norm.toolCallId,
-                        agent: norm.subagentSpec.typeName,
-                        label: isRedacted ? "[redacted]" : norm.subagentSpec.role,
-                        status: "running",
-                        startedAt: at,
-                        tools: [],
-                    };
-                    this.setSubagent(norm.toolCallId, sub);
-                    outEvents.push(sub);
+                for (const norm of norms) {
+                    outEvents.push({
+                        type: "tool_execution_start",
+                        toolCallId: norm.toolCallId,
+                        toolName: norm.name,
+                        ...(isRedacted ? {} : { args: norm.args }),
+                    });
+                    if (norm.subagentSpec) {
+                        const sub = {
+                            type: "subagent_update",
+                            taskId: norm.toolCallId,
+                            agent: norm.subagentSpec.typeName,
+                            label: isRedacted ? "[redacted]" : norm.subagentSpec.role,
+                            status: "running",
+                            startedAt: at,
+                            tools: [],
+                        };
+                        this.setSubagent(norm.toolCallId, sub);
+                        outEvents.push(this.cloneSubagent(sub, isRedacted));
+                    }
                 }
             }
             return;
@@ -594,42 +975,80 @@ export class AgyTranscriptReader {
                 content: [{ type: "text", text }],
                 ...(truncated ? { truncated: true } : {}),
             };
-            const entryMsg = {
-                role: "toolResult",
-                toolCallId: pending.toolCallId,
-                toolName: pending.name,
-                isError,
-                ...(isRedacted ? {} : { content: resultObj.content }),
-            };
-            this.entries.push({ eid, kind: "tool_result", at, msg: entryMsg });
-            outEvents.push({
-                type: "tool_execution_end",
-                toolCallId: pending.toolCallId,
-                toolName: pending.name,
-                isError,
-                durationMs: Math.max(0, at - pending.at),
-                ...(isRedacted ? {} : { result: resultObj, ...(truncated ? { truncated: true } : {}) }),
-            });
-            const sub = this.subagents.get(pending.toolCallId);
-            if (sub) {
-                const finished = {
-                    ...sub,
-                    status: isError ? "error" : "done",
-                    endedAt: at,
-                    durationMs: Math.max(0, at - (sub.startedAt ?? at)),
-                    ...(isRedacted
-                        ? {}
-                        : isError
-                            ? { error: truncateBytes(rawOut, 4096).text }
-                            : { result: truncateBytes(rawOut, 4096).text }),
+            const targetIds = pending.subagentIds && pending.subagentIds.length > 0 ? pending.subagentIds : [pending.toolCallId];
+            for (let si = 0; si < targetIds.length; si++) {
+                const toolCallId = targetIds[si];
+                const entryMsg = {
+                    role: "toolResult",
+                    toolCallId,
+                    toolName: pending.name,
+                    isError,
+                    ...(isRedacted ? {} : { content: resultObj.content }),
                 };
-                this.setSubagent(pending.toolCallId, finished);
-                outEvents.push(finished);
+                this.entries.push({ eid: si === 0 ? eid : `${eid}:${si}`, kind: "tool_result", at, msg: entryMsg });
+                outEvents.push({
+                    type: "tool_execution_end",
+                    toolCallId,
+                    toolName: pending.name,
+                    isError,
+                    durationMs: Math.max(0, at - pending.at),
+                    ...(isRedacted ? {} : { result: resultObj, ...(truncated ? { truncated: true } : {}) }),
+                });
+            }
+            if (pending.subagentIds && pending.subagentIds.length > 0) {
+                const refs = isError ? [] : parseSpawnedSubagentRefs(rawOut);
+                const hasValidAck = !isError && refs.some(Boolean);
+                for (let si = 0; si < pending.subagentIds.length; si++) {
+                    const subId = pending.subagentIds[si];
+                    const sub = this.subagents.get(subId);
+                    if (!sub)
+                        continue;
+                    const ref = hasValidAck ? refs[si] ?? null : null;
+                    if (ref) {
+                        const childPath = this.resolveChildTranscriptPath(ref.conversationId, ref.logAbsoluteUri);
+                        if (childPath) {
+                            this.convToTaskId.set(ref.conversationId, subId);
+                            this.childCursors.set(ref.conversationId, {
+                                taskId: subId,
+                                convId: ref.conversationId,
+                                transcriptPath: childPath,
+                                offset: 0,
+                                remainder: "",
+                                lastStepIndex: -1,
+                                tools: [],
+                                toolCalls: 0,
+                                turns: 0,
+                                tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                                modelChecked: false,
+                            });
+                        }
+                        continue;
+                    }
+                    const finished = {
+                        ...sub,
+                        label: isRedacted ? "[redacted]" : sub.label,
+                        status: isError ? "error" : "done",
+                        endedAt: at,
+                        durationMs: Math.max(0, at - (sub.startedAt ?? at)),
+                        ...(isRedacted
+                            ? {}
+                            : isError
+                                ? { error: truncateBytes(rawOut, MAX_SUBAGENT_RESULT_BYTES).text }
+                                : { result: truncateBytes(rawOut, MAX_SUBAGENT_RESULT_BYTES).text }),
+                    };
+                    if (isRedacted) {
+                        delete finished.thinking;
+                        delete finished.result;
+                        delete finished.error;
+                    }
+                    this.setSubagent(subId, finished);
+                    outEvents.push(this.cloneSubagent(finished, isRedacted));
+                }
+                return;
             }
         }
     }
     setSubagent(taskId, sub) {
-        this.subagents.delete(taskId);
         this.subagents.set(taskId, sub);
         while (this.subagents.size > MAX_SUBAGENTS) {
             let victim;
@@ -644,6 +1063,12 @@ export class AgyTranscriptReader {
             if (!victim)
                 break;
             this.subagents.delete(victim);
+            for (const [convId, mappedTaskId] of this.convToTaskId) {
+                if (mappedTaskId === victim) {
+                    this.convToTaskId.delete(convId);
+                    this.childCursors.delete(convId);
+                }
+            }
         }
     }
 }
