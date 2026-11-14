@@ -8,7 +8,7 @@ import { SNAPSHOT_LIMIT } from "../extension/snapshot.ts";
 import { LIMITS } from "../extension/forwarder.ts";
 import type { SubagentTokens, SubagentUpdateEvent } from "../shared/protocol.ts";
 import { SAFE_CONV_ID_RE, truncateBytes } from "../shared/util.ts";
-import { readExternalAgentModel } from "./bridge/external-metadata.ts";
+import { readAgySessionModel } from "./bridge/external-metadata.ts";
 import { isInside } from "./validate.ts";
 
 const MAX_SUBAGENTS = 100;
@@ -65,6 +65,7 @@ export interface NormalizedAgyTool {
     role: string;
     typeName: string;
     prompt: string;
+    model?: string;
   };
 }
 
@@ -257,6 +258,11 @@ function normalizeInvokeSubagentEntry(
     src.TypeName ?? src.typeName ?? src.type_name ?? parsed.TypeName ?? parsed.typeName ?? "subagent",
   );
   const prompt = String(src.Prompt ?? src.prompt ?? parsed.Prompt ?? parsed.prompt ?? "");
+  const rawModel = src.Model ?? src.model ?? parsed.Model ?? parsed.model;
+  const requestedModel =
+    typeof rawModel === "string" && rawModel.trim() && rawModel.trim().toLowerCase() !== "inherit"
+      ? rawModel.trim()
+      : undefined;
   return {
     toolCallId,
     name: "subagent_run",
@@ -264,8 +270,9 @@ function normalizeInvokeSubagentEntry(
       agent: typeName,
       label: role,
       task: truncateBytes(prompt, 500).text,
+      ...(requestedModel ? { model: requestedModel } : {}),
     },
-    subagentSpec: { role, typeName, prompt },
+    subagentSpec: { role, typeName, prompt, ...(requestedModel ? { model: requestedModel } : {}) },
   };
 }
 
@@ -336,6 +343,20 @@ export function resolveAgyTranscriptPath(conversationId: string, home = os.homed
     throw new Error("transcript path escapes brain directory");
   }
   return resolved;
+}
+
+function inferAgyHomeFromTranscriptPath(transcriptPath: string): string {
+  const resolved = path.resolve(transcriptPath);
+  const logsDir = path.dirname(resolved);
+  const sysDir = path.dirname(logsDir);
+  const convDir = path.dirname(sysDir);
+  const brainDir = path.dirname(convDir);
+  const cliDir = path.dirname(brainDir);
+  const geminiDir = path.dirname(cliDir);
+  if (path.basename(cliDir) === "antigravity-cli" && path.basename(geminiDir) === ".gemini") {
+    return path.dirname(geminiDir);
+  }
+  return os.homedir();
 }
 
 /** Build a step_index -> AgyStepRaw map from the last 512 KB of transcript_full.jsonl. */
@@ -588,7 +609,7 @@ interface ChildCursor {
   tokens: Required<Pick<SubagentTokens, "input" | "output" | "cacheRead" | "cacheWrite" | "total">>;
   thinking?: string;
   model?: string;
-  modelChecked: boolean;
+  modelFromSession: boolean;
 }
 
 interface PendingTool {
@@ -596,7 +617,7 @@ interface PendingTool {
   name: string;
   args: Record<string, unknown>;
   at: number;
-  subagentSpec?: { role: string; typeName: string; prompt: string };
+  subagentSpec?: { role: string; typeName: string; prompt: string; model?: string };
   subagentIds?: string[];
 }
 
@@ -803,7 +824,8 @@ export class AgyTranscriptReader {
         if (url.protocol === "file:") {
           const candidate = path.resolve(fileURLToPath(url));
           if (path.basename(candidate) === "transcript.jsonl") {
-            const brainRoot = path.resolve(os.homedir(), ".gemini", "antigravity-cli", "brain");
+            const homeDir = inferAgyHomeFromTranscriptPath(this.transcriptPath);
+            const brainRoot = path.resolve(homeDir, ".gemini", "antigravity-cli", "brain");
             const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
             if (isInside(brainRoot, candidate) || isInside(siblingRoot, candidate)) {
               return candidate;
@@ -815,7 +837,7 @@ export class AgyTranscriptReader {
       }
     }
     try {
-      return resolveAgyTranscriptPath(convId);
+      return resolveAgyTranscriptPath(convId, inferAgyHomeFromTranscriptPath(this.transcriptPath));
     } catch {
       return null;
     }
@@ -862,6 +884,7 @@ export class AgyTranscriptReader {
           const m = MODEL_CHANGE_RE.exec(step.content);
           if (m?.[1]?.trim()) {
             cursor.model = m[1].trim();
+            cursor.modelFromSession = true;
           }
           continue;
         }
@@ -896,11 +919,12 @@ export class AgyTranscriptReader {
       }
     }
 
-    if (!cursor.model && !cursor.modelChecked) {
-      cursor.modelChecked = true;
-      const ext = readExternalAgentModel("agy", "", cursor.convId);
-      if (ext.id && ext.id !== "antigravity") {
-        cursor.model = ext.id;
+    if (!cursor.modelFromSession) {
+      const homeDir = inferAgyHomeFromTranscriptPath(cursor.transcriptPath);
+      const { model: sessionModel } = readAgySessionModel(cursor.convId, homeDir);
+      if (sessionModel) {
+        cursor.model = sessionModel;
+        cursor.modelFromSession = true;
       }
     }
 
@@ -1082,6 +1106,7 @@ export class AgyTranscriptReader {
               label: isRedacted ? "[redacted]" : norm.subagentSpec.role,
               status: "running",
               startedAt: at,
+              ...(norm.subagentSpec.model ? { model: norm.subagentSpec.model } : {}),
               tools: [],
             };
             this.setSubagent(norm.toolCallId, sub);
@@ -1146,7 +1171,8 @@ export class AgyTranscriptReader {
                 toolCalls: 0,
                 turns: 0,
                 tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-                modelChecked: false,
+                ...(sub.model ? { model: sub.model } : {}),
+                modelFromSession: false,
               });
             }
             continue;

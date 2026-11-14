@@ -240,7 +240,7 @@ function extractAgyModelFromGenMetadataBlob(buf) {
     }
     return null;
 }
-function readAgySessionModel(sessionId, home) {
+export function readAgySessionModel(sessionId, home = os.homedir()) {
     if (!sessionId || !SAFE_CONV_ID_RE.test(sessionId))
         return { model: null, uncertain: false };
     let transcriptChangeModel = null;

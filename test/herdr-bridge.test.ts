@@ -2,6 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG, type RpConfig } from "../src/extension/config.ts";
@@ -2087,6 +2088,84 @@ describe("herdr-bridge & PreToolUse gate", () => {
     } finally {
       homeSpy.mockRestore();
       vi.useRealTimers();
+    }
+  });
+
+  it("tracks child subagent model from requested Model arg and child session db instead of locking global settings.json", () => {
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-sub-model-"));
+    tmpDirs.push(homeDir);
+    const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(homeDir);
+    try {
+      const agyCliDir = path.join(homeDir, ".gemini", "antigravity-cli");
+    fs.mkdirSync(path.join(agyCliDir, "conversations"), { recursive: true });
+    fs.writeFileSync(path.join(agyCliDir, "settings.json"), JSON.stringify({ model: "Gemini 4 Hydrogen (High)" }));
+
+    const parentConv = "conv-parent-model";
+    const childConv = "conv-child-flash";
+    const parentPath = resolveAgyTranscriptPath(parentConv, homeDir);
+    const childPath = resolveAgyTranscriptPath(childConv, homeDir);
+    fs.mkdirSync(path.dirname(parentPath), { recursive: true });
+    fs.mkdirSync(path.dirname(childPath), { recursive: true });
+
+    fs.writeFileSync(
+      parentPath,
+      [
+        {
+          step_index: 0,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-14T10:00:00Z",
+          tool_calls: [
+            {
+              name: "invoke_subagent",
+              args: { Role: "Flash Probe", TypeName: "research", Model: "flash", Prompt: "Check" },
+            },
+          ],
+        },
+        {
+          step_index: 1,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-14T10:00:01Z",
+          content: JSON.stringify({ conversationId: childConv, logAbsoluteUri: pathToFileURL(childPath).href }),
+        },
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+    );
+
+    const reader = new AgyTranscriptReader(parentPath);
+    const firstEvents = reader.pollNewEvents();
+    const initialSub = firstEvents.find((e) => e.type === "subagent_update") as any;
+    expect(initialSub?.model).toBe("flash");
+    expect(reader.getSubagents()[0]?.model).toBe("flash");
+
+    // Once the child conversation writes gen_metadata to its own sqlite db, poll upgrades model cleanly
+    const db = new DatabaseSync(path.join(agyCliDir, "conversations", `${childConv}.db`));
+    try {
+      db.exec("CREATE TABLE gen_metadata (idx INTEGER, data BLOB)");
+      const modelId = "gemini-3.8-flash-tiered";
+      const blob = Buffer.concat([Buffer.from([0xaa, 0x01, modelId.length]), Buffer.from(modelId, "utf8")]);
+      db.prepare("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)").run(1, blob);
+    } finally {
+      db.close();
+    }
+
+    fs.writeFileSync(
+      childPath,
+      JSON.stringify({
+        step_index: 0,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-14T10:00:02Z",
+        tool_calls: [{ name: "read_file", args: { Path: "/repo/a.ts" } }],
+      }) + "\n",
+    );
+
+    const secondEvents = reader.pollNewEvents();
+    const upgradedSub = secondEvents.find((e) => e.type === "subagent_update") as any;
+    expect(upgradedSub?.model).toBe("gemini-3.8-flash-tiered");
+    expect(reader.getSubagents()[0]?.model).toBe("gemini-3.8-flash-tiered");
+    } finally {
+      homeSpy.mockRestore();
     }
   });
 });

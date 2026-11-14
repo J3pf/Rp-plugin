@@ -236,7 +236,7 @@ function extractAgyModelFromGenMetadataBlob(buf: Buffer): string | null {
   return null;
 }
 
-function readAgySessionModel(sessionId: string | null, home: string): { model: string | null; uncertain: boolean } {
+export function readAgySessionModel(sessionId: string | null, home = os.homedir()): { model: string | null; uncertain: boolean } {
   if (!sessionId || !SAFE_CONV_ID_RE.test(sessionId)) return { model: null, uncertain: false };
   let transcriptChangeModel: string | null = null;
   let lastUserInputChangeModel: string | null = null;
