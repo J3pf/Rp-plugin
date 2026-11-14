@@ -5,6 +5,14 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-11-14
+
+Extension startup event preservation and Gentle Shell e2e compatibility fixes.
+
+### Fixed
+- **Initial Snapshot Event Preservation**: Passed `welcome.lastSeq` to `Runtime.sendSnapshot` and kept unacknowledged pre-welcome events queued instead of dropping `agent_start`/`agent_settled` events that fire before the initial `agent.welcome`.
+- **Gentle Shell E2E Compatibility (`gentle-pi >= 4.8`)**: Invoked `/gentle:mode status` explicitly after the input prompt mounts and disabled background `rp-host` autostart and async `skill-registry` startup notifications in `gentle-shell-e2e` so status notifications are not overwritten in place.
+
 ## [0.4.2] - 2026-11-14
 
 Security hardening, serialized Herdr bridge delivery & status reconciliation, non-blocking extension/host handshakes, and modular helper extraction.
