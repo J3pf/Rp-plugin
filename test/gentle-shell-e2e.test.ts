@@ -59,6 +59,7 @@ function env(extra: Record<string, string> = {}) {
     PATH: `${path.join(tmp, "bin")}:${process.env.PATH}`,
     PI_OFFLINE: "1",
     GENTLE_SHELL_NO_AUTO_SETUP: "1",
+    GENTLE_PI_NO_SKILL_REGISTRY: "1",
     RP_NO_AUTO_HOST: "1",
     FAUX_SCRIPT: path.join(tmp, "script.json"),
     FAUX_LOG: path.join(tmp, "faux.log"),
