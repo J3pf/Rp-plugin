@@ -59,6 +59,7 @@ function env(extra: Record<string, string> = {}) {
     PATH: `${path.join(tmp, "bin")}:${process.env.PATH}`,
     PI_OFFLINE: "1",
     GENTLE_SHELL_NO_AUTO_SETUP: "1",
+    RP_NO_AUTO_HOST: "1",
     FAUX_SCRIPT: path.join(tmp, "script.json"),
     FAUX_LOG: path.join(tmp, "faux.log"),
     RP_CONFIG: path.join(tmp, "rp.json"),
@@ -138,7 +139,7 @@ describe.skipIf(!hasTmux)("real gentle-shell + gentle-pi", () => {
     install();
     launchShell([{ text: "x" }]);
     await waitUntil(() => relay.of("agent.hello")[0], 60000);
-    await waitScreen("faux-1");
+    await waitScreen("waiting for input");
     relay.push("user.message", { clientMsgId: "gs-2", text: "/gentle:mode status", asCommand: true });
     await waitUntil(() => relay.of("user.message.ack")[0], 15000);
     expect(relay.of("user.message.ack")[0]!.d).toMatchObject({ disposition: "command", method: "api" });
