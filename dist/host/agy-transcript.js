@@ -4,12 +4,11 @@ import path from "node:path";
 import os from "node:os";
 import { SNAPSHOT_LIMIT } from "../extension/snapshot.js";
 import { LIMITS } from "../extension/forwarder.js";
-import { truncateBytes } from "../shared/util.js";
+import { SAFE_CONV_ID_RE, truncateBytes } from "../shared/util.js";
 import { isInside } from "./validate.js";
 const MAX_SUBAGENTS = 100;
 const MAX_POLL_DELTA_BYTES = 2 * 1024 * 1024;
 const MAX_REMAINDER_BYTES = 1024 * 1024;
-const SAFE_CONV_ID_RE = /^[0-9a-zA-Z_][0-9a-zA-Z_-]{0,127}$/;
 /** Empirical context window before Antigravity CLI (agy) triggers conversation compaction (~256k tokens). */
 export const AGY_CONTEXT_WINDOW = 256_000;
 const USER_REQ_RE = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i;
@@ -321,6 +320,9 @@ export class AgyTranscriptReader {
         return this.lastContextUsage ? { ...this.lastContextUsage } : null;
     }
     /** Return a compact description of the currently executing tool call, if any. */
+    get byteOffset() {
+        return this.offset;
+    }
     getActiveTask() {
         if (this.redact() || this.pendingTools.length === 0)
             return null;

@@ -5,8 +5,6 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
-import { DatabaseSync } from "node:sqlite";
 import { Connection } from "../extension/connection.js";
 import { resolveInboxDir } from "../extension/config.js";
 import { relayBlobFetcher, resolveAttachments } from "../extension/attachments.js";
@@ -17,11 +15,16 @@ import { ALLOW, ALLOW_SESSION, DENY, DENY_REASON, allowKey, compilePatterns, dec
 import { pluginVersion } from "../extension/version.js";
 import { parseJson, pick } from "./backends/herdr.js";
 import { run as realRun } from "./runner.js";
-import { AgyTranscriptReader, parseAgyArgs, resolveAgyTranscriptPath } from "./agy-transcript.js";
+import { AgyTranscriptReader, resolveAgyTranscriptPath } from "./agy-transcript.js";
+import { readGitHeadAndDirty } from "./git.js";
+import { parseTerminalContextUsage, readExternalAgentContextUsage, readExternalAgentModel, readExternalAgentModelWithState, } from "./bridge/external-metadata.js";
+import { AGY_GATE_SOCKET_TIMEOUT_MS, GATE_MAX_LINE_BYTES, gateSocketPath, installAgyHooks, probeUnixSocketAlive, runAgyHook, sanitizeIdPart, signGatePayload, verifyGateSignature, } from "./bridge/agy-hooks.js";
 import { configDir } from "../shared/platform.js";
-import { newId, } from "../shared/protocol.js";
-import { LruSet, errMsg, safeUser, truncateBytes } from "../shared/util.js";
+import { encodeHerdrTabId, newId, } from "../shared/protocol.js";
+import { LruSet, SAFE_CONV_ID_RE, errMsg, safeUser, stripAnsi, truncateBytes } from "../shared/util.js";
+export { gateSocketPath, installAgyHooks, parseTerminalContextUsage, readExternalAgentContextUsage, readExternalAgentModel, runAgyHook, };
 const CONV_RE = /--conversation\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+const OPTIMISTIC_WORKING_MS = 8_000;
 export function mapHerdrAgentStatus(rawStatus) {
     switch (rawStatus) {
         case "working":
@@ -94,394 +97,6 @@ export function extractRecentCommandOutput(terminalText, commandText) {
     }
     return terminalText;
 }
-const CLAUDE_DEFAULT_WINDOW = 200_000;
-const CODEX_DEFAULT_WINDOW = 258_400;
-function readJsonlTailLines(filePath, maxBytes = 64 * 1024) {
-    try {
-        const stat = fs.statSync(filePath);
-        if (!stat.isFile() || stat.size <= 0)
-            return [];
-        const readSize = Math.min(stat.size, maxBytes);
-        const fd = fs.openSync(filePath, "r");
-        try {
-            const buf = Buffer.allocUnsafe(readSize);
-            fs.readSync(fd, buf, 0, readSize, stat.size - readSize);
-            const lines = buf.toString("utf8").split("\n");
-            if (readSize < stat.size && lines.length > 0)
-                lines.shift();
-            return lines;
-        }
-        finally {
-            fs.closeSync(fd);
-        }
-    }
-    catch {
-        return [];
-    }
-}
-function readClaudeContextUsage(cwd, sessionId, home) {
-    try {
-        const slug = path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
-        const projDir = path.join(home, ".claude", "projects", slug);
-        if (!fs.existsSync(projDir))
-            return null;
-        let targetFile = null;
-        if (sessionId) {
-            const candidate = path.join(projDir, `${sessionId}.jsonl`);
-            if (fs.existsSync(candidate))
-                targetFile = candidate;
-        }
-        if (!targetFile) {
-            const files = fs
-                .readdirSync(projDir)
-                .filter((f) => f.endsWith(".jsonl"))
-                .map((f) => {
-                const full = path.join(projDir, f);
-                try {
-                    return { full, mtimeMs: fs.statSync(full).mtimeMs };
-                }
-                catch {
-                    return { full, mtimeMs: 0 };
-                }
-            })
-                .filter((f) => f.mtimeMs > 0)
-                .sort((a, b) => b.mtimeMs - a.mtimeMs);
-            if (files.length > 0)
-                targetFile = files[0].full;
-        }
-        if (!targetFile)
-            return null;
-        const lines = readJsonlTailLines(targetFile);
-        for (let i = lines.length - 1; i >= 0; i--) {
-            const line = lines[i].trim();
-            if (!line.startsWith("{"))
-                continue;
-            try {
-                const obj = JSON.parse(line);
-                const usage = obj?.message?.usage ?? obj?.usage;
-                if (usage && typeof usage === "object") {
-                    const inTok = Number(usage.input_tokens ?? 0) || 0;
-                    const cacheCreate = Number(usage.cache_creation_input_tokens ?? 0) || 0;
-                    const cacheRead = Number(usage.cache_read_input_tokens ?? 0) || 0;
-                    const outTok = Number(usage.output_tokens ?? 0) || 0;
-                    const total = Math.max(0, Math.floor(inTok + cacheCreate + cacheRead + outTok));
-                    if (total > 0) {
-                        const pct = Math.min(100, Math.max(0, Math.round((total / CLAUDE_DEFAULT_WINDOW) * 100)));
-                        return { tokens: total, contextWindow: CLAUDE_DEFAULT_WINDOW, percent: pct };
-                    }
-                }
-            }
-            catch {
-                /* ignore malformed line */
-            }
-        }
-    }
-    catch {
-        /* ignore */
-    }
-    return null;
-}
-function readCodexContextUsage(cwd, sessionId, home) {
-    try {
-        const sessionsRoot = path.join(home, ".codex", "sessions");
-        if (!fs.existsSync(sessionsRoot))
-            return null;
-        const years = fs.readdirSync(sessionsRoot).sort().reverse();
-        const candidates = [];
-        for (const y of years.slice(0, 2)) {
-            const yDir = path.join(sessionsRoot, y);
-            if (!fs.statSync(yDir, { throwIfNoEntry: false })?.isDirectory())
-                continue;
-            const months = fs.readdirSync(yDir).sort().reverse();
-            for (const m of months.slice(0, 2)) {
-                const mDir = path.join(yDir, m);
-                if (!fs.statSync(mDir, { throwIfNoEntry: false })?.isDirectory())
-                    continue;
-                const days = fs.readdirSync(mDir).sort().reverse();
-                for (const d of days.slice(0, 3)) {
-                    const dDir = path.join(mDir, d);
-                    if (!fs.statSync(dDir, { throwIfNoEntry: false })?.isDirectory())
-                        continue;
-                    for (const f of fs.readdirSync(dDir)) {
-                        if (!f.endsWith(".jsonl"))
-                            continue;
-                        const full = path.join(dDir, f);
-                        try {
-                            candidates.push({ full, mtimeMs: fs.statSync(full).mtimeMs });
-                        }
-                        catch {
-                            /* ignore */
-                        }
-                    }
-                }
-            }
-        }
-        candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-        for (const cand of candidates.slice(0, 8)) {
-            if (sessionId && !path.basename(cand.full).includes(sessionId))
-                continue;
-            if (!sessionId && cwd) {
-                const headLines = readJsonlTailLines(cand.full, 4096);
-                const firstLine = headLines[0]?.trim();
-                if (firstLine?.startsWith("{")) {
-                    try {
-                        const meta = JSON.parse(firstLine);
-                        if (meta?.type === "session_meta" && meta?.payload?.cwd && path.resolve(meta.payload.cwd) !== path.resolve(cwd)) {
-                            continue;
-                        }
-                    }
-                    catch {
-                        /* ignore */
-                    }
-                }
-            }
-            const lines = readJsonlTailLines(cand.full);
-            for (let i = lines.length - 1; i >= 0; i--) {
-                const line = lines[i].trim();
-                if (!line.startsWith("{"))
-                    continue;
-                try {
-                    const obj = JSON.parse(line);
-                    if (obj?.payload?.type === "token_count" && obj?.payload?.info?.last_token_usage) {
-                        const total = Math.max(0, Math.floor(Number(obj.payload.info.last_token_usage.total_tokens ?? 0)));
-                        const win = Math.max(1, Math.floor(Number(obj.payload.info.model_context_window ?? CODEX_DEFAULT_WINDOW)));
-                        if (total > 0) {
-                            const pct = Math.min(100, Math.max(0, Math.round((total / win) * 100)));
-                            return { tokens: total, contextWindow: win, percent: pct };
-                        }
-                    }
-                }
-                catch {
-                    /* ignore */
-                }
-            }
-        }
-    }
-    catch {
-        /* ignore */
-    }
-    return null;
-}
-export function parseTerminalContextUsage(terminalText, defaultWindow = CLAUDE_DEFAULT_WINDOW) {
-    if (!terminalText)
-        return null;
-    const slashMatch = /(\d+(?:\.\d+)?)\s*k\s*\/\s*(\d+(?:\.\d+)?)\s*k/i.exec(terminalText);
-    if (slashMatch) {
-        const tokens = Math.round(Number.parseFloat(slashMatch[1]) * 1000);
-        const window = Math.round(Number.parseFloat(slashMatch[2]) * 1000);
-        if (tokens > 0 && window > 0 && tokens <= window * 2) {
-            const percent = Math.min(100, Math.max(0, Math.round((tokens / window) * 100)));
-            return { tokens, contextWindow: window, percent };
-        }
-    }
-    const leftMatch = /(\d{1,3})%\s+context\s+left/i.exec(terminalText);
-    if (leftMatch) {
-        const leftPct = Number.parseInt(leftMatch[1], 10);
-        if (leftPct >= 0 && leftPct <= 100) {
-            const percent = 100 - leftPct;
-            const tokens = Math.round((percent / 100) * defaultWindow);
-            return { tokens, contextWindow: defaultWindow, percent };
-        }
-    }
-    const usedMatch = /context(?:\s+used)?[:\s]+(\d{1,3})%/i.exec(terminalText);
-    if (usedMatch) {
-        const percent = Number.parseInt(usedMatch[1], 10);
-        if (percent >= 0 && percent <= 100) {
-            const tokens = Math.round((percent / 100) * defaultWindow);
-            return { tokens, contextWindow: defaultWindow, percent };
-        }
-    }
-    return null;
-}
-export function readExternalAgentContextUsage(agent, cwd, sessionId, terminalText = "", home = os.homedir()) {
-    if (agent === "claude") {
-        return readClaudeContextUsage(cwd, sessionId, home) ?? parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW);
-    }
-    if (agent === "codex") {
-        return readCodexContextUsage(cwd, sessionId, home) ?? parseTerminalContextUsage(terminalText, CODEX_DEFAULT_WINDOW);
-    }
-    return parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW);
-}
-function extractAgyModelFromGenMetadataBlob(buf) {
-    const tail = buf.subarray(Math.max(0, buf.length - 600));
-    for (const tagByte of [0xaa, 0x9a]) {
-        for (let i = tail.length - 4; i >= 0; i--) {
-            if (tail[i] === tagByte && tail[i + 1] === 0x01) {
-                const len = tail[i + 2];
-                if (len >= 3 && len <= 80 && i + 3 + len <= tail.length) {
-                    const s = tail.subarray(i + 3, i + 3 + len).toString("utf8").trim();
-                    if (/^[A-Za-z0-9][A-Za-z0-9 ._()/-]+$/.test(s) &&
-                        !/^[0-9a-f-]{32,}$/i.test(s) &&
-                        s !== "false" &&
-                        s !== "true") {
-                        return s;
-                    }
-                }
-            }
-        }
-    }
-    return null;
-}
-function readAgySessionModel(sessionId, home) {
-    if (!sessionId || !/^[a-zA-Z0-9._-]+$/.test(sessionId))
-        return null;
-    let transcriptChangeModel = null;
-    let lastUserInputChangeModel = null;
-    try {
-        const tPath = resolveAgyTranscriptPath(sessionId, home);
-        const lines = readJsonlTailLines(tPath, 256 * 1024);
-        let seenLatestUserInput = false;
-        for (let i = lines.length - 1; i >= 0; i--) {
-            const line = lines[i].trim();
-            if (!line.startsWith("{"))
-                continue;
-            try {
-                const obj = JSON.parse(line);
-                if (obj?.type === "USER_INPUT" && typeof obj?.content === "string") {
-                    const m = /changed setting `Model Selection` from [^\n]+ to ([^\n.<]+)\./i.exec(obj.content);
-                    if (m?.[1]?.trim()) {
-                        const candidate = m[1].trim();
-                        if (!transcriptChangeModel)
-                            transcriptChangeModel = candidate;
-                        if (!seenLatestUserInput)
-                            lastUserInputChangeModel = candidate;
-                    }
-                    seenLatestUserInput = true;
-                    if (transcriptChangeModel)
-                        break;
-                }
-            }
-            catch {
-                /* ignore */
-            }
-        }
-    }
-    catch {
-        /* ignore */
-    }
-    if (lastUserInputChangeModel)
-        return lastUserInputChangeModel;
-    try {
-        const dbPath = path.join(home, ".gemini", "antigravity-cli", "conversations", `${sessionId}.db`);
-        if (fs.existsSync(dbPath)) {
-            const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
-            try {
-                const row = db.prepare("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1").get();
-                if (row?.data) {
-                    const fromDb = extractAgyModelFromGenMetadataBlob(Buffer.from(row.data));
-                    if (fromDb)
-                        return fromDb;
-                }
-            }
-            finally {
-                db.close();
-            }
-        }
-    }
-    catch {
-        /* ignore */
-    }
-    return transcriptChangeModel;
-}
-export function readExternalAgentModel(agent, cwd, sessionId, home = os.homedir()) {
-    if (agent === "agy") {
-        const sessionModel = readAgySessionModel(sessionId, home);
-        if (sessionModel) {
-            return { provider: "google", id: sessionModel };
-        }
-        try {
-            const settingsPath = path.join(home, ".gemini", "antigravity-cli", "settings.json");
-            if (fs.existsSync(settingsPath)) {
-                const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-                if (typeof parsed?.model === "string" && parsed.model.trim()) {
-                    return { provider: "google", id: parsed.model.trim() };
-                }
-            }
-        }
-        catch {
-            /* ignore */
-        }
-        return { provider: "google", id: "antigravity" };
-    }
-    if (agent === "claude") {
-        try {
-            const slug = path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
-            const projDir = path.join(home, ".claude", "projects", slug);
-            if (fs.existsSync(projDir)) {
-                let targetFile = null;
-                if (sessionId) {
-                    const candidate = path.join(projDir, `${sessionId}.jsonl`);
-                    if (fs.existsSync(candidate))
-                        targetFile = candidate;
-                }
-                if (!targetFile) {
-                    const files = fs
-                        .readdirSync(projDir)
-                        .filter((f) => f.endsWith(".jsonl"))
-                        .map((f) => {
-                        const full = path.join(projDir, f);
-                        try {
-                            return { full, mtimeMs: fs.statSync(full).mtimeMs };
-                        }
-                        catch {
-                            return { full, mtimeMs: 0 };
-                        }
-                    })
-                        .filter((f) => f.mtimeMs > 0)
-                        .sort((a, b) => b.mtimeMs - a.mtimeMs);
-                    if (files.length > 0)
-                        targetFile = files[0].full;
-                }
-                if (targetFile) {
-                    const lines = readJsonlTailLines(targetFile);
-                    for (let i = lines.length - 1; i >= 0; i--) {
-                        const line = lines[i].trim();
-                        if (!line.startsWith("{"))
-                            continue;
-                        try {
-                            const obj = JSON.parse(line);
-                            const model = obj?.message?.model ?? obj?.model;
-                            if (typeof model === "string" && model.trim()) {
-                                return { provider: "anthropic", id: model.trim() };
-                            }
-                        }
-                        catch {
-                            /* ignore */
-                        }
-                    }
-                }
-            }
-            const claudeSettings = path.join(home, ".claude", "settings.json");
-            if (fs.existsSync(claudeSettings)) {
-                const parsed = JSON.parse(fs.readFileSync(claudeSettings, "utf8"));
-                if (typeof parsed?.model === "string" && parsed.model.trim()) {
-                    return { provider: "anthropic", id: parsed.model.trim() };
-                }
-            }
-        }
-        catch {
-            /* ignore */
-        }
-        return { provider: "anthropic", id: "claude" };
-    }
-    if (agent === "codex") {
-        try {
-            const cfgToml = path.join(home, ".codex", "config.toml");
-            if (fs.existsSync(cfgToml)) {
-                const text = fs.readFileSync(cfgToml, "utf8");
-                const m = /^\s*model\s*=\s*["']([^"']+)["']/m.exec(text);
-                if (m?.[1]?.trim()) {
-                    return { provider: "openai", id: m[1].trim() };
-                }
-            }
-        }
-        catch {
-            /* ignore */
-        }
-        return { provider: "openai", id: "codex" };
-    }
-    return { provider: agent, id: "default" };
-}
 export function parseHerdrAgentList(stdout) {
     const json = parseJson(stdout);
     const list = Array.isArray(json?.result?.agents)
@@ -507,7 +122,7 @@ export function parseHerdrAgentList(stdout) {
             if (m)
                 sessionId = m[1];
         }
-        if (sessionId && !/^[0-9a-zA-Z_][0-9a-zA-Z_-]{0,127}$/.test(sessionId)) {
+        if (sessionId && !SAFE_CONV_ID_RE.test(sessionId)) {
             sessionId = null;
         }
         const cwd = pick(item, ["foreground_cwd", "cwd"]) ?? process.cwd();
@@ -525,16 +140,6 @@ export function parseHerdrAgentList(stdout) {
         });
     }
     return out;
-}
-function sanitizeIdPart(raw) {
-    return raw.replace(/[^a-zA-Z0-9_.:-]/g, "_").slice(0, 80);
-}
-export function gateSocketPath(env = process.env, platform = process.platform) {
-    if (platform === "win32") {
-        const user = sanitizeIdPart(safeUser());
-        return `\\\\.\\pipe\\rp-agy-gate-${user}`;
-    }
-    return path.join(configDir(env, platform), "agy-gate.sock");
 }
 export class BridgedAgentSession {
     info;
@@ -558,6 +163,7 @@ export class BridgedAgentSession {
     lastStateSeq = -1;
     startTimer = null;
     pollTimer = null;
+    pollInFlight = null;
     watcher = null;
     watchDebounce = null;
     lastSentName = "";
@@ -566,23 +172,28 @@ export class BridgedAgentSession {
     lastSentModelId = "";
     externalContextUsage = null;
     currentStatus;
+    lastEmittedStatus;
     optimisticWorkingUntilMs = 0;
+    optimisticTimer = null;
     fallbackTurnTs = 0;
     commandTimer = null;
     closeTimer = null;
     reconnectDebounce = null;
-    constructor(info, d, transcriptOverride) {
+    deliveryTail = Promise.resolve();
+    seenClientMsgIds = new LruSet(500);
+    lastActiveTask = null;
+    constructor(info, d) {
         this.info = info;
         this.d = d;
         const rawKey = info.sessionId || `pane-${info.paneId}`;
         this.sessionKey = sanitizeIdPart(rawKey);
         this.agentId = `${d.machineId}:herdr:${this.sessionKey}`;
         this.currentStatus = info.status;
-        if (info.agent === "agy" && info.sessionId) {
+        this.lastEmittedStatus = info.status;
+        if (!d.retireOnly && info.agent === "agy" && info.sessionId) {
             try {
                 const canonical = resolveAgyTranscriptPath(info.sessionId);
-                const tPath = transcriptOverride && path.resolve(transcriptOverride) === canonical ? canonical : canonical;
-                this.transcriptReader = new AgyTranscriptReader(tPath, () => this.d.cfg.redactContent);
+                this.transcriptReader = new AgyTranscriptReader(canonical, () => this.d.cfg.redactContent);
             }
             catch {
                 this.transcriptReader = null;
@@ -592,9 +203,10 @@ export class BridgedAgentSession {
             agentId: this.agentId,
             send: (t, body) => this.conn.send(t, body),
             hasUI: false,
+            redact: () => this.d.cfg.redactContent,
             classifier: new Classifier(),
             herdr: null,
-            onChange: () => this.syncStatus(),
+            onChange: () => this.reconcileStatus(),
         });
         const makeConn = d.connectionFactory ?? ((o) => new Connection(o));
         this.conn = makeConn({
@@ -607,7 +219,10 @@ export class BridgedAgentSession {
             onMessage: (env) => this.onRelayMessage(env),
             onLog: (m) => d.onLog?.(`[${this.info.agent}:${this.info.paneId}] ${m}`),
         });
-        void this.refreshGit();
+        if (!d.retireOnly) {
+            void this.refreshGit();
+            this.startTranscriptPolling();
+        }
         if (d.startDelayMs && d.startDelayMs > 0) {
             this.startTimer = setTimeout(() => {
                 this.startTimer = null;
@@ -619,7 +234,6 @@ export class BridgedAgentSession {
         else {
             this.conn.start();
         }
-        this.startTranscriptPolling();
     }
     get conversationId() {
         return this.info.sessionId;
@@ -630,22 +244,19 @@ export class BridgedAgentSession {
     get discoveredInfo() {
         return { ...this.info };
     }
+    hasOpenGatePrompts() {
+        return this.broker.openCount > 0;
+    }
     getContextUsage() {
         return this.transcriptReader?.getContextUsage() ?? this.externalContextUsage;
     }
     encodedTabId() {
-        const idx = this.info.orderIndex;
-        const hasOrder = typeof idx === "number" && Number.isFinite(idx) && idx > 0;
-        const isDone = this.effectiveStatus() === "done";
-        const ctx = this.getContextUsage();
-        const hasCtx = !!ctx && ctx.tokens > 0 && ctx.contextWindow > 0;
-        if (!hasOrder && !isDone && !hasCtx) {
-            return this.info.tabId;
-        }
-        const orderPart = hasOrder ? `#${String(Math.floor(idx)).padStart(4, "0")}` : "";
-        const donePart = isDone ? "~done" : "";
-        const ctxPart = hasCtx ? `@${ctx.tokens}/${ctx.contextWindow}` : "";
-        return `${orderPart}${donePart}${ctxPart}|${this.info.tabId ?? ""}`;
+        return encodeHerdrTabId({
+            tabId: this.info.tabId,
+            orderIndex: this.info.orderIndex,
+            isDone: this.effectiveStatus() === "done",
+            context: this.getContextUsage(),
+        });
     }
     syncContextIfChanged(direct = false) {
         const ctx = this.getContextUsage();
@@ -683,22 +294,39 @@ export class BridgedAgentSession {
         }
     }
     syncModelIfChanged() {
-        const nextModel = readExternalAgentModel(this.info.agent, this.info.cwd, this.info.sessionId);
-        if (nextModel.id && nextModel.id !== this.lastSentModelId) {
-            this.lastSentModelId = nextModel.id;
-            if (this.conn.connected && this.initialSnapshotSent) {
-                this.conn.sendDirect("agent.hello", this.makeHello());
-                this.sendEvent({ type: "model_change", model: nextModel });
-            }
-        }
+        if (!this.conn.connected || !this.initialSnapshotSent)
+            return;
+        const { model: nextModel, uncertain } = readExternalAgentModelWithState(this.info.agent, this.info.cwd, this.info.sessionId);
+        if (uncertain || !nextModel.id || nextModel.id === this.lastSentModelId)
+            return;
+        this.lastSentModelId = nextModel.id;
+        this.conn.sendDirect("agent.hello", this.makeHello());
+        this.sendEvent({ type: "model_select", model: nextModel });
     }
     effectiveStatus() {
         if (this.broker.openCount > 0)
             return "waiting_input";
-        if (this.currentStatus === "idle" && Date.now() < this.optimisticWorkingUntilMs) {
+        if ((this.currentStatus === "idle" || this.currentStatus === "done") && Date.now() < this.optimisticWorkingUntilMs) {
             return "working";
         }
         return this.currentStatus;
+    }
+    clearOptimisticWorking() {
+        this.optimisticWorkingUntilMs = 0;
+        if (this.optimisticTimer) {
+            clearTimeout(this.optimisticTimer);
+            this.optimisticTimer = null;
+        }
+    }
+    armOptimisticWorking() {
+        this.optimisticWorkingUntilMs = Date.now() + OPTIMISTIC_WORKING_MS;
+        if (this.optimisticTimer)
+            clearTimeout(this.optimisticTimer);
+        this.optimisticTimer = setTimeout(() => {
+            this.optimisticTimer = null;
+            this.reconcileStatus();
+        }, OPTIMISTIC_WORKING_MS + 50);
+        this.optimisticTimer.unref?.();
     }
     syncStatus() {
         if (this.disposed)
@@ -706,13 +334,30 @@ export class BridgedAgentSession {
         const status = this.effectiveStatus();
         const detail = status === "working" ? (this.transcriptReader?.getActiveTask() ?? null) : null;
         this.lastActiveTask = detail;
+        this.lastEmittedStatus = status;
         this.conn.send("agent.status", { status, ...(detail ? { detail } : {}) });
         this.scheduleNextPoll();
     }
-    lastActiveTask = null;
+    reconcileStatus() {
+        if (this.disposed)
+            return;
+        const prev = this.lastEmittedStatus;
+        const next = this.effectiveStatus();
+        const nextTask = next === "working" ? (this.transcriptReader?.getActiveTask() ?? null) : null;
+        if (next === prev && nextTask === this.lastActiveTask)
+            return;
+        this.syncStatus();
+        if (next === "working" && prev !== "working") {
+            this.sendEvent({ type: "agent_start" });
+        }
+        else if (prev === "working" && (next === "idle" || next === "done")) {
+            void this.pollTranscriptNow();
+            void this.refreshGit();
+            this.sendEvent({ type: "agent_settled", aborted: false });
+        }
+    }
     updateFromHerdr(next) {
         const prevCwd = this.info.cwd;
-        const prevStatus = this.effectiveStatus();
         const prevWorkspace = this.info.workspaceId;
         const prevPane = this.info.paneId;
         const seqChanged = next.stateChangeSeq !== this.lastStateSeq;
@@ -728,10 +373,11 @@ export class BridgedAgentSession {
                 /* ignore invalid sessionId */
             }
         }
-        if (next.status !== "idle") {
-            this.optimisticWorkingUntilMs = 0;
+        if (next.status !== "idle" && next.status !== "done") {
+            this.clearOptimisticWorking();
         }
         const prevTab = this.encodedTabId();
+        const prevEmitted = this.lastEmittedStatus;
         this.info = { ...this.info, ...next };
         this.currentStatus = next.status;
         const nextTab = this.encodedTabId();
@@ -752,19 +398,8 @@ export class BridgedAgentSession {
         if (prevCwd !== next.cwd) {
             void this.refreshGit();
         }
-        if (this.effectiveStatus() !== prevStatus) {
-            this.syncStatus();
-            if (this.effectiveStatus() === "working") {
-                this.sendEvent({ type: "agent_start" });
-            }
-            else if (prevStatus === "working" &&
-                (this.effectiveStatus() === "idle" || this.effectiveStatus() === "done")) {
-                void this.pollTranscriptNow();
-                void this.refreshGit();
-                this.sendEvent({ type: "agent_settled", aborted: false });
-            }
-        }
-        else if (seqChanged) {
+        this.reconcileStatus();
+        if (this.lastEmittedStatus === prevEmitted && seqChanged) {
             void this.pollTranscriptNow();
         }
     }
@@ -824,6 +459,7 @@ export class BridgedAgentSession {
         const status = this.effectiveStatus();
         const detail = status === "working" ? (this.transcriptReader?.getActiveTask() ?? null) : null;
         this.lastActiveTask = detail;
+        this.lastEmittedStatus = status;
         this.conn.sendDirect("agent.status", { status, ...(detail ? { detail } : {}) });
         this.syncContextIfChanged(true);
         this.conn.needsSnapshot = false;
@@ -843,12 +479,8 @@ export class BridgedAgentSession {
                 ...(lastActivityAt ? { lastActivityAt } : {}),
             };
             if (direct) {
-                if (this.conn.needsSnapshot) {
-                    this.conn.dropQueuedEventsUpTo(this.seq);
-                }
-                const minQueued = this.conn.minQueuedEventSeq();
-                const snapSeq = minQueued !== null ? Math.max(0, minQueued - 1) : this.seq;
-                this.conn.sendDirect("agent.snapshot", { ...body, seq: snapSeq });
+                this.conn.dropQueuedEventsUpTo(this.seq);
+                this.conn.sendDirect("agent.snapshot", { ...body, seq: this.seq });
                 for (const ev of events) {
                     if (ev.type === "subagent_update")
                         this.sendEvent(ev);
@@ -885,12 +517,8 @@ export class BridgedAgentSession {
             ...(entryAt ? { lastActivityAt: entryAt } : {}),
         };
         if (direct) {
-            if (this.conn.needsSnapshot) {
-                this.conn.dropQueuedEventsUpTo(this.seq);
-            }
-            const minQueued = this.conn.minQueuedEventSeq();
-            const snapSeq = minQueued !== null ? Math.max(0, minQueued - 1) : this.seq;
-            this.conn.sendDirect("agent.snapshot", { ...body, seq: snapSeq });
+            this.conn.dropQueuedEventsUpTo(this.seq);
+            this.conn.sendDirect("agent.snapshot", { ...body, seq: this.seq });
         }
         else {
             this.conn.send("agent.snapshot", body);
@@ -944,8 +572,7 @@ export class BridgedAgentSession {
         const isWorking = this.effectiveStatus() === "working";
         const delayMs = isWorking ? 900 : this.watcher ? 15_000 : 4_500;
         this.pollTimer = setTimeout(() => {
-            void this.pollTranscriptNow();
-            this.scheduleNextPoll();
+            void this.pollTranscriptNow().finally(() => this.scheduleNextPoll());
         }, delayMs);
         this.pollTimer.unref?.();
     }
@@ -953,48 +580,61 @@ export class BridgedAgentSession {
         this.setupFileWatcher();
         this.scheduleNextPoll();
     }
-    async pollTranscriptNow() {
+    pollTranscriptNow() {
         if (this.disposed)
-            return;
-        try {
-            if (this.transcriptReader) {
-                if (!this.watcher)
-                    this.setupFileWatcher();
-                const events = this.transcriptReader.pollNewEvents();
-                let shouldRefreshGit = false;
-                for (const ev of events) {
-                    this.sendEvent(ev);
-                    if (ev.type === "tool_execution_end" &&
-                        (ev.toolName === "edit" || ev.toolName === "write" || ev.toolName === "bash")) {
-                        shouldRefreshGit = true;
-                    }
-                }
-                if (events.length > 0) {
-                    this.syncSessionNameIfChanged();
-                    this.syncContextIfChanged();
-                    this.syncModelIfChanged();
-                    if (this.effectiveStatus() === "working") {
-                        const nextTask = this.transcriptReader.getActiveTask();
-                        if (nextTask !== this.lastActiveTask) {
-                            this.syncStatus();
+            return Promise.resolve();
+        if (this.pollInFlight)
+            return this.pollInFlight;
+        const p = (async () => {
+            try {
+                if (this.transcriptReader) {
+                    if (!this.watcher)
+                        this.setupFileWatcher();
+                    const prevOffset = this.transcriptReader.byteOffset;
+                    const events = this.transcriptReader.pollNewEvents();
+                    const offsetAdvanced = this.transcriptReader.byteOffset !== prevOffset;
+                    let shouldRefreshGit = false;
+                    for (const ev of events) {
+                        this.sendEvent(ev);
+                        if (ev.type === "tool_execution_end" &&
+                            (ev.toolName === "edit" || ev.toolName === "write" || ev.toolName === "bash")) {
+                            shouldRefreshGit = true;
                         }
                     }
-                    if (shouldRefreshGit) {
-                        void this.refreshGit();
+                    if (offsetAdvanced || events.length > 0) {
+                        this.syncSessionNameIfChanged();
+                        this.syncContextIfChanged();
+                        this.syncModelIfChanged();
                     }
+                    if (events.length > 0) {
+                        if (this.effectiveStatus() === "working") {
+                            const nextTask = this.transcriptReader.getActiveTask();
+                            if (nextTask !== this.lastActiveTask) {
+                                this.syncStatus();
+                            }
+                        }
+                        if (shouldRefreshGit) {
+                            void this.refreshGit();
+                        }
+                    }
+                    return;
                 }
-                return;
+                const extUsage = readExternalAgentContextUsage(this.info.agent, this.info.cwd, this.info.sessionId, this.lastTerminalSnapshot);
+                if (extUsage) {
+                    this.externalContextUsage = extUsage;
+                    this.syncContextIfChanged();
+                }
+                await this.pollPaneFallback();
             }
-            const extUsage = readExternalAgentContextUsage(this.info.agent, this.info.cwd, this.info.sessionId, this.lastTerminalSnapshot);
-            if (extUsage) {
-                this.externalContextUsage = extUsage;
-                this.syncContextIfChanged();
+            catch (e) {
+                this.d.onLog?.(`poll transcript error: ${errMsg(e)}`);
             }
-            await this.pollPaneFallback();
-        }
-        catch (e) {
-            this.d.onLog?.(`poll transcript error: ${errMsg(e)}`);
-        }
+        })().finally(() => {
+            if (this.pollInFlight === p)
+                this.pollInFlight = null;
+        });
+        this.pollInFlight = p;
+        return p;
     }
     async pollPaneFallback(commandText) {
         if (this.disposed || !this.info.paneId || this.d.cfg.redactContent)
@@ -1010,7 +650,7 @@ export class BridgedAgentSession {
                 return;
             const parsed = parseJson(res.stdout);
             const rawText = (typeof parsed?.result?.text === "string" ? parsed.result.text : res.stdout).trim();
-            const text = rawText.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "").trim();
+            const text = stripAnsi(rawText).trim();
             if (!text)
                 return;
             const snippet = extractRecentCommandOutput(text, commandText);
@@ -1019,6 +659,7 @@ export class BridgedAgentSession {
                 this.externalContextUsage = termUsage;
                 this.syncContextIfChanged();
             }
+            this.syncModelIfChanged();
             if (snippet === this.lastTerminalSnapshot)
                 return;
             this.lastTerminalSnapshot = truncateBytes(snippet, 16 * 1024).text;
@@ -1130,13 +771,24 @@ export class BridgedAgentSession {
             error: (code, message) => this.d.onLog?.(`[${this.agentId}] relay error ${code}: ${message}`),
         });
     }
-    async handleUserMessage(b) {
-        const ack = (status, error = null) => this.conn.send("user.message.ack", {
+    handleUserMessage(b) {
+        const run = this.deliveryTail.then(() => this.deliverUserMessage(b), () => this.deliverUserMessage(b));
+        this.deliveryTail = run.catch(() => { });
+        return run;
+    }
+    async deliverUserMessage(b) {
+        if (this.disposed)
+            return;
+        const sendAck = (disposition, method, error = null) => this.conn.send("user.message.ack", {
             clientMsgId: b.clientMsgId,
-            disposition: status === "delivered" ? (b.asCommand ? "command" : "typed") : "rejected",
-            ...(status === "delivered" ? { method: "herdr" } : {}),
-            ...(error ? { error } : {}),
+            disposition,
+            method,
+            error,
         });
+        if (b.clientMsgId && this.seenClientMsgIds.has(b.clientMsgId)) {
+            sendAck(b.asCommand ? "command" : "typed", "herdr", null);
+            return;
+        }
         let text = b.text ?? "";
         if (b.attachments?.length) {
             const att = await resolveAttachments(b.attachments, {
@@ -1150,20 +802,12 @@ export class BridgedAgentSession {
         }
         text = text.trim();
         if (!text)
-            return ack("rejected", "herdr_unavailable");
-        this.fallbackTurnTs = 0;
-        this.lastTerminalSnapshot = "";
-        this.lastTerminalSnapshotTs = Date.now();
-        this.initialFallbackDone = true;
-        const markWorkingOnDelivery = () => {
-            this.optimisticWorkingUntilMs = Date.now() + 8_000;
-            this.syncStatus();
-            this.sendEvent({ type: "agent_start" });
-            void this.pollTranscriptNow();
-        };
+            return sendAck("rejected", "herdr", "herdr_unavailable");
         const env = this.d.herdrSession ? { HERDR_SESSION: this.d.herdrSession } : {};
         if (b.asCommand && (text === "/quit" || text === "/exit")) {
-            ack("delivered");
+            if (b.clientMsgId)
+                this.seenClientMsgIds.add(b.clientMsgId);
+            sendAck("command", "herdr", null);
             if (this.info.paneId) {
                 try {
                     await this.d.runner("herdr", ["pane", "close", this.info.paneId], { timeoutMs: 5_000, env });
@@ -1178,31 +822,42 @@ export class BridgedAgentSession {
         }
         if (b.asCommand && (text.toLowerCase() === "/term" || text.toLowerCase().startsWith("/term "))) {
             if (!this.info.paneId || this.d.cfg.redactContent) {
-                return ack("rejected", "herdr_unavailable");
+                return sendAck("rejected", "herdr", "herdr_unavailable");
             }
-            ack("delivered");
+            if (b.clientMsgId)
+                this.seenClientMsgIds.add(b.clientMsgId);
+            sendAck("command", "herdr", null);
             await this.handleTermCommand(text, env);
             return;
         }
         const textArgs = text.startsWith("-") ? ["--", text] : [text];
         try {
-            let deliveredViaAgentPrompt = false;
             if (!b.asCommand) {
                 const res = await this.d.runner("herdr", ["agent", "prompt", this.info.paneId, ...textArgs], { timeoutMs: 10_000, env });
-                if (res.code === 0) {
-                    deliveredViaAgentPrompt = true;
+                if (res.code !== 0) {
+                    const out = `${res.stderr ?? ""}\n${res.stdout ?? ""}`;
+                    if (/agent_blocked/i.test(out)) {
+                        return sendAck("rejected", "herdr", "agent_blocked");
+                    }
+                    return sendAck("rejected", "herdr", "herdr_unavailable");
                 }
             }
-            if (!deliveredViaAgentPrompt) {
-                // Fallback (when agent is in blocked/waiting_input state, or slash command):
-                // send literal text + Enter directly to the Herdr pane.
+            else {
                 const sendRes = await this.d.runner("herdr", ["pane", "send-text", this.info.paneId, ...textArgs], { timeoutMs: 5_000, env });
                 if (sendRes.code !== 0)
-                    return ack("rejected", "herdr_unavailable");
+                    return sendAck("rejected", "herdr", "herdr_unavailable");
                 await this.d.runner("herdr", ["pane", "send-keys", this.info.paneId, "Enter"], { timeoutMs: 5_000, env });
             }
-            markWorkingOnDelivery();
-            ack("delivered");
+            if (b.clientMsgId)
+                this.seenClientMsgIds.add(b.clientMsgId);
+            this.fallbackTurnTs = 0;
+            this.lastTerminalSnapshot = "";
+            this.lastTerminalSnapshotTs = Date.now();
+            this.initialFallbackDone = true;
+            this.armOptimisticWorking();
+            this.reconcileStatus();
+            void this.pollTranscriptNow();
+            sendAck(b.asCommand ? "command" : "typed", "herdr", null);
             if (this.commandTimer)
                 clearTimeout(this.commandTimer);
             this.commandTimer = setTimeout(async () => {
@@ -1210,20 +865,25 @@ export class BridgedAgentSession {
                 if (this.disposed)
                     return;
                 if (this.transcriptReader) {
+                    const prevOffset = this.transcriptReader.byteOffset;
                     const events = this.transcriptReader.pollNewEvents();
+                    const offsetAdvanced = this.transcriptReader.byteOffset !== prevOffset;
                     if (events.length > 0) {
                         for (const ev of events)
                             this.sendEvent(ev);
+                    }
+                    if (offsetAdvanced || events.length > 0) {
                         this.syncSessionNameIfChanged();
+                        this.syncContextIfChanged();
+                        this.syncModelIfChanged();
                         return;
                     }
                 }
                 if (b.asCommand) {
                     await this.pollPaneFallback(text);
                     if (this.currentStatus === "idle" || this.currentStatus === "done") {
-                        this.optimisticWorkingUntilMs = 0;
-                        this.syncStatus();
-                        this.sendEvent({ type: "agent_settled", aborted: false });
+                        this.clearOptimisticWorking();
+                        this.reconcileStatus();
                     }
                 }
             }, 800);
@@ -1231,7 +891,7 @@ export class BridgedAgentSession {
             return;
         }
         catch {
-            return ack("rejected", "herdr_unavailable");
+            return sendAck("rejected", "herdr", "herdr_unavailable");
         }
     }
     async handleAbort() {
@@ -1305,31 +965,19 @@ export class BridgedAgentSession {
             return Promise.resolve();
         if (this.gitInFlight)
             return this.gitInFlight;
-        const hadPrev = this.git !== null;
         const prevBranch = this.git?.branch ?? null;
         const prevDirty = this.git?.dirty ?? false;
-        const p = new Promise((resolve) => {
-            execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeout: 2_000 }, (err, stdout) => {
-                if (this.disposed)
-                    return resolve();
-                if (err) {
-                    this.git = { branch: null, dirty: false };
-                    return resolve();
-                }
-                const branch = stdout.trim() || null;
-                execFile("git", ["status", "--porcelain", "-uno"], { cwd, timeout: 2_000 }, (err2, stdout2) => {
-                    if (!this.disposed) {
-                        const dirty = !err2 && stdout2.trim().length > 0;
-                        this.git = { branch, dirty };
-                        if (hadPrev && this.conn.connected && (branch !== prevBranch || dirty !== prevDirty)) {
-                            this.conn.sendDirect("agent.hello", this.makeHello());
-                        }
-                    }
-                    resolve();
-                });
-            });
-        }).finally(() => {
-            this.gitInFlight = null;
+        const p = (async () => {
+            const next = (await readGitHeadAndDirty(cwd, false)) ?? { branch: null, dirty: false };
+            if (this.disposed)
+                return;
+            this.git = next;
+            if (this.conn.connected && (next.branch !== prevBranch || next.dirty !== prevDirty)) {
+                this.conn.sendDirect("agent.hello", this.makeHello());
+            }
+        })().finally(() => {
+            if (this.gitInFlight === p)
+                this.gitInFlight = null;
         });
         this.gitInFlight = p;
         return p;
@@ -1368,6 +1016,7 @@ export class BridgedAgentSession {
         if (this.disposed)
             return;
         this.disposed = true;
+        this.clearOptimisticWorking();
         if (this.closeTimer)
             clearTimeout(this.closeTimer);
         this.closeTimer = null;
@@ -1574,10 +1223,14 @@ export class HerdrAgentBridge {
             runner: this.runner,
             onLog: this.o.onLog,
             connectionFactory: this.o.connectionFactory,
+            retireOnly: true,
         });
         this.retiringOrphans.add(orphan);
         orphan.closeFromHerdr("pane_closed");
-        const t = setTimeout(() => this.retiringOrphans.delete(orphan), 5_000);
+        const t = setTimeout(() => {
+            orphan.stop();
+            this.retiringOrphans.delete(orphan);
+        }, 5_000);
         t.unref?.();
     }
     async runPoll() {
@@ -1609,10 +1262,17 @@ export class HerdrAgentBridge {
                     existing.updateFromHerdr(item);
                 }
                 else {
-                    // If an on-demand fallback or previous session occupied this pane and was superseded, close and archive it
+                    // If an on-demand fallback or previous session occupied this pane and was superseded,
+                    // wait while it has open gate prompts so an active approval cannot be severed mid-flight.
+                    let deferredByOpenGate = false;
                     const inheritedAllowed = [];
                     for (const [prevKey, prevSession] of this.sessionsByKey.entries()) {
                         if (prevKey !== key && prevSession.paneId === item.paneId && !discoveredKeys.has(prevKey)) {
+                            if (prevSession.hasOpenGatePrompts()) {
+                                deferredByOpenGate = true;
+                                seenKeys.add(prevKey);
+                                break;
+                            }
                             for (const k of prevSession.allowed.keys())
                                 inheritedAllowed.push(k);
                             prevSession.closeFromHerdr("pane_closed");
@@ -1622,6 +1282,8 @@ export class HerdrAgentBridge {
                             this.persistedSessions.delete(prevKey);
                         }
                     }
+                    if (deferredByOpenGate)
+                        continue;
                     const startDelayMs = !this.o.connectionFactory ? newCount * 35 : 0;
                     newCount++;
                     const session = new BridgedAgentSession(item, {
@@ -1677,61 +1339,94 @@ export class HerdrAgentBridge {
             this.o.onLog?.(`herdr bridge poll error: ${errMsg(e)}`);
         }
     }
+    bindGateServer() {
+        if (this.stopped)
+            return;
+        const server = net.createServer((socket) => {
+            this.clientSockets.add(socket);
+            socket.setEncoding("utf8");
+            const ac = new AbortController();
+            socket.setTimeout(AGY_GATE_SOCKET_TIMEOUT_MS, () => socket.destroy());
+            socket.on("close", () => {
+                this.clientSockets.delete(socket);
+                ac.abort();
+            });
+            socket.on("error", () => {
+                this.clientSockets.delete(socket);
+                ac.abort();
+            });
+            let buf = "";
+            socket.on("data", (chunk) => {
+                if (buf.length + chunk.length > GATE_MAX_LINE_BYTES) {
+                    socket.destroy();
+                    return;
+                }
+                buf += chunk;
+                const nl = buf.indexOf("\n");
+                if (nl < 0)
+                    return;
+                const line = buf.slice(0, nl).trim();
+                buf = buf.slice(nl + 1);
+                void this.handleGateSocketRequest(line, ac.signal).then((resp) => {
+                    if (!socket.destroyed) {
+                        socket.end(JSON.stringify(resp) + "\n");
+                    }
+                });
+            });
+        });
+        server.on("error", (e) => this.o.onLog?.(`gate socket error: ${errMsg(e)}`));
+        server.listen(this.sockPath, () => {
+            if (process.platform !== "win32") {
+                try {
+                    fs.chmodSync(this.sockPath, 0o600);
+                }
+                catch {
+                    /* ignore */
+                }
+            }
+        });
+        server.unref?.();
+        this.gateServer = server;
+    }
     startGateServer() {
         try {
             if (process.platform !== "win32") {
-                fs.mkdirSync(path.dirname(this.sockPath), { recursive: true, mode: 0o700 });
-                if (fs.existsSync(this.sockPath))
-                    fs.unlinkSync(this.sockPath);
-            }
-            const server = net.createServer((socket) => {
-                this.clientSockets.add(socket);
-                const ac = new AbortController();
-                socket.setTimeout(300_000, () => socket.destroy());
-                socket.on("close", () => {
-                    this.clientSockets.delete(socket);
-                    ac.abort();
-                });
-                socket.on("error", () => {
-                    this.clientSockets.delete(socket);
-                    ac.abort();
-                });
-                let buf = "";
-                socket.on("data", (chunk) => {
-                    if (buf.length + chunk.length > 256 * 1024) {
-                        socket.destroy();
-                        return;
-                    }
-                    buf += chunk.toString("utf8");
-                    const nl = buf.indexOf("\n");
-                    if (nl < 0)
-                        return;
-                    const line = buf.slice(0, nl).trim();
-                    buf = buf.slice(nl + 1);
-                    void this.handleGateSocketRequest(line, ac.signal).then((resp) => {
-                        if (!socket.destroyed) {
-                            socket.end(JSON.stringify(resp) + "\n");
-                        }
-                    });
-                });
-            });
-            server.on("error", (e) => this.o.onLog?.(`gate socket error: ${errMsg(e)}`));
-            server.listen(this.sockPath, () => {
-                if (process.platform !== "win32") {
-                    try {
-                        fs.chmodSync(this.sockPath, 0o600);
-                    }
-                    catch {
-                        /* ignore */
-                    }
+                const sockDir = path.dirname(this.sockPath);
+                fs.mkdirSync(sockDir, { recursive: true, mode: 0o700 });
+                try {
+                    fs.chmodSync(sockDir, 0o700);
                 }
-            });
-            server.unref?.();
-            this.gateServer = server;
+                catch {
+                    /* ignore */
+                }
+                if (fs.existsSync(this.sockPath)) {
+                    void probeUnixSocketAlive(this.sockPath).then((alive) => {
+                        if (this.stopped)
+                            return;
+                        if (alive) {
+                            this.o.onLog?.(`gate socket already held by another live process: ${this.sockPath}`);
+                            return;
+                        }
+                        try {
+                            fs.rmSync(this.sockPath, { force: true });
+                        }
+                        catch {
+                            /* ignore */
+                        }
+                        this.bindGateServer();
+                    });
+                    return;
+                }
+            }
+            this.bindGateServer();
         }
         catch (e) {
             this.o.onLog?.(`failed to start gate socket: ${errMsg(e)}`);
         }
+    }
+    signGateResponse(resp, nonce) {
+        const sig = signGatePayload(this.o.token, ["res", resp.decision, resp.reason ?? "", nonce]);
+        return sig ? { ...resp, sig } : resp;
     }
     async handleGateSocketRequest(rawLine, signal) {
         let req;
@@ -1741,16 +1436,21 @@ export class HerdrAgentBridge {
         catch {
             return { decision: "ask", reason: "RP: solicitud de autorización inválida (JSON malformado)" };
         }
+        const nonce = typeof req?.nonce === "string" ? req.nonce : "";
         const conversationId = typeof req?.conversationId === "string" ? req.conversationId : "";
         const command = typeof req?.command === "string" ? req.command : "";
-        if (!conversationId || !/^[0-9a-zA-Z_][0-9a-zA-Z_-]{0,127}$/.test(conversationId) || !command) {
-            return { decision: "ask", reason: "RP: solicitud de autorización incompleta" };
+        const paneId = typeof req?.paneId === "string" ? req.paneId : "";
+        if (!verifyGateSignature(this.o.token, ["req", conversationId, paneId, command, nonce], req?.sig)) {
+            return this.signGateResponse({ decision: "ask", reason: "RP: solicitud de gate no autenticada; confirmar en terminal" }, nonce);
+        }
+        if (!conversationId || !SAFE_CONV_ID_RE.test(conversationId) || !command) {
+            return this.signGateResponse({ decision: "ask", reason: "RP: solicitud de autorización incompleta" }, nonce);
         }
         const key = sanitizeIdPart(conversationId);
         let session = this.sessionsByKey.get(key);
-        if (!session && typeof req.paneId === "string" && req.paneId) {
+        if (!session && paneId) {
             for (const existing of this.sessionsByKey.values()) {
-                if (existing.paneId === req.paneId) {
+                if (existing.paneId === paneId) {
                     session = existing;
                     break;
                 }
@@ -1763,7 +1463,7 @@ export class HerdrAgentBridge {
                 sessionId: conversationId,
                 status: "working",
                 cwd,
-                paneId: typeof req.paneId === "string" ? req.paneId : "",
+                paneId,
                 tabId: null,
                 workspaceId: null,
                 title: null,
@@ -1777,7 +1477,7 @@ export class HerdrAgentBridge {
                 runner: this.runner,
                 onLog: this.o.onLog,
                 connectionFactory: this.o.connectionFactory,
-            }, typeof req.transcriptPath === "string" ? req.transcriptPath : undefined);
+            });
             this.sessionsByKey.set(key, session);
             this.gateCreatedAt.set(key, Date.now());
         }
@@ -1786,139 +1486,17 @@ export class HerdrAgentBridge {
         const serverDanger = dec.danger === "high" || req.danger === "high" ? "high" : req.danger === "medium" || dec.danger === "medium" ? "medium" : "high";
         const serverKey = serverDanger === "high" ? `bash:${command.trim()}` : allowKey("bash", { command });
         try {
-            return await session.requestGateApproval({
+            const decision = await session.requestGateApproval({
                 toolName: "bash",
                 command,
                 danger: serverDanger,
                 key: serverKey,
                 signal,
             });
+            return this.signGateResponse(decision, nonce);
         }
         catch (e) {
-            return { decision: "ask", reason: `RP: error procesando autorización (${errMsg(e)}); confirmar en terminal` };
+            return this.signGateResponse({ decision: "ask", reason: `RP: error procesando autorización (${errMsg(e)}); confirmar en terminal` }, nonce);
         }
     }
-}
-/**
- * Executed by Antigravity CLI on `PreToolUse` (`rp-host agy-hook PreToolUse`).
- * MUST write exactly one JSON object to stdout and exit 0.
- */
-export async function runAgyHook(cfg, stdinText, sockPath = gateSocketPath()) {
-    if (!cfg.enabled)
-        return { decision: "ask" };
-    let payload;
-    try {
-        payload = JSON.parse(stdinText);
-    }
-    catch {
-        return { decision: "ask", reason: "RP: entrada de hook inválida (JSON malformado)" };
-    }
-    const rawToolName = String(payload?.toolCall?.name ?? "");
-    if (rawToolName !== "run_command")
-        return { decision: "allow" };
-    const args = parseAgyArgs(payload?.toolCall?.args ?? payload?.toolCall?.arguments);
-    const command = String(args.CommandLine ?? args.command ?? args.commandLine ?? args.cmd ?? "").trim();
-    if (!command)
-        return { decision: "ask", reason: "RP: comando no identificado; confirmar en terminal" };
-    const mode = cfg.gate.mode === "auto-detect" ? "dangerous" : cfg.gate.mode;
-    if (mode === "off")
-        return { decision: "ask" };
-    const patterns = compilePatterns(cfg.gate.dangerousPatterns);
-    const dec = decide(mode, cfg.gate, patterns, "bash", { command });
-    if (!dec.ask)
-        return { decision: "allow" };
-    const conversationId = typeof payload?.conversationId === "string" ? payload.conversationId : "";
-    if (!conversationId)
-        return { decision: "ask", reason: "RP: comando peligroso detectado" };
-    return new Promise((resolve) => {
-        const client = net.createConnection(sockPath);
-        let settled = false;
-        const finish = (res) => {
-            if (settled)
-                return;
-            settled = true;
-            try {
-                client.destroy();
-            }
-            catch {
-                /* ignore */
-            }
-            resolve(res);
-        };
-        const timer = setTimeout(() => finish({ decision: "ask", reason: "RP: tiempo de espera agotado; confirmar en terminal" }), 280_000);
-        timer.unref?.();
-        client.on("error", () => {
-            clearTimeout(timer);
-            finish({ decision: "ask", reason: "RP: comando peligroso detectado (rp-host inactivo)" });
-        });
-        client.on("connect", () => {
-            const req = {
-                conversationId,
-                workspacePaths: payload?.workspacePaths,
-                transcriptPath: payload?.transcriptPath,
-                paneId: process.env.HERDR_PANE_ID ?? "",
-                command,
-                danger: dec.danger,
-                allowKey: dec.key,
-            };
-            client.write(JSON.stringify(req) + "\n");
-        });
-        let buf = "";
-        client.on("data", (chunk) => {
-            buf += chunk.toString("utf8");
-            const nl = buf.indexOf("\n");
-            if (nl < 0)
-                return;
-            clearTimeout(timer);
-            try {
-                const parsed = JSON.parse(buf.slice(0, nl).trim());
-                if (parsed?.decision === "allow" || parsed?.decision === "deny" || parsed?.decision === "ask") {
-                    finish(parsed);
-                    return;
-                }
-            }
-            catch {
-                /* fallthrough */
-            }
-            finish({ decision: "ask", reason: "RP: comando peligroso detectado" });
-        });
-        client.on("close", () => {
-            clearTimeout(timer);
-            finish({ decision: "ask", reason: "RP: comando peligroso detectado" });
-        });
-    });
-}
-/** Install or update the rp-gate PreToolUse hook inside ~/.gemini/config/hooks.json without touching other hooks. */
-export function installAgyHooks(nodePath, scriptPath, home = os.homedir(), platform = process.platform) {
-    const hooksFile = path.join(home, ".gemini", "config", "hooks.json");
-    let current = {};
-    try {
-        current = JSON.parse(fs.readFileSync(hooksFile, "utf8"));
-        if (!current || typeof current !== "object" || Array.isArray(current))
-            current = {};
-    }
-    catch {
-        current = {};
-    }
-    const hookCommand = platform === "win32"
-        ? `"${nodePath.replace(/"/g, '""')}" "${scriptPath.replace(/"/g, '""')}" agy-hook PreToolUse`
-        : `'${nodePath.replace(/'/g, "'\\''")}' '${scriptPath.replace(/'/g, "'\\''")}' agy-hook PreToolUse`;
-    current["rp-gate"] = {
-        enabled: true,
-        PreToolUse: [
-            {
-                matcher: "run_command",
-                hooks: [
-                    {
-                        type: "command",
-                        command: hookCommand,
-                        timeout: 300,
-                    },
-                ],
-            },
-        ],
-    };
-    fs.mkdirSync(path.dirname(hooksFile), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(hooksFile, JSON.stringify(current, null, 2) + "\n", { mode: 0o600 });
-    return hooksFile;
 }

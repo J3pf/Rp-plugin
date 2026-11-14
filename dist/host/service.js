@@ -57,7 +57,7 @@ export function resolveStableNodePath(env, platform = process.platform, execPath
     return candidates.find((candidate) => !isVersionedNodePath(candidate)) ?? candidates[0] ?? (targetIsNode ? targetExecPath : nodeName);
 }
 export function isStaleNodePath(installedNodePath) {
-    if (!isNodeBinaryName(installedNodePath) || !fs.existsSync(installedNodePath) || /[\\/]Cellar[\\/]node[\\/]/.test(installedNodePath))
+    if (!isNodeBinaryName(installedNodePath) || isVersionedNodePath(installedNodePath) || !fs.existsSync(installedNodePath))
         return true;
     try {
         fs.realpathSync(installedNodePath);

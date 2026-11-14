@@ -24,7 +24,7 @@ export function check(value: unknown, shape: Shape, where: string, optional: str
   return errs;
 }
 
-const status = oneOf("idle", "working", "waiting_input", "compacting", "error");
+const status = oneOf("idle", "working", "waiting_input", "compacting", "done", "error");
 const promptKind = oneOf("confirm", "select", "input", "questionnaire");
 const category = oneOf("permission", "question", "dialog");
 const danger = oneOf("low", "medium", "high");

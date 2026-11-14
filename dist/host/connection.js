@@ -2,7 +2,7 @@
 import os from "node:os";
 import WebSocket from "ws";
 import { MAX_FRAME_BYTES, CLOSE, envelope, parseEnvelope } from "../shared/protocol.js";
-import { getProxyAgent, toWsUrl } from "../shared/http.js";
+import { WsKeepalive, getProxyAgent, toWsUrl } from "../shared/http.js";
 import { backoffDelay, errMsg } from "../shared/util.js";
 import { HostError, listDirs, validateSessionId } from "./validate.js";
 import { gitDiff, gitDiscard } from "./git.js";
@@ -12,8 +12,8 @@ export class HostConnection {
     stopped = false;
     attempt = 0;
     timer = null;
-    watchdog = null;
-    pingTimer = null;
+    /** The relay pings every 25 s, client pings every 20 s; silence beyond 70 s means a dead socket. */
+    keepalive = new WsKeepalive(70_000, 20_000);
     quotaTimer = null;
     quotaPolling = false;
     constructor(o) {
@@ -27,8 +27,7 @@ export class HostConnection {
     }
     stop() {
         this.stopped = true;
-        this.stopHeartbeat();
-        this.clearWatchdog();
+        this.keepalive.stop();
         this.stopQuotaTimer();
         if (this.timer)
             clearTimeout(this.timer);
@@ -40,45 +39,10 @@ export class HostConnection {
             /* ignore */
         }
     }
-    startHeartbeat() {
-        this.stopHeartbeat();
-        this.pingTimer = setInterval(() => {
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                try {
-                    this.ws.ping();
-                }
-                catch {
-                    try {
-                        this.ws.terminate();
-                    }
-                    catch {
-                        /* ignore */
-                    }
-                }
-            }
-        }, 20_000);
-        this.pingTimer.unref?.();
-    }
-    stopHeartbeat() {
-        if (this.pingTimer)
-            clearInterval(this.pingTimer);
-        this.pingTimer = null;
-    }
-    /** The relay pings every 25 s, client pings every 20 s; silence beyond 70 s means a dead socket. */
-    arm() {
-        this.clearWatchdog();
-        this.watchdog = setTimeout(() => this.ws?.terminate(), 70_000);
-        this.watchdog.unref?.();
-    }
-    clearWatchdog() {
-        if (this.watchdog)
-            clearTimeout(this.watchdog);
-        this.watchdog = null;
-    }
     scheduleReconnect(code) {
         if (this.stopped)
             return;
-        if (code === CLOSE.INVALID_TOKEN || code === CLOSE.INCOMPATIBLE) {
+        if (code === CLOSE.INVALID_TOKEN || code === CLOSE.INCOMPATIBLE || code === CLOSE.REPLACED) {
             this.log(`relay closed the connection with ${code}; not reconnecting`);
             this.stopped = true;
             return;
@@ -117,15 +81,14 @@ export class HostConnection {
         this.ws = ws;
         ws.on("open", () => {
             this.attempt = 0;
-            this.arm();
-            this.startHeartbeat();
+            this.keepalive.start(ws, WebSocket.OPEN);
             this.startQuotaTimer();
             void this.hello(ws).catch((e) => this.log(`hello failed: ${errMsg(e)}`));
         });
-        ws.on("ping", () => this.arm());
-        ws.on("pong", () => this.arm());
+        ws.on("ping", () => this.keepalive.arm(ws));
+        ws.on("pong", () => this.keepalive.arm(ws));
         ws.on("message", (data) => {
-            this.arm();
+            this.keepalive.arm(ws);
             const env = parseEnvelope(data.toString("utf8"));
             if (env)
                 void this.handle(env);
@@ -145,8 +108,7 @@ export class HostConnection {
             }
         });
         ws.on("close", (code) => {
-            this.stopHeartbeat();
-            this.clearWatchdog();
+            this.keepalive.stop();
             this.stopQuotaTimer();
             if (this.ws !== ws)
                 return;
@@ -200,7 +162,6 @@ export class HostConnection {
     async hello(ws) {
         const rep = await this.o.manager.detect(true);
         const def = await this.o.manager.defaultBackend();
-        const quotas = await this.o.manager.collectQuotas();
         if (this.stopped || (ws && this.ws !== ws))
             return;
         const body = {
@@ -212,10 +173,12 @@ export class HostConnection {
             launchers: Object.keys(this.o.cfg.launchers),
             defaultLauncher: this.o.cfg.defaultLauncher,
         };
+        const quotas = this.o.manager.getLastQuotas?.() ?? null;
         if (quotas && quotas.length > 0) {
             body.quotas = quotas;
         }
         this.sendEnv(envelope("host.hello", body));
+        void this.pollQuotas();
     }
     /** Handle one relay request; always answers with `re` = request id. */
     async handle(env) {
@@ -228,7 +191,7 @@ export class HostConnection {
                 case "host.list_dirs":
                     return reply("host.dirs", listDirs(this.o.cfg, String(d.path ?? "")));
                 case "host.git_diff": {
-                    const res = await gitDiff(this.o.cfg, String(d.cwd ?? ""), typeof d.path === "string" ? d.path : undefined);
+                    const res = await gitDiff(this.o.cfg, String(d.cwd ?? ""), typeof d.path === "string" ? d.path : undefined, { redactContent: !!this.o.redactContent });
                     return reply("host.git_diff.result", res);
                 }
                 case "host.git_discard": {

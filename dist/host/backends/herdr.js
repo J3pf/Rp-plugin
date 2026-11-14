@@ -37,10 +37,11 @@ export function parseJson(text) {
 export const PANE_PATHS = ["result.root_pane.pane_id", "result.pane.pane_id", "result.pane_id", "result.new_pane.pane_id", "result.root_pane.id", "result.pane.id", "pane_id"];
 export const WORKSPACE_PATHS = ["result.workspace.workspace_id", "result.workspace_id", "result.workspace.id", "workspace_id"];
 export const TAB_PATHS = ["result.tab.tab_id", "result.tab_id", "result.tab.id", "tab_id"];
+const HERDR_SERVER_COOLDOWN_MS = 10_000;
 export class HerdrBackend {
     d;
     name = "herdr";
-    serverStarted = false;
+    lastServerStartAt = 0;
     serverStarting = null;
     constructor(d) {
         this.d = d;
@@ -60,31 +61,35 @@ export class HerdrBackend {
     /** If the herdr server is not running, start it headless so panes can be created (PLAN §10). */
     async ensureServer() {
         const st = await this.herdr(["status", "server"]);
-        if (st.code === 0)
+        if (st.code === 0) {
+            this.lastServerStartAt = 0;
             return;
+        }
         if (this.serverStarting)
             return this.serverStarting;
-        if (this.serverStarted)
+        if (this.lastServerStartAt > 0 && Date.now() - this.lastServerStartAt < HERDR_SERVER_COOLDOWN_MS) {
             throw new HostError("internal", "herdr server is not running");
+        }
+        this.lastServerStartAt = Date.now();
         const p = (async () => {
             // supervised background process: detached so it outlives a single request
             const { spawn } = await import("node:child_process");
             const child = spawn("herdr", ["server"], { stdio: "ignore", detached: true, windowsHide: true, env: { ...process.env, ...this.env() } });
             child.on("error", () => {
-                this.serverStarted = false;
+                this.lastServerStartAt = 0;
             });
             child.on("exit", () => {
-                this.serverStarted = false;
+                this.lastServerStartAt = 0;
             });
             child.unref();
             for (let i = 0; i < 20; i++) {
                 await new Promise((r) => setTimeout(r, 250));
                 if ((await this.herdr(["status", "server"])).code === 0) {
-                    this.serverStarted = true;
+                    this.lastServerStartAt = 0;
                     return;
                 }
             }
-            this.serverStarted = false;
+            this.lastServerStartAt = 0;
             try {
                 child.kill();
             }

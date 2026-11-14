@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { atomicWriteFileSync } from "../shared/util.js";
 import { expandHome, hostConfigPath } from "../shared/platform.js";
 export const DEFAULT_HOST_CONFIG = {
     roots: ["~/proyectos"],
@@ -135,7 +136,6 @@ export function loadHostConfig(env = process.env) {
     }
 }
 export function writeDefaultHostConfig(p) {
-    fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
     const body = {
         roots: DEFAULT_HOST_CONFIG.roots,
         backend: "auto",
@@ -146,5 +146,5 @@ export function writeDefaultHostConfig(p) {
         quotaCommand: DEFAULT_HOST_CONFIG.quotaCommand,
         quotaIntervalSec: DEFAULT_HOST_CONFIG.quotaIntervalSec,
     };
-    fs.writeFileSync(p, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
+    atomicWriteFileSync(p, JSON.stringify(body, null, 2) + "\n", 0o600);
 }

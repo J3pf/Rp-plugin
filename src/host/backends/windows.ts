@@ -1,9 +1,15 @@
 // Windows backends: Windows Terminal (`wt.exe`) and plain console (`cmd /c start`).
-// Neither passes environment variables, so the id travels as the `--rp-spawn-id` flag registered by the plugin.
+// Neither passes environment variables, so the id travels as the `--rp-spawn-id` flag registered by the plugin for Pi launchers.
+import path from "node:path";
 import { HostError, splitCommand, validateSessionId, validateSpawnId } from "../validate.ts";
 import type { Backend, BackendDeps, SpawnRecord, SpawnRequest } from "./types.ts";
 
 const CMD_META_RE = /[&|<>^%\r\n\0"!]/;
+
+function isExternalCliLauncher(parts: string[]): boolean {
+  const bin = path.basename(parts[0] ?? "").replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
+  return bin === "claude" || bin === "codex" || bin === "agy";
+}
 
 export function wtArgs(req: SpawnRequest): string[] {
   const spawnId = validateSpawnId(req.spawnId);
@@ -12,7 +18,9 @@ export function wtArgs(req: SpawnRequest): string[] {
     throw new HostError("bad_request", "cwd with ';' or control chars is not supported by Windows Terminal");
   }
   const cleanName = req.name.replace(/[\r\n\0;]/g, " ");
-  return ["-w", "rp", "new-tab", "-d", req.cwd, "--title", cleanName, ...splitCommand(req.launcherCommand), "--rp-spawn-id", spawnId];
+  const parts = splitCommand(req.launcherCommand);
+  const spawnFlag = isExternalCliLauncher(parts) ? [] : ["--rp-spawn-id", spawnId];
+  return ["-w", "rp", "new-tab", "-d", req.cwd, "--title", cleanName, ...parts, ...spawnFlag];
 }
 
 export function consoleArgs(req: SpawnRequest): string[] {
@@ -23,7 +31,8 @@ export function consoleArgs(req: SpawnRequest): string[] {
     throw new HostError("bad_request", "unsafe characters for Windows console backend");
   }
   const title = `"${req.name.replace(/["&|<>^%\r\n\0!]/g, "")}"`;
-  return ["/c", "start", title, "/D", req.cwd, ...parts, "--rp-spawn-id", spawnId];
+  const spawnFlag = isExternalCliLauncher(parts) ? [] : ["--rp-spawn-id", spawnId];
+  return ["/c", "start", title, "/D", req.cwd, ...parts, ...spawnFlag];
 }
 
 /** PowerShell that stops the processes whose command line carries the spawn id (ids are validated alphanumeric → injection-safe). */

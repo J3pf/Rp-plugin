@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { newId } from "../shared/protocol.js";
+import { splitCommand } from "../shared/util.js";
 import { configDir } from "../shared/platform.js";
 import { HerdrBackend } from "./backends/herdr.js";
 import { TmuxBackend } from "./backends/tmux.js";
@@ -126,7 +127,9 @@ export class HostManager {
             throw new HostError("bad_request", "herdrTarget requires the herdr backend");
         const spawnId = newId();
         const sessionId = p.sessionId ? validateSessionId(p.sessionId) : undefined;
-        const launcherCommand = sessionId ? `${launcher.command} --session ${sessionId}` : launcher.command;
+        const launcherBin = path.basename(splitCommand(launcher.command)[0] ?? "").replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
+        const isExternalCli = launcherBin === "claude" || launcherBin === "codex" || launcherBin === "agy";
+        const launcherCommand = sessionId && !isExternalCli ? `${launcher.command} --session ${sessionId}` : launcher.command;
         const rec = await this.backends[backendName].spawn({ cwd, name, launcherCommand, spawnId, herdrTarget: p.herdrTarget, sessionId });
         this.records.set(spawnId, rec);
         this.trimRecords();
@@ -162,6 +165,11 @@ export class HostManager {
     }
     list() {
         return [...this.records.values()];
+    }
+    getLastQuotas() {
+        if (!this.cfg.quotaEnabled)
+            return null;
+        return this.quotaCollector.getLastQuotas();
     }
     async collectQuotas() {
         if (!this.cfg.quotaEnabled)

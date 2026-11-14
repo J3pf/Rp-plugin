@@ -1385,4 +1385,193 @@ describe("herdr-bridge & PreToolUse gate", () => {
       bridge.stop();
     }
   });
+
+  it("deduplicates user.message by clientMsgId, rejects agent_blocked without send-text, expires optimistic working, rejects unauthenticated gate IPC, and defers promotion while gate prompts are open", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-hardening-"));
+    tmpDirs.push(dir);
+    const sockPath = path.join(dir, "gate.sock");
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    let pollStep = 0;
+
+    const runner = async (cmd: string, args: string[]) => {
+      calls.push({ cmd, args });
+      if (cmd === "herdr" && args[0] === "agent" && args[1] === "list") {
+        pollStep++;
+        const agents =
+          pollStep === 1
+            ? [{ agent: "agy", pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: dir, agent_status: "idle" }]
+            : [
+                {
+                  agent: "agy",
+                  pane_id: "w1:p1",
+                  tab_id: "w1:t1",
+                  workspace_id: "w1",
+                  cwd: dir,
+                  agent_status: "idle",
+                  agent_session: { value: "conv-promoted" },
+                },
+              ];
+        return { code: 0, stdout: JSON.stringify({ result: { agents } }), stderr: "" };
+      }
+      if (cmd === "herdr" && args[0] === "agent" && args[1] === "prompt") {
+        if (args.includes("blocked prompt")) {
+          return { code: 1, stdout: "", stderr: "agent_blocked: dialog open" };
+        }
+        return { code: 0, stdout: "{}", stderr: "" };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    };
+
+    const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+    const transports = new Map<string, FakeTransport>();
+    const bridge = new HerdrAgentBridge({
+      relayUrl: "https://relay.example.com",
+      machineId: "M1",
+      token: "T1",
+      cfg,
+      herdrSession: null,
+      runner,
+      socketPath: sockPath,
+      stateFile: null,
+      pollIntervalMs: 60_000,
+      connectionFactory: (opts) =>
+        new Connection({
+          ...opts,
+          transportFactory: (_name, handlers) => {
+            const t = new FakeTransport("ws", handlers);
+            transports.set(opts.agentId, t);
+            return t;
+          },
+        }),
+    });
+
+    bridge.start();
+    try {
+      await bridge.poll();
+      const t1 = transports.get("M1:herdr:pane-w1:p1")!;
+      t1.open();
+      t1.receive({ v: 1, id: "w1", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+
+      // 1. clientMsgId deduplication prevents duplicate prompt injection
+      t1.receive({ v: 1, id: "m1", t: "user.message", ts: Date.now(), d: { clientMsgId: "dup-1", text: "first prompt" } });
+      await vi.waitFor(() => {
+        expect(t1.sent.some((e) => e.t === "user.message.ack" && (e.d as any).clientMsgId === "dup-1")).toBe(true);
+      });
+      t1.receive({ v: 1, id: "m2", t: "user.message", ts: Date.now(), d: { clientMsgId: "dup-1", text: "first prompt" } });
+      await new Promise((r) => setTimeout(r, 30));
+      const promptCalls = calls.filter((c) => c.cmd === "herdr" && c.args[0] === "agent" && c.args[1] === "prompt" && c.args.includes("first prompt"));
+      expect(promptCalls).toHaveLength(1);
+      expect(t1.sent.filter((e) => e.t === "user.message.ack" && (e.d as any).clientMsgId === "dup-1")).toHaveLength(2);
+
+      // 2. agent_blocked rejects cleanly without pane send-text fallback
+      t1.receive({ v: 1, id: "m3", t: "user.message", ts: Date.now(), d: { clientMsgId: "blk-1", text: "blocked prompt" } });
+      await vi.waitFor(() => {
+        expect(t1.sent.some((e) => e.t === "user.message.ack" && (e.d as any).clientMsgId === "blk-1")).toBe(true);
+      });
+      const blkAck = t1.sent.find((e) => e.t === "user.message.ack" && (e.d as any).clientMsgId === "blk-1")!;
+      expect(blkAck.d).toEqual({ clientMsgId: "blk-1", disposition: "rejected", method: "herdr", error: "agent_blocked" });
+      expect(calls.some((c) => c.cmd === "herdr" && c.args[0] === "pane" && c.args[1] === "send-text")).toBe(false);
+
+      // 3. Unauthenticated gate socket client request fails closed without opening a prompt
+      const rawResp = await new Promise<any>((resolve, reject) => {
+        const client = net.createConnection(sockPath);
+        client.setEncoding("utf8");
+        let out = "";
+        client.on("connect", () => {
+          client.write(JSON.stringify({ conversationId: "conv-unauth", paneId: "w1:p1", command: "sudo ls", nonce: "n1", sig: "0000" }) + "\n");
+        });
+        client.on("data", (chunk) => {
+          out += chunk;
+          if (out.includes("\n")) {
+            client.destroy();
+            resolve(JSON.parse(out.trim()));
+          }
+        });
+        client.on("error", reject);
+      });
+      expect(rawResp.decision).toBe("ask");
+      expect(t1.sent.some((e) => e.t === "prompt.open")).toBe(false);
+
+      // 4. Open gate prompt on pane fallback defers pane promotion across poll, then completes once resolved
+      const prevPaneEnv = process.env.HERDR_PANE_ID;
+      process.env.HERDR_PANE_ID = "w1:p1";
+      let gatePromise: ReturnType<typeof runAgyHook>;
+      try {
+        gatePromise = runAgyHook(
+          cfg,
+          JSON.stringify({ conversationId: "conv-during-gate", toolCall: { name: "run_command", args: { CommandLine: '"sudo ls"' } } }),
+          sockPath,
+        );
+      } finally {
+        if (prevPaneEnv === undefined) delete process.env.HERDR_PANE_ID;
+        else process.env.HERDR_PANE_ID = prevPaneEnv;
+      }
+      await vi.waitFor(() => {
+        expect(t1.sent.some((e) => e.t === "prompt.open")).toBe(true);
+      });
+      const promptId = (t1.sent.find((e) => e.t === "prompt.open")!.d as any).promptId as string;
+
+      // Poll while gate prompt is open -> pane-w1:p1 stays alive, no agent.closed yet
+      await bridge.poll();
+      expect(t1.sent.some((e) => e.t === "agent.closed")).toBe(false);
+      expect(transports.has("M1:herdr:conv-promoted")).toBe(false);
+
+      t1.receive({ v: 1, id: "pa-defer", t: "prompt.answer", ts: Date.now(), d: { promptId, answer: { optionIds: ["0"] } } });
+      await expect(gatePromise).resolves.toEqual({ decision: "allow" });
+
+      // Next poll after prompt closes completes promotion seamlessly
+      await bridge.poll();
+      expect(t1.sent.some((e) => e.t === "agent.closed" && (e.d as any).reason === "pane_closed")).toBe(true);
+      expect(transports.has("M1:herdr:conv-promoted")).toBe(true);
+    } finally {
+      bridge.stop();
+    }
+  });
+
+  it("expires optimistic working state and emits agent_settled when Herdr stays idle", async () => {
+    vi.useFakeTimers();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-optimistic-"));
+    tmpDirs.push(dir);
+    try {
+      const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+      const t = { instance: null as FakeTransport | null };
+      const runner = async () => ({ code: 0, stdout: "{}", stderr: "" });
+      const session = new BridgedAgentSession(
+        { agent: "codex", sessionId: null, status: "idle", cwd: dir, paneId: "w9:p1", tabId: null, workspaceId: "w9", title: null, stateChangeSeq: 0 },
+        {
+          relayUrl: "https://relay.example.com",
+          machineId: "M1",
+          token: "T1",
+          cfg,
+          herdrSession: null,
+          runner,
+          connectionFactory: (opts) =>
+            new Connection({
+              ...opts,
+              transportFactory: (_name, handlers) => {
+                const ft = new FakeTransport("ws", handlers);
+                t.instance = ft;
+                return ft;
+              },
+            }),
+        },
+      );
+      try {
+        t.instance!.open();
+        t.instance!.receive({ v: 1, id: "w", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+        t.instance!.receive({ v: 1, id: "u", t: "user.message", ts: Date.now(), d: { clientMsgId: "opt-1", text: "ping" } });
+        await vi.waitFor(() => {
+          expect(t.instance!.sent.some((e) => e.t === "agent.status" && (e.d as any).status === "working")).toBe(true);
+        });
+        await vi.advanceTimersByTimeAsync(8_200);
+        const statuses = t.instance!.sent.filter((e) => e.t === "agent.status").map((e) => (e.d as any).status);
+        expect(statuses[statuses.length - 1]).toBe("idle");
+        expect(t.instance!.sent.some((e) => e.t === "agent.event" && (e.d as any).e?.type === "agent_settled")).toBe(true);
+      } finally {
+        session.stop();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

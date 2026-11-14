@@ -1,8 +1,8 @@
-// rp-host CLI: run | install | uninstall | status | init | agy-hook
+// rp-host CLI: run | install | uninstall | status | doctor | roots | init | agy-hook
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig } from "../extension/config.js";
+import { loadConfig, resolveInboxDir } from "../extension/config.js";
 import { expandHome } from "../shared/platform.js";
 import { addRoot, loadHostConfig, missingRoots, NO_ROOTS_HINT, removeRoot, writeDefaultHostConfig } from "./config.js";
 import { HostConnection } from "./connection.js";
@@ -22,6 +22,53 @@ Usage: rp-host <command>
   agy-hook    Antigravity CLI PreToolUse hook entrypoint
 
 Requires the PC to be paired first (/rp pair inside Pi). Config: host.json next to RP's config.json.`;
+const INBOX_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+function cleanupExpiredInboxFiles(inboxDir, now = Date.now()) {
+    let dirs;
+    try {
+        dirs = fs.readdirSync(inboxDir, { withFileTypes: true });
+    }
+    catch {
+        return;
+    }
+    const cutoff = now - INBOX_RETENTION_MS;
+    for (const d of dirs) {
+        if (!d.isDirectory())
+            continue;
+        const convPath = path.join(inboxDir, d.name);
+        let entries;
+        try {
+            entries = fs.readdirSync(convPath, { withFileTypes: true });
+        }
+        catch {
+            continue;
+        }
+        let remaining = entries.length;
+        for (const f of entries) {
+            if (!f.isFile())
+                continue;
+            const fp = path.join(convPath, f.name);
+            try {
+                const st = fs.statSync(fp);
+                if (st.mtimeMs < cutoff) {
+                    fs.unlinkSync(fp);
+                    remaining--;
+                }
+            }
+            catch {
+                /* best effort */
+            }
+        }
+        if (remaining <= 0) {
+            try {
+                fs.rmdirSync(convPath);
+            }
+            catch {
+                /* ignore non-empty */
+            }
+        }
+    }
+}
 async function readStdinText(maxBytes = 2 * 1024 * 1024) {
     const chunks = [];
     let total = 0;
@@ -175,6 +222,7 @@ export async function main(argv) {
                     /* ignore */
                 }
             }
+            cleanupExpiredInboxFiles(resolveInboxDir(cfg));
             let bridge;
             const manager = new HostManager(host, {
                 onLog: (m) => console.error(`[rp-host] ${m}`),
@@ -186,6 +234,7 @@ export async function main(argv) {
                 token: cfg.machineToken,
                 cfg: host,
                 manager,
+                redactContent: cfg.redactContent,
                 onLog: (m) => console.error(`[rp-host] ${m}`),
             });
             bridge = new HerdrAgentBridge({
@@ -199,10 +248,16 @@ export async function main(argv) {
             conn.start();
             bridge.start();
             console.error(`[rp-host] running (roots: ${host.roots.join(", ")})`);
+            let stopping = false;
             const stop = () => {
-                bridge.stop();
+                if (stopping)
+                    return;
+                stopping = true;
+                bridge?.stop();
                 conn.stop();
-                process.exit(0);
+                // Allow a brief flush window for final close/agent.closed frames before exit.
+                const exitTimer = setTimeout(() => process.exit(0), 80);
+                exitTimer.unref?.();
             };
             process.on("SIGINT", stop);
             process.on("SIGTERM", stop);

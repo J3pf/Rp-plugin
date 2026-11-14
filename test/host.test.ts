@@ -526,16 +526,32 @@ describe("HostConnection protocol", () => {
     hc.start();
 
     const hello = await waitUntil(() => relay.of("host.hello")[0]);
-    expect(hello.d.quotas).toBeDefined();
-    expect(hello.d.quotas).toHaveLength(1);
-    expect(hello.d.quotas[0].family).toBe("antigravity");
+    expect(hello.d.quotas).toBeUndefined();
     expect(validateEnvelope(hello)).toEqual([]);
 
-    await hc.pollQuotas();
     const quotasEnv = await waitUntil(() => relay.of("host.quotas")[0]);
     expect(quotasEnv.d.quotas).toHaveLength(1);
     expect(quotasEnv.d.quotas[0].family).toBe("antigravity");
     expect(validateEnvelope(quotasEnv)).toEqual([]);
+
+    // Reconnect / re-hello carries cached quotas synchronously without waiting on collection
+    await hc.hello();
+    const secondHello = await waitUntil(() => relay.of("host.hello")[1]);
+    expect(secondHello.d.quotas).toBeDefined();
+    expect(secondHello.d.quotas).toHaveLength(1);
+    expect(secondHello.d.quotas[0].family).toBe("antigravity");
+  });
+  it("host.hello is never delayed when quota collection hangs", async () => {
+    relay = await new FakeRelay().start();
+    const cfg = normalizeHostConfig({ roots: [tmp()], quotaEnabled: true, quotaIntervalSec: 60 });
+    const manager = new HostManager(cfg, { platform: "linux", storeFile: path.join(tmp(), "s.json") });
+    (manager as any).collectQuotas = () => new Promise(() => {});
+    hc = new HostConnection({ relayUrl: relay.url, machineId: "MACH-SLOW-Q", token: "tok", cfg, manager, backoff: () => 20 });
+    hc.start();
+
+    const hello = await waitUntil(() => relay.of("host.hello")[0]);
+    expect(hello.d.machineId).toBe("MACH-SLOW-Q");
+    expect(validateEnvelope(hello)).toEqual([]);
   });
   it("omits quotas when quotaEnabled is false", async () => {
     relay = await new FakeRelay().start();
@@ -1085,7 +1101,24 @@ Statut: Inconnu
       await gitDiscard(cfg, dir, "sub dir/ spaced.txt");
       expect(fs.existsSync(path.join(dir, "sub dir", " spaced.txt"))).toBe(false);
 
-      // Rejects traversal, '.' / '..', option flags, and pathspec magic
+      // Redact content omits patch bodies while keeping file metadata
+      fs.writeFileSync(path.join(dir, "secret.txt"), "top-secret-line\n");
+      const redactedDiff = await gitDiff(cfg, dir, undefined, { redactContent: true });
+      const redactedFile = redactedDiff.files.find((f) => f.path === "secret.txt");
+      expect(redactedFile).toBeDefined();
+      expect(redactedFile?.patch).toBe("");
+      await gitDiscard(cfg, dir, "secret.txt");
+
+      // Rejects traversal, '.' / '..', option flags, pathspec magic, directories, and symlinks
+      fs.mkdirSync(path.join(dir, "untracked-dir"));
+      fs.symlinkSync(path.join(dir, "file.txt"), path.join(dir, "sym-link.txt"));
+      await expect(gitDiscard(cfg, dir, "untracked-dir")).rejects.toThrow(/directory/);
+      await expect(gitDiscard(cfg, dir, "sym-link.txt")).rejects.toThrow(/symlink/);
+      expect(fs.existsSync(path.join(dir, "untracked-dir"))).toBe(true);
+      expect(fs.lstatSync(path.join(dir, "sym-link.txt")).isSymbolicLink()).toBe(true);
+      fs.rmSync(path.join(dir, "untracked-dir"), { recursive: true, force: true });
+      fs.unlinkSync(path.join(dir, "sym-link.txt"));
+
       await expect(gitDiscard(cfg, dir, ".")).rejects.toThrow(/invalid relative path/);
       await expect(gitDiscard(cfg, dir, "sub/../..")).rejects.toThrow(/invalid relative path/);
       await expect(gitDiscard(cfg, dir, ":(icase)file.txt")).rejects.toThrow(/invalid relative path/);

@@ -4,7 +4,7 @@ Extension for the [Pi](https://github.com/earendil-works/pi) coding agent and co
 
 ## Tech Stack & Architecture
 
-- **Runtime**: Node.js >= 20, TypeScript (`tsc -p tsconfig.build.json`).
+- **Runtime**: Node.js >= 22.19, TypeScript (`tsc -p tsconfig.build.json`).
 - **Target OS**: Linux (systemd `--user`), macOS (`launchd`), Windows (Task Scheduler with `conhost.exe --headless`).
 - **Core Components**:
   - `src/extension/`: Pi extension hooking into `session_start`, `ui_prompt_start`, questions, and tool execution events.

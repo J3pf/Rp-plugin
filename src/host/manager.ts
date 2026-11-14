@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { newId, type MachineQuota } from "../shared/protocol.ts";
+import { splitCommand } from "../shared/util.ts";
 import { configDir } from "../shared/platform.ts";
 import type { BackendName, HostConfig } from "./config.ts";
 import type { Backend, HerdrTarget, SpawnRecord } from "./backends/types.ts";
@@ -148,7 +149,9 @@ export class HostManager {
     if (p.herdrTarget && backendName !== "herdr") throw new HostError("bad_request", "herdrTarget requires the herdr backend");
     const spawnId = newId();
     const sessionId = p.sessionId ? validateSessionId(p.sessionId) : undefined;
-    const launcherCommand = sessionId ? `${launcher.command} --session ${sessionId}` : launcher.command;
+    const launcherBin = path.basename(splitCommand(launcher.command)[0] ?? "").replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
+    const isExternalCli = launcherBin === "claude" || launcherBin === "codex" || launcherBin === "agy";
+    const launcherCommand = sessionId && !isExternalCli ? `${launcher.command} --session ${sessionId}` : launcher.command;
     const rec = await this.backends[backendName].spawn({ cwd, name, launcherCommand, spawnId, herdrTarget: p.herdrTarget, sessionId });
     this.records.set(spawnId, rec);
     this.trimRecords();
@@ -185,6 +188,11 @@ export class HostManager {
 
   list(): SpawnRecord[] {
     return [...this.records.values()];
+  }
+
+  getLastQuotas(): MachineQuota[] | null {
+    if (!this.cfg.quotaEnabled) return null;
+    return this.quotaCollector.getLastQuotas();
   }
 
   async collectQuotas(): Promise<MachineQuota[] | null> {

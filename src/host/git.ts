@@ -34,27 +34,39 @@ const MAX_FILE_PATCH_BYTES = 64 * 1024;
 const MAX_TOTAL_PATCH_BYTES = 512 * 1024;
 const DIFF_DEADLINE_MS = 10_000;
 
-function execGit(cwd: string, args: string[], timeout = 5000): Promise<{ stdout: string; code: number }> {
+function execGit(cwd: string, args: string[], timeout = 5000): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
     execFile(
       "git",
-      ["--literal-pathspecs", "-c", "core.quotePath=false", ...args],
+      ["--no-optional-locks", "--literal-pathspecs", "-c", "core.quotePath=false", ...args],
       {
         cwd,
         timeout,
         maxBuffer: 4 * 1024 * 1024,
         windowsHide: true,
-        env: { ...process.env, GIT_LITERAL_PATHSPECS: "1" },
+        env: { ...process.env, GIT_LITERAL_PATHSPECS: "1", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
       },
-      (err, stdout) => {
+      (err, stdout, stderr) => {
         const code = err && "code" in err && typeof err.code === "number" ? err.code : err ? 1 : 0;
-        resolve({ stdout: stdout || "", code });
+        resolve({ stdout: stdout || "", stderr: stderr || "", code });
       },
     );
   });
 }
 
-function validateRepoRelativePath(cwd: string, relPath: string): { relPath: string; absPath: string; isSymlink: boolean } {
+/** Lightweight branch and tracked/untracked dirty status poll using GIT_OPTIONAL_LOCKS=0. */
+export async function readGitHeadAndDirty(cwd: string, untracked = false): Promise<{ branch: string | null; dirty: boolean } | null> {
+  const head = await execGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"], 2000);
+  if (head.code !== 0) return null;
+  const branch = head.stdout.trim() || null;
+  const st = await execGit(cwd, ["status", "--porcelain", untracked ? "-u" : "-uno"], 2000);
+  return { branch, dirty: st.code === 0 && st.stdout.trim().length > 0 };
+}
+
+function validateRepoRelativePath(
+  cwd: string,
+  relPath: string,
+): { relPath: string; absPath: string; isSymlink: boolean; isDirectory: boolean } {
   const clean = relPath.replace(/\r$/, "");
   if (
     !clean ||
@@ -94,10 +106,13 @@ function validateRepoRelativePath(cwd: string, relPath: string): { relPath: stri
   }
 
   let isSymlink = false;
+  let isDirectory = false;
   try {
     const lst = fs.lstatSync(absPath);
     if (lst.isSymbolicLink()) {
       isSymlink = true;
+    } else if (lst.isDirectory()) {
+      isDirectory = true;
     } else {
       const realTarget = fs.realpathSync(absPath);
       if (!isInside(cwd, realTarget)) {
@@ -109,20 +124,45 @@ function validateRepoRelativePath(cwd: string, relPath: string): { relPath: stri
     // File may be deleted in working tree; ancestor check above is sufficient
   }
 
-  return { relPath: clean, absPath, isSymlink };
+  return { relPath: clean, absPath, isSymlink, isDirectory };
 }
 
-function unquotePorcelainPath(raw: string): string {
-  const s = raw.replace(/\r$/, "");
-  if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) {
-    return s.slice(1, -1).replace(/\\(["\\])/g, "$1");
+interface PorcelainEntry {
+  code: string;
+  path: string;
+}
+
+/** Parse `git status --porcelain -z` output into status code + target relative path records. */
+function parsePorcelainZ(stdout: string): PorcelainEntry[] {
+  const entries: PorcelainEntry[] = [];
+  const fields = stdout.split("\0");
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i]!;
+    if (field.length < 4) continue;
+    const code = field.slice(0, 2);
+    const rel = field.slice(3);
+    if (code.includes("R") || code.includes("C")) {
+      // Porcelain -z emits target path first, then NUL + original path
+      i++;
+    }
+    if (rel) entries.push({ code, path: rel });
   }
-  return s;
+  return entries;
 }
 
-export async function gitDiff(cfg: HostConfig, requestedCwd: string, requestedPath?: string): Promise<GitDiffResult> {
+export interface GitDiffOptions {
+  redactContent?: boolean;
+}
+
+export async function gitDiff(
+  cfg: HostConfig,
+  requestedCwd: string,
+  requestedPath?: string,
+  opts: GitDiffOptions = {},
+): Promise<GitDiffResult> {
   const cwd = resolveWithinRoots(cfg, requestedCwd);
   const startedAt = Date.now();
+  const redact = !!opts.redactContent;
 
   let validatedFilterPath: string | undefined;
   if (requestedPath !== undefined && requestedPath !== "") {
@@ -132,97 +172,90 @@ export async function gitDiff(cfg: HostConfig, requestedCwd: string, requestedPa
   const branchRes = await execGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
   const branch = branchRes.code === 0 ? branchRes.stdout.trim() || null : null;
 
-  const statusArgs = ["status", "--porcelain", "-u"];
+  const statusArgs = ["status", "--porcelain", "-z", "-u"];
   if (validatedFilterPath) statusArgs.push("--", validatedFilterPath);
   const statusRes = await execGit(cwd, statusArgs);
-  if (statusRes.code !== 0 && !statusRes.stdout) {
-    return { cwd, branch, files: [], totalAdditions: 0, totalDeletions: 0 };
+  if (statusRes.code !== 0) {
+    const msg = statusRes.stderr.trim() || "git status failed";
+    if (/not a git repository/i.test(msg)) {
+      return { cwd, branch, files: [], totalAdditions: 0, totalDeletions: 0 };
+    }
+    throw new HostError("internal", msg);
   }
 
-  const lines = statusRes.stdout.split("\n").filter((l) => l.replace(/\r$/, "").length > 3);
+  const entries = parsePorcelainZ(statusRes.stdout);
   const files: GitDiffFile[] = [];
   let totalAdditions = 0;
   let totalDeletions = 0;
   let totalPatchBytes = 0;
 
-  for (const rawLine of lines) {
+  for (const entry of entries) {
     if (files.length >= MAX_DIFF_FILES) break;
-    const line = rawLine.replace(/\r$/, "");
-    const code = line.slice(0, 2);
-    let rawRel = line.slice(3);
-    if (code.includes("R") && rawRel.includes(" -> ")) {
-      rawRel = rawRel.split(" -> ").pop()!;
-    }
-    const candidatePath = unquotePorcelainPath(rawRel);
+    const code = entry.code;
 
-    let validated: { relPath: string; absPath: string; isSymlink: boolean };
+    let validated: { relPath: string; absPath: string; isSymlink: boolean; isDirectory: boolean };
     try {
-      validated = validateRepoRelativePath(cwd, candidatePath);
+      validated = validateRepoRelativePath(cwd, entry.path);
     } catch {
       continue;
     }
-    const { relPath, isSymlink } = validated;
+    const { relPath, isSymlink, isDirectory } = validated;
 
     let status: GitDiffFile["status"] = "modified";
     if (code.includes("A") || code === "??") status = "added";
     else if (code.includes("D")) status = "deleted";
     else if (code.includes("R")) status = "renamed";
 
-    const overBudget =
-      totalPatchBytes >= MAX_TOTAL_PATCH_BYTES || Date.now() - startedAt >= DIFF_DEADLINE_MS;
+    const elapsedMs = Date.now() - startedAt;
+    const remainingMs = DIFF_DEADLINE_MS - elapsedMs;
+    const overBudget = totalPatchBytes >= MAX_TOTAL_PATCH_BYTES || remainingMs <= 0;
 
     let rawPatch = "";
-    if (!overBudget && !isSymlink) {
+    if (!redact && !overBudget && !isSymlink && !isDirectory) {
+      const timeoutMs = Math.max(500, Math.min(5000, remainingMs));
       if (status === "added" && code === "??") {
-        const diffRes = await execGit(cwd, [
-          "diff",
-          "--no-color",
-          "--no-ext-diff",
-          "-U2",
-          "--no-index",
-          "--",
-          "/dev/null",
-          relPath,
-        ]);
+        const diffRes = await execGit(
+          cwd,
+          ["diff", "--no-color", "--no-ext-diff", "-U2", "--no-index", "--", "/dev/null", relPath],
+          timeoutMs,
+        );
         rawPatch = diffRes.stdout;
       } else {
-        const diffRes = await execGit(cwd, ["diff", "--no-color", "--no-ext-diff", "-U2", "HEAD", "--", relPath]);
+        const diffRes = await execGit(cwd, ["diff", "--no-color", "--no-ext-diff", "-U2", "HEAD", "--", relPath], timeoutMs);
         rawPatch = diffRes.stdout;
         if (!rawPatch) {
-          const diffIndex = await execGit(cwd, ["diff", "--no-color", "--no-ext-diff", "-U2", "--", relPath]);
+          const diffIndex = await execGit(cwd, ["diff", "--no-color", "--no-ext-diff", "-U2", "--", relPath], timeoutMs);
           rawPatch = diffIndex.stdout;
           if (!rawPatch) {
-            const diffStaged = await execGit(cwd, [
-              "diff",
-              "--no-color",
-              "--no-ext-diff",
-              "-U2",
-              "--cached",
-              "--",
-              relPath,
-            ]);
+            const diffStaged = await execGit(
+              cwd,
+              ["diff", "--no-color", "--no-ext-diff", "-U2", "--cached", "--", relPath],
+              timeoutMs,
+            );
             rawPatch = diffStaged.stdout;
           }
         }
       }
     }
 
-    const binary = rawPatch.includes("Binary files ") || rawPatch.includes("GIT binary patch");
+    const binary = !redact && (rawPatch.includes("Binary files ") || rawPatch.includes("GIT binary patch"));
     let adds = 0;
     let dels = 0;
-    for (const pLine of rawPatch.split("\n")) {
-      if (pLine.startsWith("+") && !pLine.startsWith("+++")) adds++;
-      else if (pLine.startsWith("-") && !pLine.startsWith("---")) dels++;
+    if (!redact) {
+      for (const pLine of rawPatch.split("\n")) {
+        if (pLine.startsWith("+") && !pLine.startsWith("+++")) adds++;
+        else if (pLine.startsWith("-") && !pLine.startsWith("---")) dels++;
+      }
     }
 
     const remainingBudget = Math.max(0, MAX_TOTAL_PATCH_BYTES - totalPatchBytes);
     const maxFileBytes = Math.min(MAX_FILE_PATCH_BYTES, remainingBudget);
-    let patch = rawPatch;
-    let truncated = overBudget;
-    if (maxFileBytes === 0 && rawPatch.length > 0) {
+    let patch = redact ? "" : rawPatch;
+    let truncated = redact || overBudget;
+    if (!redact && maxFileBytes === 0 && rawPatch.length > 0) {
       patch = "";
       truncated = true;
-    } else if (Buffer.byteLength(rawPatch, "utf8") > maxFileBytes) {
+    } else if (!redact && Buffer.byteLength(rawPatch, "utf8") > maxFileBytes) {
       const t = truncateBytes(rawPatch, maxFileBytes);
       patch = t.text + "\n... [diff truncado a 64KB]";
       truncated = true;
@@ -253,16 +286,30 @@ export async function gitDiff(cfg: HostConfig, requestedCwd: string, requestedPa
 
 export async function gitDiscard(cfg: HostConfig, requestedCwd: string, rawRelPath: string): Promise<GitDiscardResult> {
   const cwd = resolveWithinRoots(cfg, requestedCwd);
-  const { relPath } = validateRepoRelativePath(cwd, rawRelPath);
+  const { relPath, absPath, isSymlink, isDirectory } = validateRepoRelativePath(cwd, rawRelPath);
+  if (isDirectory || isSymlink) {
+    throw new HostError("bad_request", "path must be a file, not a directory or symlink");
+  }
 
-  const statusRes = await execGit(cwd, ["status", "--porcelain", "-u", "--", relPath]);
-  const statusLine = statusRes.stdout.split("\n").find((l) => l.trim().length > 0) ?? "";
-  const code = statusLine.slice(0, 2);
+  const statusRes = await execGit(cwd, ["status", "--porcelain", "-z", "-u", "--", relPath]);
+  if (statusRes.code !== 0) {
+    throw new HostError("internal", statusRes.stderr.trim() || "git status failed");
+  }
+  const matched = parsePorcelainZ(statusRes.stdout).find((e) => e.path === relPath);
+  const code = matched?.code ?? "";
   const isUntracked = code === "??";
 
   if (isUntracked) {
-    const cleanRes = await execGit(cwd, ["clean", "-fd", "--", relPath]);
-    if (cleanRes.code !== 0) throw new HostError("internal", "failed to clean untracked file");
+    let lst: fs.Stats;
+    try {
+      lst = fs.lstatSync(absPath);
+    } catch {
+      return { cwd, ok: true, path: relPath };
+    }
+    if (lst.isDirectory() || lst.isSymbolicLink()) {
+      throw new HostError("bad_request", "path must be a file, not a directory or symlink");
+    }
+    fs.unlinkSync(absPath);
   } else {
     const checkoutRes = await execGit(cwd, ["checkout", "HEAD", "--", relPath]);
     if (checkoutRes.code !== 0) {

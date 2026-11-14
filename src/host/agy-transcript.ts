@@ -6,13 +6,12 @@ import type { SnapshotEntry } from "../extension/snapshot.ts";
 import { SNAPSHOT_LIMIT } from "../extension/snapshot.ts";
 import { LIMITS } from "../extension/forwarder.ts";
 import type { SubagentUpdateEvent } from "../shared/protocol.ts";
-import { truncateBytes } from "../shared/util.ts";
+import { SAFE_CONV_ID_RE, truncateBytes } from "../shared/util.ts";
 import { isInside } from "./validate.ts";
 
 const MAX_SUBAGENTS = 100;
 const MAX_POLL_DELTA_BYTES = 2 * 1024 * 1024;
 const MAX_REMAINDER_BYTES = 1024 * 1024;
-const SAFE_CONV_ID_RE = /^[0-9a-zA-Z_][0-9a-zA-Z_-]{0,127}$/;
 
 /** Empirical context window before Antigravity CLI (agy) triggers conversation compaction (~256k tokens). */
 export const AGY_CONTEXT_WINDOW = 256_000;
@@ -385,6 +384,10 @@ export class AgyTranscriptReader {
   }
 
   /** Return a compact description of the currently executing tool call, if any. */
+  get byteOffset(): number {
+    return this.offset;
+  }
+
   getActiveTask(): string | null {
     if (this.redact() || this.pendingTools.length === 0) return null;
     const latest = this.pendingTools[this.pendingTools.length - 1]!;
