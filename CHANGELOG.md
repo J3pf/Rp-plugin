@@ -5,6 +5,18 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-11-14
+
+Security hardening, serialized Herdr bridge delivery & status reconciliation, non-blocking extension/host handshakes, and modular helper extraction.
+
+### Security
+- **Safe `gitDiscard` & bounded `gitDiff`**: Reject directories and symlinks in `gitDiscard`, match exact untracked files via `-z` porcelain parsing (`fs.unlinkSync` instead of `git clean -fd`), strip patches when `redactContent` is enabled, apply `-z` porcelain + `GIT_OPTIONAL_LOCKS=0` + deadline budgets in `gitDiff`, and enforce `redactContent` in `Broker`.
+- **Command gate & Unix socket IPC authentication**: Harden `dangerousPatterns` (`rm -r` after flags/paths, `git push` forced refspecs), scope `allowKey` by subcommands and block session wildcards for destructive commands, validate `sessionId` against `SAFE_CONV_ID_RE`, write configs/hooks atomically (`0o600`), restrict `agy-gate.sock` directory (`0o700`), probe live sockets before unlinking, and sign/verify gate IPC payloads with per-machine HMAC-SHA256.
+
+### Fixed & Improved
+- **Herdr bridge delivery & status reliability**: Deduplicate `clientMsgId` via `LruSet(500)`, serialize per-session `deliveryTail`, reject with `agent_blocked` instead of pane keystroke fallback, always populate full `user.message.ack` fields, treat `done` as settled alongside `idle` with optimistic `working` expiry + `agent_settled`, defer pane promotion while `PreToolUse` prompts are open, emit `model_select` parity events on external CLI/AGY model changes, lock `pollTranscriptNow` against overlaps, and retire dead orphan sessions lightly.
+- **Extension & host lifecycle resilience**: Keep `deliverInteractive` non-blocking under `mode === "auto"`, bound dialog waits, preserve local editor drafts in `deliverHerdr`, protect active PC TUI `custom()` dialogs from relay cancellations, fix `terminalWait` wedging & sticky `"compacting"` status, send `HostConnection.hello()` immediately with cached quotas, stop reconnecting on `CLOSE.REPLACED` (`4003`), skip non-Pi launcher flags, extract `WsKeepalive` + `src/host/bridge/` modules, and prune >14d inbox files on startup.
+
 ## [0.4.1] - 2026-11-12
 
 Per-session model detection, context token telemetry, Herdr `done` settling, live order sync, and `agent_blocked` pane delivery fallback.
