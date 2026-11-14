@@ -5,6 +5,17 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-11-14
+
+Full Antigravity CLI (`agy`) subagent lifecycle visibility, per-child model tracking, and snapshot replay cleanup.
+
+### Added
+- **Async AGY `invoke_subagent` Lifecycle & Child Transcript Polling**: Parsed full `Subagents` arrays, resolved `truncated_fields` from `transcript_full.jsonl`, kept subagents `running` past the initial creation ack, polled active child transcripts every 900ms for live `tools`, `toolCalls`, `turns`, `tokens`, and `thinking`, and handled `SYSTEM_MESSAGE` completion reports.
+
+### Fixed
+- **Per-Child AGY Subagent Model Detection**: Used requested non-`inherit` `Model` arguments initially and queried `readAgySessionModel` against the child session's own `conversations/<id>.db` (`gen_metadata`) instead of locking onto global `settings.json`.
+- **Snapshot Subagent Replay Cleanup**: Filtered `sendSnapshot` post-snapshot `subagent_update` emissions to active `running` subagents or `taskId`s present in the sent `entries` window, preventing evicted historical completed subagents from appending at the bottom of chat, while preserving queued updates across `dropQueuedEventsUpTo`.
+
 ## [0.4.3] - 2026-11-14
 
 Extension startup event preservation and Gentle Shell e2e compatibility fixes.
