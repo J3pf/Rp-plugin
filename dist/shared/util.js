@@ -1,5 +1,30 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
+/** Safe conversation/session identifier pattern preventing path traversal. */
+export const SAFE_CONV_ID_RE = /^[0-9a-zA-Z_][0-9a-zA-Z_-]{0,127}$/;
+/** Strip ANSI CSI/OSC escape sequences and stray ESC bytes from terminal text. */
+export function stripAnsi(s) {
+    return s
+        .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+        .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+        .replace(/\x1b/g, "");
+}
+/** Write a file atomically via same-directory temp file + chmod + rename. */
+export function atomicWriteFileSync(filePath, content, mode = 0o600) {
+    const dir = path.dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const tmp = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+    fs.writeFileSync(tmp, content, { mode });
+    try {
+        fs.chmodSync(tmp, mode);
+    }
+    catch {
+        /* ignore on platforms without POSIX modes */
+    }
+    fs.renameSync(tmp, filePath);
+}
 export function sha256(buf) {
     return createHash("sha256").update(buf).digest("hex");
 }
@@ -67,7 +92,7 @@ export function preview(s, max = 140) {
 export class LruSet {
     max;
     set = new Set();
-    constructor(max) {
+    constructor(max = 500) {
         this.max = max;
     }
     has(k) {
@@ -80,8 +105,12 @@ export class LruSet {
     add(k) {
         this.set.delete(k);
         this.set.add(k);
-        if (this.set.size > this.max)
-            this.set.delete(this.set.values().next().value);
+        if (this.set.size > this.max) {
+            const oldest = this.set.values().next();
+            if (!oldest.done)
+                this.set.delete(oldest.value);
+        }
+        return this;
     }
     clear() {
         this.set.clear();
@@ -94,6 +123,40 @@ export class LruSet {
     }
     get size() {
         return this.set.size;
+    }
+}
+/** Bounded LRU map remembering the last N entries (refreshes recency on `get`, `has`, and `set`). */
+export class LruMap extends Map {
+    capacity;
+    constructor(maxCapacity = 500) {
+        super();
+        this.capacity = Number.isFinite(maxCapacity) ? Math.max(0, Math.floor(maxCapacity)) : 500;
+    }
+    get(key) {
+        if (!super.has(key))
+            return undefined;
+        const value = super.get(key);
+        super.delete(key);
+        super.set(key, value);
+        return value;
+    }
+    has(key) {
+        if (!super.has(key))
+            return false;
+        const value = super.get(key);
+        super.delete(key);
+        super.set(key, value);
+        return true;
+    }
+    set(key, value) {
+        super.delete(key);
+        super.set(key, value);
+        if (this.size > this.capacity) {
+            const oldest = this.keys().next();
+            if (!oldest.done)
+                super.delete(oldest.value);
+        }
+        return this;
     }
 }
 export function splitCommand(command) {

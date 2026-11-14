@@ -122,3 +122,55 @@ export function toHttpUrl(relayUrl, path) {
 export function toWsUrl(relayUrl, path) {
     return buildRelayEndpointUrl(relayUrl, path, true);
 }
+/** Shared WebSocket client ping + silence-watchdog keepalive timer helper. */
+export class WsKeepalive {
+    watchdogMs;
+    pingIntervalMs;
+    watchdog = null;
+    pingTimer = null;
+    constructor(watchdogMs, pingIntervalMs = 20_000) {
+        this.watchdogMs = watchdogMs;
+        this.pingIntervalMs = pingIntervalMs;
+    }
+    start(ws, openState = 1) {
+        this.stop();
+        this.arm(ws);
+        this.pingTimer = setInterval(() => {
+            if (ws.readyState === openState) {
+                try {
+                    ws.ping();
+                }
+                catch {
+                    try {
+                        ws.terminate();
+                    }
+                    catch {
+                        /* ignore */
+                    }
+                }
+            }
+        }, this.pingIntervalMs);
+        this.pingTimer.unref?.();
+    }
+    arm(ws) {
+        if (this.watchdog)
+            clearTimeout(this.watchdog);
+        this.watchdog = setTimeout(() => {
+            try {
+                ws.terminate();
+            }
+            catch {
+                /* ignore */
+            }
+        }, this.watchdogMs);
+        this.watchdog.unref?.();
+    }
+    stop() {
+        if (this.pingTimer)
+            clearInterval(this.pingTimer);
+        this.pingTimer = null;
+        if (this.watchdog)
+            clearTimeout(this.watchdog);
+        this.watchdog = null;
+    }
+}

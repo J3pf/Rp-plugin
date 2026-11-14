@@ -197,9 +197,34 @@ export interface UserMessageBody {
 
 export interface AgentHerdrLocation {
   paneId: string;
+  /**
+   * Raw Herdr tab ID, or for bridged sessions optionally prefixed with
+   * `[#<4-digit order>][~done][@<tokens>/<contextWindow>]|<tabId>` for card ordering/badges.
+   */
   tabId?: string | null;
   workspaceId?: string | null;
   session?: string | null;
+}
+
+/** Encode optional panel display metadata into `AgentHerdrLocation.tabId` for bridged sessions. */
+export function encodeHerdrTabId(opts: {
+  tabId: string | null;
+  orderIndex?: number | null;
+  isDone?: boolean;
+  context?: { tokens: number; contextWindow: number } | null;
+}): string | null {
+  const idx = opts.orderIndex;
+  const hasOrder = typeof idx === "number" && Number.isFinite(idx) && idx > 0;
+  const isDone = !!opts.isDone;
+  const ctx = opts.context;
+  const hasCtx = !!ctx && ctx.tokens > 0 && ctx.contextWindow > 0;
+  if (!hasOrder && !isDone && !hasCtx) {
+    return opts.tabId;
+  }
+  const orderPart = hasOrder ? `#${String(Math.floor(idx!)).padStart(4, "0")}` : "";
+  const donePart = isDone ? "~done" : "";
+  const ctxPart = hasCtx ? `@${ctx!.tokens}/${ctx!.contextWindow}` : "";
+  return `${orderPart}${donePart}${ctxPart}|${opts.tabId ?? ""}`;
 }
 
 export type AgentClosedReason = "pane_closed";

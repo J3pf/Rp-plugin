@@ -37,6 +37,21 @@ export const CLOSE = {
     BAD_FRAME: 4008,
 };
 export const MAX_FRAME_BYTES = 1024 * 1024;
+/** Encode optional panel display metadata into `AgentHerdrLocation.tabId` for bridged sessions. */
+export function encodeHerdrTabId(opts) {
+    const idx = opts.orderIndex;
+    const hasOrder = typeof idx === "number" && Number.isFinite(idx) && idx > 0;
+    const isDone = !!opts.isDone;
+    const ctx = opts.context;
+    const hasCtx = !!ctx && ctx.tokens > 0 && ctx.contextWindow > 0;
+    if (!hasOrder && !isDone && !hasCtx) {
+        return opts.tabId;
+    }
+    const orderPart = hasOrder ? `#${String(Math.floor(idx)).padStart(4, "0")}` : "";
+    const donePart = isDone ? "~done" : "";
+    const ctxPart = hasCtx ? `@${ctx.tokens}/${ctx.contextWindow}` : "";
+    return `${orderPart}${donePart}${ctxPart}|${opts.tabId ?? ""}`;
+}
 /** Message types the plugin sends that must never be dropped from the outbound queue. */
 export const CRITICAL_TYPES = new Set([
     "agent.hello",
