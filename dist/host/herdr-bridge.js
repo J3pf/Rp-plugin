@@ -479,10 +479,11 @@ export class BridgedAgentSession {
                 truncated,
                 ...(lastActivityAt ? { lastActivityAt } : {}),
             };
+            const snapshotToolIds = collectSnapshotToolCallIds(entries);
             if (direct) {
                 this.conn.dropQueuedEventsUpTo(this.seq);
                 this.conn.sendDirect("agent.snapshot", { ...body, seq: this.seq });
-                for (const sub of this.dedupeSubagentUpdates(events, this.transcriptReader.getSubagents())) {
+                for (const sub of this.dedupeSubagentUpdates(events, this.transcriptReader.getSubagents(), snapshotToolIds)) {
                     this.sendEvent(sub);
                 }
             }
@@ -491,12 +492,16 @@ export class BridgedAgentSession {
                 const emittedSubIds = new Set();
                 for (const ev of events) {
                     if (ev.type === "subagent_update" && typeof ev.taskId === "string") {
+                        if (ev.status !== "running" && !snapshotToolIds.has(ev.taskId))
+                            continue;
                         emittedSubIds.add(ev.taskId);
                     }
                     this.sendEvent(ev);
                 }
                 for (const sub of this.transcriptReader.getSubagents()) {
-                    if (!emittedSubIds.has(sub.taskId)) {
+                    if (emittedSubIds.has(sub.taskId))
+                        continue;
+                    if (sub.status === "running" || snapshotToolIds.has(sub.taskId)) {
                         this.sendEvent(sub);
                     }
                 }
@@ -576,14 +581,21 @@ export class BridgedAgentSession {
             /* fallback to timer */
         }
     }
-    dedupeSubagentUpdates(events, subagents) {
+    dedupeSubagentUpdates(events, subagents, snapshotToolIds) {
         const byId = new Map();
         for (const sub of subagents) {
-            byId.set(sub.taskId, sub);
+            if (sub.status === "running" || snapshotToolIds.has(sub.taskId)) {
+                byId.set(sub.taskId, sub);
+            }
         }
         for (const ev of events) {
             if (ev.type === "subagent_update" && typeof ev.taskId === "string") {
-                byId.set(ev.taskId, ev);
+                if (ev.status === "running" || snapshotToolIds.has(ev.taskId)) {
+                    byId.set(ev.taskId, ev);
+                }
+                else {
+                    byId.delete(ev.taskId);
+                }
             }
         }
         return [...byId.values()];
@@ -1527,4 +1539,20 @@ export class HerdrAgentBridge {
             return this.signGateResponse({ decision: "ask", reason: `RP: error procesando autorización (${errMsg(e)}); confirmar en terminal` }, nonce);
         }
     }
+}
+function collectSnapshotToolCallIds(entries) {
+    const ids = new Set();
+    for (const entry of entries) {
+        if (entry.kind !== "assistant")
+            continue;
+        const content = entry.msg && typeof entry.msg === "object" ? entry.msg.content : null;
+        if (!Array.isArray(content))
+            continue;
+        for (const block of content) {
+            if (block && typeof block === "object" && block.type === "toolCall" && typeof block.id === "string") {
+                ids.add(block.id);
+            }
+        }
+    }
+    return ids;
 }

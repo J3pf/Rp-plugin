@@ -2168,4 +2168,120 @@ describe("herdr-bridge & PreToolUse gate", () => {
       homeSpy.mockRestore();
     }
   });
+
+  it("omits completed pre-snapshot subagents after agent.snapshot while retaining recent and running ones", () => {
+    vi.useFakeTimers();
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-sub-trunc-"));
+    tmpDirs.push(homeDir);
+    const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(homeDir);
+    try {
+      const parentConv = "conv-parent-trunc";
+      const oldChildConv = "conv-child-old";
+      const recentChildConv = "conv-child-recent";
+      const parentPath = resolveAgyTranscriptPath(parentConv, homeDir);
+      const oldChildPath = resolveAgyTranscriptPath(oldChildConv, homeDir);
+      const recentChildPath = resolveAgyTranscriptPath(recentChildConv, homeDir);
+      fs.mkdirSync(path.dirname(parentPath), { recursive: true });
+      fs.mkdirSync(path.dirname(oldChildPath), { recursive: true });
+      fs.mkdirSync(path.dirname(recentChildPath), { recursive: true });
+
+      const steps: unknown[] = [
+        {
+          step_index: 0,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-14T10:00:00Z",
+          tool_calls: [{ name: "invoke_subagent", args: { Role: "Old Worker", TypeName: "odd-worker", Prompt: "Old" } }],
+        },
+        {
+          step_index: 1,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-14T10:00:01Z",
+          content: JSON.stringify({ conversationId: oldChildConv, logAbsoluteUri: pathToFileURL(oldChildPath).href }),
+        },
+        {
+          step_index: 2,
+          type: "SYSTEM_MESSAGE",
+          created_at: "2026-11-14T10:00:02Z",
+          content: `[Message] timestamp=2026-11-14T10:00:02Z sender=${oldChildConv} priority=MESSAGE_PRIORITY_HIGH content=Old finished`,
+        },
+      ];
+      // Push enough subsequent turns to evict the old completed worker out of SNAPSHOT_LIMIT (200 entries)
+      let idx = 3;
+      for (let i = 0; i < 210; i++) {
+        steps.push({
+          step_index: idx++,
+          type: "USER_INPUT",
+          created_at: "2026-11-14T10:01:00Z",
+          content: `<USER_REQUEST>msg ${i}</USER_REQUEST>`,
+        });
+      }
+      steps.push(
+        {
+          step_index: idx++,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-14T10:02:00Z",
+          tool_calls: [{ name: "invoke_subagent", args: { Role: "Recent Worker", TypeName: "research", Prompt: "New" } }],
+        },
+        {
+          step_index: idx++,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-14T10:02:01Z",
+          content: JSON.stringify({ conversationId: recentChildConv, logAbsoluteUri: pathToFileURL(recentChildPath).href }),
+        },
+        {
+          step_index: idx++,
+          type: "SYSTEM_MESSAGE",
+          created_at: "2026-11-14T10:02:02Z",
+          content: `[Message] timestamp=2026-11-14T10:02:02Z sender=${recentChildConv} priority=MESSAGE_PRIORITY_HIGH content=Recent finished`,
+        },
+      );
+      fs.writeFileSync(parentPath, steps.map((s) => JSON.stringify(s)).join("\n") + "\n");
+
+      const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+      const t = { instance: null as FakeTransport | null };
+      const session = new BridgedAgentSession(
+        { agent: "agy", sessionId: parentConv, status: "idle", cwd: homeDir, paneId: "w1:p1", tabId: null, workspaceId: "w1", title: null, stateChangeSeq: 0 },
+        {
+          relayUrl: "https://relay.example.com",
+          machineId: "M1",
+          token: "T1",
+          cfg,
+          herdrSession: null,
+          runner: async () => ({ code: 0, stdout: "{}", stderr: "" }),
+          connectionFactory: (opts) =>
+            new Connection({
+              ...opts,
+              transportFactory: (_name, handlers) => {
+                const ft = new FakeTransport("ws", handlers);
+                t.instance = ft;
+                return ft;
+              },
+            }),
+        },
+      );
+
+      try {
+        t.instance!.open();
+        t.instance!.receive({ v: 1, id: "w", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+
+        const snap = t.instance!.sent.find((e) => e.t === "agent.snapshot");
+        expect(snap).toBeDefined();
+        expect((snap!.d as any).truncated).toBe(true);
+        const snapSeq = (snap!.d as any).seq as number;
+        const postSnapSubs = t.instance!.sent
+          .filter((e) => e.t === "agent.event" && (e.d as any).e?.type === "subagent_update" && (e.d as any).seq > snapSeq)
+          .map((e) => (e.d as any).e.label);
+
+        expect(postSnapSubs).toEqual(["Recent Worker"]);
+        expect(postSnapSubs).not.toContain("Old Worker");
+      } finally {
+        session.stop();
+      }
+    } finally {
+      homeSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });

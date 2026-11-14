@@ -560,10 +560,11 @@ export class BridgedAgentSession {
         truncated,
         ...(lastActivityAt ? { lastActivityAt } : {}),
       };
+      const snapshotToolIds = collectSnapshotToolCallIds(entries);
       if (direct) {
         this.conn.dropQueuedEventsUpTo(this.seq);
         this.conn.sendDirect("agent.snapshot", { ...body, seq: this.seq });
-        for (const sub of this.dedupeSubagentUpdates(events, this.transcriptReader.getSubagents())) {
+        for (const sub of this.dedupeSubagentUpdates(events, this.transcriptReader.getSubagents(), snapshotToolIds)) {
           this.sendEvent(sub);
         }
       } else {
@@ -571,12 +572,14 @@ export class BridgedAgentSession {
         const emittedSubIds = new Set<string>();
         for (const ev of events) {
           if (ev.type === "subagent_update" && typeof ev.taskId === "string") {
+            if (ev.status !== "running" && !snapshotToolIds.has(ev.taskId)) continue;
             emittedSubIds.add(ev.taskId);
           }
           this.sendEvent(ev);
         }
         for (const sub of this.transcriptReader.getSubagents()) {
-          if (!emittedSubIds.has(sub.taskId)) {
+          if (emittedSubIds.has(sub.taskId)) continue;
+          if (sub.status === "running" || snapshotToolIds.has(sub.taskId)) {
             this.sendEvent(sub as unknown as Record<string, unknown>);
           }
         }
@@ -654,14 +657,21 @@ export class BridgedAgentSession {
   private dedupeSubagentUpdates(
     events: Record<string, unknown>[],
     subagents: ReturnType<AgyTranscriptReader["getSubagents"]>,
+    snapshotToolIds: Set<string>,
   ): Record<string, unknown>[] {
     const byId = new Map<string, Record<string, unknown>>();
     for (const sub of subagents) {
-      byId.set(sub.taskId, sub as unknown as Record<string, unknown>);
+      if (sub.status === "running" || snapshotToolIds.has(sub.taskId)) {
+        byId.set(sub.taskId, sub as unknown as Record<string, unknown>);
+      }
     }
     for (const ev of events) {
       if (ev.type === "subagent_update" && typeof ev.taskId === "string") {
-        byId.set(ev.taskId, ev);
+        if (ev.status === "running" || snapshotToolIds.has(ev.taskId)) {
+          byId.set(ev.taskId, ev);
+        } else {
+          byId.delete(ev.taskId);
+        }
       }
     }
     return [...byId.values()];
@@ -1630,4 +1640,19 @@ export class HerdrAgentBridge {
       );
     }
   }
+}
+
+function collectSnapshotToolCallIds(entries: { kind: string; msg?: unknown }[]): Set<string> {
+  const ids = new Set<string>();
+  for (const entry of entries) {
+    if (entry.kind !== "assistant") continue;
+    const content = entry.msg && typeof entry.msg === "object" ? (entry.msg as any).content : null;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block && typeof block === "object" && (block as any).type === "toolCall" && typeof (block as any).id === "string") {
+        ids.add((block as any).id);
+      }
+    }
+  }
+  return ids;
 }
