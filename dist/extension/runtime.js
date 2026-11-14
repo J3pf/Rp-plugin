@@ -388,7 +388,7 @@ export class Runtime {
         });
     }
     onWelcome(w) {
-        this.sendSnapshot(true);
+        this.sendSnapshot(true, w.lastSeq);
         this.conn.sendDirect("agent.status", { status: this.statuses.current });
         const items = this.filterStatuses(this.statuses.snapshot());
         if (Object.keys(items).length)
@@ -397,11 +397,21 @@ export class Runtime {
         for (const p of pendingAnswers(w))
             this.broker.handleAnswer(p.promptId, p.answer);
     }
-    sendSnapshot(direct) {
+    sendSnapshot(direct, lastAckSeq) {
         const { entries, truncated } = buildSnapshotEntries(this.safeBranch(), this.cfg.redactContent);
         if (direct) {
-            this.conn.dropQueuedEventsUpTo(this.seq);
-            this.conn.sendDirect("agent.snapshot", { epoch: this.epoch, seq: this.seq, entries, truncated });
+            if (this.conn.needsSnapshot) {
+                this.conn.dropQueuedEventsUpTo(this.seq);
+                this.conn.sendDirect("agent.snapshot", { epoch: this.epoch, seq: this.seq, entries, truncated });
+            }
+            else {
+                if (typeof lastAckSeq === "number" && lastAckSeq > 0) {
+                    this.conn.dropQueuedEventsUpTo(Math.min(this.seq, lastAckSeq));
+                }
+                const minQueued = this.conn.minQueuedEventSeq();
+                const snapSeq = minQueued !== null ? Math.max(0, minQueued - 1) : this.seq;
+                this.conn.sendDirect("agent.snapshot", { epoch: this.epoch, seq: snapSeq, entries, truncated });
+            }
         }
         else {
             this.conn.send("agent.snapshot", { epoch: this.epoch, seq: this.seq, entries, truncated });

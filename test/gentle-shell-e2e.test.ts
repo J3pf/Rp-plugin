@@ -134,12 +134,12 @@ describe.skipIf(!hasTmux)("real gentle-shell + gentle-pi", () => {
     expect(fauxLog().find((l) => l.call === 2)!.lastMessage).not.toMatch(/denied|blocked|not allowed/i);
   }, 150000);
 
-  it("S4: `/gentle:mode` sent from the phone as a command runs through sendUserMessage", async () => {
+  it("S4: `/gentle:mode status` sent from the phone as a command runs through sendUserMessage", async () => {
     install();
     launchShell([{ text: "x" }]);
     await waitUntil(() => relay.of("agent.hello")[0], 60000);
     await waitScreen("faux-1");
-    relay.push("user.message", { clientMsgId: "gs-2", text: "/gentle:mode", asCommand: true });
+    relay.push("user.message", { clientMsgId: "gs-2", text: "/gentle:mode status", asCommand: true });
     await waitUntil(() => relay.of("user.message.ack")[0], 15000);
     expect(relay.of("user.message.ack")[0]!.d).toMatchObject({ disposition: "command", method: "api" });
     await waitScreen(/Permissions: NORMAL/);

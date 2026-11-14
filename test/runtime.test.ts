@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import rpExtension from "../src/extension/index.ts";
 import { toolDetail } from "../src/extension/runtime.ts";
 import * as configModule from "../src/extension/config.ts";
+import { envelope } from "../src/shared/protocol.ts";
 import { FakeRelay, baseConfig, makeCtx, makePi, makeUi, waitUntil } from "./helpers.ts";
 import fs from "node:fs";
 import os from "node:os";
@@ -654,5 +655,45 @@ describe("toolDetail telemetry", () => {
     expect(toolDetail("grep", { pattern: "agent.event" })).toBe(": agent.event");
     expect(toolDetail("custom", null)).toBe("");
   });
+});
+
+describe("snapshot vs queued live events on welcome", () => {
+  it("preserves events queued before initial agent.welcome without dropping agent_settled", async () => {
+    relay.autoWelcome = false;
+    const t = await boot();
+    const hello = await waitUntil(() => relay.of("agent.hello")[0], 3000, "agent.hello");
+    await t.fire("agent_start", { type: "agent_start" }, t.ctx);
+    await t.fire("agent_settled", { aborted: false }, t.ctx);
+
+    relay.conns[0]!.ws.send(JSON.stringify(envelope("agent.welcome", { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] }, { re: hello.id })));
+
+    await waitUntil(() => relay.of("agent.snapshot").length === 1, 3000, "agent.snapshot");
+    await waitUntil(() => relay.of("agent.event").some((e) => e.d.e.type === "agent_settled"), 3000, "agent_settled");
+    expect(relay.of("agent.snapshot")[0]!.d.seq).toBe(0);
+    expect(relay.of("agent.event").map((e) => [e.d.seq, e.d.e.type])).toEqual([
+      [1, "agent_start"],
+      [2, "agent_settled"],
+    ]);
+  });
+
+  it("drops queued events <= welcome.lastSeq on reconnect while flushing newer events", async () => {
+    const t = await boot();
+    await waitUntil(() => relay.of("agent.snapshot").length === 1, 3000, "initial snapshot");
+    const port = relay.port;
+    await relay.stop();
+    await waitUntil(() => t.ctx.ui.mocks.setStatus.mock.calls.some((c: any[]) => c[1] === "RP …"), 3000, "disconnected");
+
+    // Events emitted while disconnected: seq 1 was already acked by relay, seq 2 is new.
+    await t.fire("agent_start", { type: "agent_start" }, t.ctx);
+    await t.fire("agent_settled", { aborted: false }, t.ctx);
+
+    relay = await new FakeRelay().start(port);
+    relay.welcomeBody = { serverTime: Date.now(), lastSeq: 1, pendingAnswers: [] };
+
+    await waitUntil(() => relay.of("agent.snapshot").length === 1, 8000, "reconnect snapshot");
+    await waitUntil(() => relay.of("agent.event").some((e) => e.d.e.type === "agent_settled"), 3000, "flushed event > lastSeq");
+    expect(relay.of("agent.snapshot")[0]!.d.seq).toBe(1);
+    expect(relay.of("agent.event").map((e) => [e.d.seq, e.d.e.type])).toEqual([[2, "agent_settled"]]);
+  }, 15_000);
 });
 void configModule;
