@@ -306,10 +306,15 @@ export class BridgedAgentSession {
     effectiveStatus() {
         if (this.broker.openCount > 0)
             return "waiting_input";
-        if ((this.currentStatus === "idle" || this.currentStatus === "done") && Date.now() < this.optimisticWorkingUntilMs) {
+        if ((this.currentStatus === "idle" || this.currentStatus === "done") &&
+            (Date.now() < this.optimisticWorkingUntilMs ||
+                (this.transcriptReader?.hasRunningBackgroundTasks() ?? false))) {
             return "working";
         }
         return this.currentStatus;
+    }
+    hasRunningTranscriptWork() {
+        return this.transcriptReader?.hasRunningWork() ?? false;
     }
     clearOptimisticWorking() {
         this.optimisticWorkingUntilMs = 0;
@@ -469,7 +474,7 @@ export class BridgedAgentSession {
     sendSnapshot(direct) {
         this.initialSnapshotSent = true;
         if (this.transcriptReader) {
-            const hadRunning = this.transcriptReader.hasRunningSubagents();
+            const hadRunning = this.hasRunningTranscriptWork();
             const { entries, truncated, events } = this.transcriptReader.readSnapshot();
             const lastActivityAt = this.transcriptReader.getLastActivityAt();
             const body = {
@@ -480,11 +485,15 @@ export class BridgedAgentSession {
                 ...(lastActivityAt ? { lastActivityAt } : {}),
             };
             const snapshotToolIds = collectSnapshotToolCallIds(entries);
+            const emittedUpdateToolIds = new Set();
             if (direct) {
                 this.conn.dropQueuedEventsUpTo(this.seq);
                 this.conn.sendDirect("agent.snapshot", { ...body, seq: this.seq });
                 for (const sub of this.dedupeSubagentUpdates(events, this.transcriptReader.getSubagents(), snapshotToolIds)) {
                     this.sendEvent(sub);
+                }
+                for (const upd of this.transcriptReader.getRunningBackgroundUpdates(snapshotToolIds)) {
+                    this.sendEvent(upd);
                 }
             }
             else {
@@ -496,6 +505,9 @@ export class BridgedAgentSession {
                             continue;
                         emittedSubIds.add(ev.taskId);
                     }
+                    else if (ev.type === "tool_execution_update" && typeof ev.toolCallId === "string") {
+                        emittedUpdateToolIds.add(ev.toolCallId);
+                    }
                     this.sendEvent(ev);
                 }
                 for (const sub of this.transcriptReader.getSubagents()) {
@@ -505,8 +517,14 @@ export class BridgedAgentSession {
                         this.sendEvent(sub);
                     }
                 }
+                for (const upd of this.transcriptReader.getRunningBackgroundUpdates(snapshotToolIds)) {
+                    const toolId = upd.toolCallId;
+                    if (typeof toolId === "string" && emittedUpdateToolIds.has(toolId))
+                        continue;
+                    this.sendEvent(upd);
+                }
             }
-            if (!hadRunning && this.transcriptReader.hasRunningSubagents()) {
+            if (!hadRunning && this.hasRunningTranscriptWork()) {
                 this.scheduleNextPoll();
             }
             this.syncSessionNameIfChanged();
@@ -605,7 +623,7 @@ export class BridgedAgentSession {
             return;
         if (this.pollTimer)
             clearTimeout(this.pollTimer);
-        const isWorking = this.effectiveStatus() === "working" || (this.transcriptReader?.hasRunningSubagents() ?? false);
+        const isWorking = this.effectiveStatus() === "working" || this.hasRunningTranscriptWork();
         const delayMs = isWorking ? 900 : this.watcher ? 15_000 : 4_500;
         this.pollTimer = setTimeout(() => {
             void this.pollTranscriptNow().finally(() => this.scheduleNextPoll());
@@ -626,7 +644,8 @@ export class BridgedAgentSession {
                 if (this.transcriptReader) {
                     if (!this.watcher)
                         this.setupFileWatcher();
-                    const hadRunning = this.transcriptReader.hasRunningSubagents();
+                    const hadRunning = this.hasRunningTranscriptWork();
+                    const prevTab = this.encodedTabId();
                     const prevOffset = this.transcriptReader.byteOffset;
                     const events = this.transcriptReader.pollNewEvents();
                     const offsetAdvanced = this.transcriptReader.byteOffset !== prevOffset;
@@ -638,7 +657,7 @@ export class BridgedAgentSession {
                             shouldRefreshGit = true;
                         }
                     }
-                    if (!hadRunning && this.transcriptReader.hasRunningSubagents()) {
+                    if (!hadRunning && this.hasRunningTranscriptWork()) {
                         this.scheduleNextPoll();
                     }
                     if (offsetAdvanced || events.length > 0) {
@@ -647,11 +666,10 @@ export class BridgedAgentSession {
                         this.syncModelIfChanged();
                     }
                     if (events.length > 0) {
-                        if (this.effectiveStatus() === "working") {
-                            const nextTask = this.transcriptReader.getActiveTask();
-                            if (nextTask !== this.lastActiveTask) {
-                                this.syncStatus();
-                            }
+                        this.reconcileStatus();
+                        const nextTab = this.encodedTabId();
+                        if (this.conn.connected && this.initialSnapshotSent && nextTab !== prevTab && nextTab !== this.lastSentTabId) {
+                            this.conn.sendDirect("agent.hello", this.makeHello());
                         }
                         if (shouldRefreshGit) {
                             void this.refreshGit();

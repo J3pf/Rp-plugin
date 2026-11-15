@@ -12,6 +12,7 @@ const MAX_SUBAGENTS = 100;
 const MAX_SUBAGENT_TOOLS = 100;
 const MAX_SUBAGENT_THINKING_BYTES = 1024;
 const MAX_SUBAGENT_RESULT_BYTES = 4096;
+const MAX_BG_TASK_LOG_BYTES = 8192;
 const MAX_POLL_DELTA_BYTES = 2 * 1024 * 1024;
 const MAX_REMAINDER_BYTES = 1024 * 1024;
 const MODEL_CHANGE_RE = /changed setting `Model Selection` from [^\n]+? to ([^\n<]+?)\.(?:\s|$)/i;
@@ -94,6 +95,7 @@ export function normalizeAgyToolCall(stepIndex, callIndex, rawCall) {
                         ? { toolSummary: parsed.toolSummary.trim() }
                         : {}),
                 },
+                ...(parsed.IsDaemon === true ? { isDaemon: true } : {}),
             };
         case "view_file":
         case "read_file":
@@ -169,6 +171,20 @@ export function normalizeAgyToolCall(stepIndex, callIndex, rawCall) {
             };
         case "invoke_subagent":
             return normalizeInvokeSubagentEntry(rawCall.id && String(rawCall.id).trim() ? String(rawCall.id).trim() : `agy:${stepIndex}:${callIndex}`, {}, parsed, Array.isArray(parsed.Subagents) ? parsed.Subagents : []);
+        case "manage_task": {
+            const safeArgs = {};
+            for (const [k, v] of Object.entries(parsed)) {
+                safeArgs[k] = typeof v === "string" ? truncateBytes(v, 2048).text : v;
+            }
+            const rawTaskId = typeof parsed.TaskId === "string" ? parsed.TaskId.trim() : "";
+            const killTaskSender = parsed.Action === "kill" && isSafeSystemSender(rawTaskId) ? rawTaskId : undefined;
+            return {
+                toolCallId,
+                name: rawName,
+                args: safeArgs,
+                ...(killTaskSender ? { killTaskSender } : {}),
+            };
+        }
         default: {
             const safeArgs = {};
             for (const [k, v] of Object.entries(parsed)) {
@@ -450,12 +466,20 @@ function parseSpawnedSubagentRefs(rawOut) {
     }
     return refs;
 }
+function isSafeSystemSender(sender) {
+    if (!sender)
+        return false;
+    if (SAFE_CONV_ID_RE.test(sender))
+        return true;
+    const parts = sender.split("/");
+    return parts.length === 2 && SAFE_CONV_ID_RE.test(parts[0]) && SAFE_CONV_ID_RE.test(parts[1]);
+}
 function parseSystemWakeup(raw) {
     if (!raw)
         return null;
     const senderMatch = /\bsender=([^\s\]\n<>]+)/.exec(raw);
     const sender = senderMatch?.[1]?.trim();
-    if (!sender || !SAFE_CONV_ID_RE.test(sender))
+    if (!sender || !isSafeSystemSender(sender))
         return null;
     let content = "";
     const contentIdx = raw.search(/\bcontent=/);
@@ -467,6 +491,77 @@ function parseSystemWakeup(raw) {
         content = rest.trim();
     }
     return { sender, content };
+}
+function parseBackgroundTaskAck(rawOut) {
+    if (!rawOut)
+        return null;
+    const idMatch = /Tool is running as a background task with task id:\s*([^\s\r\n]+)/i.exec(rawOut);
+    const taskSender = idMatch?.[1]?.trim();
+    if (!taskSender || !isSafeSystemSender(taskSender))
+        return null;
+    const logMatch = /Task logs are available at:\s*(file:\/\/[^\s\r\n]+)/i.exec(rawOut);
+    const logMatchUri = logMatch?.[1]?.trim();
+    const outMatch = /(?:^|\r?\n)Log output:\r?\n([\s\S]*)$/.exec(rawOut);
+    const initialTail = outMatch?.[1]?.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+    return {
+        taskSender,
+        ...(logMatchUri ? { logUri: logMatchUri } : {}),
+        ...(initialTail ? { initialTail: truncateBytes(initialTail, LIMITS.resultMaxBytes).text } : {}),
+    };
+}
+function isFinalBackgroundWakeup(content) {
+    return (/\bfinished with (?:result|error)\b/i.test(content) ||
+        /^(?:The )?[Cc]ommand exited with code \d+\b/m.test(content));
+}
+function isBackgroundTaskError(content) {
+    return (/\bfinished with error\b/i.test(content) ||
+        /^(?:The )?[Cc]ommand exited with code [1-9]\d*\b/m.test(content));
+}
+function readLogTail(filePath, maxReadBytes = MAX_BG_TASK_LOG_BYTES) {
+    let st;
+    try {
+        st = fs.statSync(filePath);
+    }
+    catch {
+        return null;
+    }
+    if (!st.isFile() || st.size <= 0)
+        return null;
+    const start = Math.max(0, st.size - maxReadBytes);
+    const len = st.size - start;
+    const buf = Buffer.allocUnsafe(len);
+    let bytesRead = 0;
+    const fd = fs.openSync(filePath, "r");
+    try {
+        bytesRead = fs.readSync(fd, buf, 0, len, start);
+    }
+    finally {
+        fs.closeSync(fd);
+    }
+    if (bytesRead <= 0)
+        return null;
+    let view = buf.subarray(0, bytesRead);
+    if (start > 0) {
+        const nl = view.indexOf(0x0a);
+        if (nl >= 0 && nl + 1 < view.length) {
+            view = view.subarray(nl + 1);
+        }
+        else {
+            let idx = 0;
+            while (idx < view.length && (view[idx] & 0xc0) === 0x80)
+                idx++;
+            if (idx > 0)
+                view = view.subarray(idx);
+        }
+    }
+    const normalized = view.toString("utf8").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+    if (!normalized)
+        return null;
+    return {
+        text: truncateBytes(normalized, LIMITS.resultMaxBytes).text,
+        size: st.size,
+        mtimeMs: st.mtimeMs,
+    };
 }
 function subagentChanged(a, b) {
     if (a.status !== b.status ||
@@ -538,6 +633,7 @@ export class AgyTranscriptReader {
     subagents = new Map();
     convToTaskId = new Map();
     childCursors = new Map();
+    bgTasks = new Map();
     lastTopic = null;
     lastContextUsage = null;
     constructor(transcriptPath, redact = () => false) {
@@ -552,6 +648,36 @@ export class AgyTranscriptReader {
                 return true;
         }
         return false;
+    }
+    /** Return true when any non-daemon background tool task (e.g. long `run_command`) is still executing. */
+    hasRunningBackgroundTasks() {
+        for (const bg of this.bgTasks.values()) {
+            if (!bg.isDaemon)
+                return true;
+        }
+        return false;
+    }
+    hasRunningWork() {
+        return this.hasRunningSubagents() || this.hasRunningBackgroundTasks();
+    }
+    /** Return latest live partial-result updates for still-running background tools present in the snapshot. */
+    getRunningBackgroundUpdates(snapshotToolIds) {
+        if (this.redact() || this.bgTasks.size === 0)
+            return [];
+        const out = [];
+        for (const bg of this.bgTasks.values()) {
+            if (!bg.lastTail)
+                continue;
+            if (snapshotToolIds && !snapshotToolIds.has(bg.toolCallId))
+                continue;
+            out.push({
+                type: "tool_execution_update",
+                toolCallId: bg.toolCallId,
+                toolName: bg.name,
+                partialResult: { content: [{ type: "text", text: bg.lastTail }] },
+            });
+        }
+        return out;
     }
     getSubagents() {
         const isRedacted = this.redact();
@@ -585,10 +711,18 @@ export class AgyTranscriptReader {
         return this.offset;
     }
     getActiveTask() {
-        if (this.redact() || this.pendingTools.length === 0)
+        if (this.redact())
             return null;
-        const latest = this.pendingTools[this.pendingTools.length - 1];
-        return summarizeAgyToolTask(latest.name, latest.args);
+        if (this.pendingTools.length > 0) {
+            const latest = this.pendingTools[this.pendingTools.length - 1];
+            return summarizeAgyToolTask(latest.name, latest.args);
+        }
+        let latestBg = null;
+        for (const bg of this.bgTasks.values()) {
+            if (!bg.isDaemon)
+                latestBg = bg;
+        }
+        return latestBg ? summarizeAgyToolTask(latestBg.name, latestBg.args) : null;
     }
     /** Return the timestamp (ms) of the most recent conversation entry, or the transcript file mtime. */
     getLastActivityAt() {
@@ -644,6 +778,7 @@ export class AgyTranscriptReader {
                 this.subagents.clear();
                 this.convToTaskId.clear();
                 this.childCursors.clear();
+                this.bgTasks.clear();
                 this.lastContextUsage = null;
             }
             this.offset = chunk.nextOffset;
@@ -669,7 +804,7 @@ export class AgyTranscriptReader {
                     const hasTrunc = Boolean(truncFields && (truncFields.includes("content") || truncFields.includes("tool_calls")));
                     const isTailLine = li >= chunk.lines.length - 5;
                     const isTailPlannerOrSys = (isTailLine && (step.type === "PLANNER_RESPONSE" || step.type === "SYSTEM_MESSAGE")) ||
-                        (step.type === "SYSTEM_MESSAGE" && this.convToTaskId.size > 0);
+                        (step.type === "SYSTEM_MESSAGE" && (this.convToTaskId.size > 0 || this.bgTasks.size > 0));
                     const isSubagentToolCall = step.type === "PLANNER_RESPONSE" &&
                         Boolean(truncFields?.includes("tool_calls")) &&
                         Array.isArray(step.tool_calls) &&
@@ -690,7 +825,89 @@ export class AgyTranscriptReader {
             }
         }
         this.pollActiveChildren(liveEvents);
+        this.pollActiveBackgroundTasks(liveEvents);
         return liveEvents;
+    }
+    resolveTaskLogPath(taskSender, logUri) {
+        if (!isSafeSystemSender(taskSender))
+            return null;
+        const parts = taskSender.split("/");
+        const taskPart = parts.length === 2 ? parts[1] : parts[0];
+        const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
+        const homeDir = inferAgyHomeFromTranscriptPath(this.transcriptPath);
+        const brainRoot = path.resolve(homeDir, ".gemini", "antigravity-cli", "brain");
+        if (logUri && typeof logUri === "string") {
+            try {
+                const url = new URL(logUri);
+                if (url.protocol === "file:") {
+                    const candidate = path.resolve(fileURLToPath(url));
+                    if (path.basename(candidate).endsWith(".log") &&
+                        (isInside(brainRoot, candidate) || isInside(siblingRoot, candidate))) {
+                        return candidate;
+                    }
+                }
+            }
+            catch {
+                /* fall back to canonical tasks directory */
+            }
+        }
+        return SAFE_CONV_ID_RE.test(taskPart) ? path.join(siblingRoot, "tasks", `${taskPart}.log`) : null;
+    }
+    pollActiveBackgroundTasks(outEvents) {
+        if (this.bgTasks.size === 0)
+            return;
+        const isRedacted = this.redact();
+        for (const bg of this.bgTasks.values()) {
+            this.pollBackgroundTaskCursor(bg, outEvents, isRedacted);
+        }
+    }
+    pollBackgroundTaskCursor(bg, outEvents, isRedacted) {
+        if (!bg.logPath || isRedacted)
+            return;
+        let st;
+        try {
+            st = fs.statSync(bg.logPath);
+        }
+        catch {
+            return;
+        }
+        if (!st.isFile() || (st.size === bg.lastSize && st.mtimeMs === bg.lastMtimeMs))
+            return;
+        const tail = readLogTail(bg.logPath);
+        bg.lastSize = st.size;
+        bg.lastMtimeMs = st.mtimeMs;
+        if (!tail || tail.text === bg.lastTail)
+            return;
+        bg.lastTail = tail.text;
+        outEvents.push({
+            type: "tool_execution_update",
+            toolCallId: bg.toolCallId,
+            toolName: bg.name,
+            partialResult: { content: [{ type: "text", text: tail.text }] },
+        });
+    }
+    finalizeToolResult(eid, toolCallId, toolName, startedAt, endedAt, isError, rawOut, isRedacted, outEvents) {
+        const { text, truncated } = truncateBytes(rawOut, LIMITS.resultMaxBytes);
+        const resultObj = {
+            content: [{ type: "text", text }],
+            ...(truncated ? { truncated: true } : {}),
+        };
+        const entryMsg = {
+            role: "toolResult",
+            toolCallId,
+            toolName,
+            isError,
+            ...(isRedacted ? {} : { content: resultObj.content }),
+        };
+        this.entries.push({ eid, kind: "tool_result", at: endedAt, msg: entryMsg });
+        outEvents.push({
+            type: "tool_execution_end",
+            toolCallId,
+            toolName,
+            isError,
+            durationMs: Math.max(0, endedAt - startedAt),
+            ...(isRedacted ? {} : { result: resultObj, ...(truncated ? { truncated: true } : {}) }),
+        });
     }
     resolveChildTranscriptPath(convId, logAbsoluteUri) {
         if (!SAFE_CONV_ID_RE.test(convId))
@@ -868,6 +1085,28 @@ export class AgyTranscriptReader {
             const parsed = parseSystemWakeup(typeof step.content === "string" ? step.content : "");
             if (!parsed)
                 return;
+            const bg = this.bgTasks.get(parsed.sender);
+            if (bg) {
+                if (!isFinalBackgroundWakeup(parsed.content)) {
+                    this.pollBackgroundTaskCursor(bg, outEvents, isRedacted);
+                    const snippet = !isRedacted && parsed.content ? truncateBytes(parsed.content, LIMITS.resultMaxBytes).text : "";
+                    if (snippet && snippet !== bg.lastTail) {
+                        bg.lastTail = snippet;
+                        outEvents.push({
+                            type: "tool_execution_update",
+                            toolCallId: bg.toolCallId,
+                            toolName: bg.name,
+                            partialResult: { content: [{ type: "text", text: snippet }] },
+                        });
+                    }
+                    return;
+                }
+                const bgIsError = isBackgroundTaskError(parsed.content);
+                const finalOut = parsed.content || bg.lastTail || "";
+                this.bgTasks.delete(parsed.sender);
+                this.finalizeToolResult(eid, bg.toolCallId, bg.name, bg.startedAt, at, bgIsError, finalOut, isRedacted, outEvents);
+                return;
+            }
             const taskId = this.convToTaskId.get(parsed.sender);
             if (!taskId)
                 return;
@@ -960,6 +1199,8 @@ export class AgyTranscriptReader {
                     name: first.name,
                     args: first.args,
                     at,
+                    ...(first.isDaemon ? { isDaemon: true } : {}),
+                    ...(first.killTaskSender ? { killTaskSender: first.killTaskSender } : {}),
                     subagentSpec: first.subagentSpec,
                     ...(subagentIds.length > 0 ? { subagentIds } : {}),
                 });
@@ -992,30 +1233,45 @@ export class AgyTranscriptReader {
             const pending = this.pendingTools.shift();
             const isError = step.status === "ERROR";
             const rawOut = typeof step.content === "string" ? step.content : "";
-            const { text, truncated } = truncateBytes(rawOut, LIMITS.resultMaxBytes);
-            const resultObj = {
-                content: [{ type: "text", text }],
-                ...(truncated ? { truncated: true } : {}),
-            };
+            if (pending.killTaskSender && !isError) {
+                const killed = this.bgTasks.get(pending.killTaskSender);
+                if (killed) {
+                    this.bgTasks.delete(pending.killTaskSender);
+                    this.finalizeToolResult(`${eid}:killed`, killed.toolCallId, killed.name, killed.startedAt, at, false, rawOut || killed.lastTail || "", isRedacted, outEvents);
+                }
+            }
+            if (!pending.subagentIds?.length && !isError && (step.status === "RUNNING" || !step.status)) {
+                const bgAck = parseBackgroundTaskAck(rawOut);
+                if (bgAck) {
+                    const logPath = this.resolveTaskLogPath(bgAck.taskSender, bgAck.logUri);
+                    const cursor = {
+                        taskSender: bgAck.taskSender,
+                        toolCallId: pending.toolCallId,
+                        name: pending.name,
+                        args: pending.args,
+                        startedAt: pending.at,
+                        isDaemon: Boolean(pending.isDaemon),
+                        logPath,
+                        lastSize: 0,
+                        lastMtimeMs: 0,
+                    };
+                    this.bgTasks.set(bgAck.taskSender, cursor);
+                    this.pollBackgroundTaskCursor(cursor, outEvents, isRedacted);
+                    if (!isRedacted && !cursor.lastTail && bgAck.initialTail) {
+                        cursor.lastTail = bgAck.initialTail;
+                        outEvents.push({
+                            type: "tool_execution_update",
+                            toolCallId: cursor.toolCallId,
+                            toolName: cursor.name,
+                            partialResult: { content: [{ type: "text", text: bgAck.initialTail }] },
+                        });
+                    }
+                    return;
+                }
+            }
             const targetIds = pending.subagentIds && pending.subagentIds.length > 0 ? pending.subagentIds : [pending.toolCallId];
             for (let si = 0; si < targetIds.length; si++) {
-                const toolCallId = targetIds[si];
-                const entryMsg = {
-                    role: "toolResult",
-                    toolCallId,
-                    toolName: pending.name,
-                    isError,
-                    ...(isRedacted ? {} : { content: resultObj.content }),
-                };
-                this.entries.push({ eid: si === 0 ? eid : `${eid}:${si}`, kind: "tool_result", at, msg: entryMsg });
-                outEvents.push({
-                    type: "tool_execution_end",
-                    toolCallId,
-                    toolName: pending.name,
-                    isError,
-                    durationMs: Math.max(0, at - pending.at),
-                    ...(isRedacted ? {} : { result: resultObj, ...(truncated ? { truncated: true } : {}) }),
-                });
+                this.finalizeToolResult(si === 0 ? eid : `${eid}:${si}`, targetIds[si], pending.name, pending.at, at, isError, rawOut, isRedacted, outEvents);
             }
             if (pending.subagentIds && pending.subagentIds.length > 0) {
                 const refs = isError ? [] : parseSpawnedSubagentRefs(rawOut);

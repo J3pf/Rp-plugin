@@ -2285,3 +2285,389 @@ describe("herdr-bridge & PreToolUse gate", () => {
     }
   });
 });
+
+describe("agy background run_command tasks", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  function setupBgWorkspace() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-bg-"));
+    dirs.push(tmp);
+    const homeDir = path.join(tmp, "home");
+    const convId = "bgparent-1111-2222-3333-444455556666";
+    const transcriptPath = path.join(
+      homeDir,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      convId,
+      ".system_generated",
+      "logs",
+      "transcript.jsonl",
+    );
+    const tasksDir = path.join(
+      homeDir,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      convId,
+      ".system_generated",
+      "tasks",
+    );
+    fs.mkdirSync(path.dirname(transcriptPath), { recursive: true });
+    fs.mkdirSync(tasksDir, { recursive: true });
+    return { homeDir, convId, transcriptPath, tasksDir };
+  }
+
+  it("keeps background run_command running with live log tails until completion SYSTEM_MESSAGE", () => {
+    const { convId, transcriptPath, tasksDir } = setupBgWorkspace();
+    const taskId = "task-10";
+    const taskSender = `${convId}/${taskId}`;
+    const logPath = path.join(tasksDir, `${taskId}.log`);
+    fs.writeFileSync(logPath, "Building project...\n");
+
+    const appendSteps = (steps: unknown[]) => {
+      fs.appendFileSync(transcriptPath, steps.map((s) => JSON.stringify(s)).join("\n") + "\n");
+    };
+
+    appendSteps([
+      {
+        step_index: 0,
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        created_at: "2026-11-14T22:00:00Z",
+        tool_calls: [
+          {
+            id: "call-deploy-1",
+            name: "run_command",
+            args: { CommandLine: '"npm run deploy"', toolSummary: '"Deploy cloud functions"' },
+          },
+        ],
+      },
+      {
+        step_index: 1,
+        type: "GENERIC",
+        status: "RUNNING",
+        created_at: "2026-11-14T22:00:05Z",
+        content: [
+          "Created At: 2026-11-14T22:00:00-05:00",
+          `Tool is running as a background task with task id: ${taskSender}`,
+          "Task Description: npm run deploy",
+          `Task logs are available at: ${pathToFileURL(logPath).href}`,
+          "Log output:",
+          "Building project...",
+        ].join("\n"),
+      },
+    ]);
+
+    const reader = new AgyTranscriptReader(transcriptPath);
+    const snap = reader.readSnapshot();
+    expect(snap.events.some((e) => e.type === "tool_execution_end")).toBe(false);
+    expect(reader.hasRunningBackgroundTasks()).toBe(true);
+    expect(reader.getActiveTask()).toBe("Deploy cloud functions");
+    const startUpdates = snap.events.filter((e) => e.type === "tool_execution_update");
+    expect(startUpdates.length).toBeGreaterThanOrEqual(1);
+    expect((startUpdates.at(-1) as any).partialResult.content[0].text).toContain("Building project...");
+
+    // Log grows asynchronously before transcript.jsonl appends anything new
+    fs.appendFileSync(logPath, "Deploying endpoint alpha...\n");
+    const poll1 = reader.pollNewEvents();
+    expect(poll1.some((e) => e.type === "tool_execution_end")).toBe(false);
+    const update1 = poll1.find((e) => e.type === "tool_execution_update") as any;
+    expect(update1).toBeDefined();
+    expect(update1.toolCallId).toBe("call-deploy-1");
+    expect(update1.partialResult.content[0].text).toContain("Deploying endpoint alpha...");
+
+    // Intermediate stabilization notice must NOT finish the background task
+    appendSteps([
+      {
+        step_index: 2,
+        type: "SYSTEM_MESSAGE",
+        status: "DONE",
+        created_at: "2026-11-14T22:00:15Z",
+        content: `[Message] timestamp=2026-11-14T22:00:15Z sender=${taskSender} priority=MESSAGE_PRIORITY_HIGH content=The command output has stabilized for 5s. The output delta since last report is:\nStill deploying...`,
+      },
+    ]);
+    const poll2 = reader.pollNewEvents();
+    expect(poll2.some((e) => e.type === "tool_execution_end")).toBe(false);
+    expect(reader.hasRunningBackgroundTasks()).toBe(true);
+
+    // Final completion notice finishes the tool cleanly
+    appendSteps([
+      {
+        step_index: 3,
+        type: "SYSTEM_MESSAGE",
+        status: "DONE",
+        created_at: "2026-11-14T22:00:30Z",
+        content: `[Message] timestamp=2026-11-14T22:00:30Z sender=${taskSender} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskSender}" finished with result:\n\nCommand exited with code 0.\n\nCommand output:\nDeployed OK`,
+      },
+    ]);
+    const poll3 = reader.pollNewEvents();
+    const endEv = poll3.find((e) => e.type === "tool_execution_end") as any;
+    expect(endEv).toBeDefined();
+    expect(endEv.toolCallId).toBe("call-deploy-1");
+    expect(endEv.toolName).toBe("bash");
+    expect(endEv.isError).toBe(false);
+    expect(endEv.durationMs).toBe(30_003);
+    expect(endEv.result.content[0].text).toContain("Deployed OK");
+    expect(reader.hasRunningBackgroundTasks()).toBe(false);
+  });
+
+  it("handles non-zero exit code, safe log path confinement, daemons, kill, and redactContent", () => {
+    const { convId, transcriptPath, tasksDir } = setupBgWorkspace();
+    const taskFail = `${convId}/task-11`;
+    const taskDaemon = `${convId}/task-12`;
+    const taskKill = `${convId}/task-13`;
+    const canonicalFailLog = path.join(tasksDir, "task-11.log");
+    const daemonLog = path.join(tasksDir, "task-12.log");
+    fs.writeFileSync(canonicalFailLog, "Safe log line\n");
+    fs.writeFileSync(daemonLog, "Server listening on 3000\n");
+
+    const lines = [
+      // Traversal URI should fall back to canonical tasksDir/task-11.log
+      {
+        step_index: 0,
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        created_at: "2026-11-14T22:01:00Z",
+        tool_calls: [{ id: "call-fail", name: "run_command", args: { CommandLine: '"npm test"' } }],
+      },
+      {
+        step_index: 1,
+        type: "GENERIC",
+        status: "RUNNING",
+        created_at: "2026-11-14T22:01:05Z",
+        content: [
+          `Tool is running as a background task with task id: ${taskFail}`,
+          "Task logs are available at: file:///etc/passwd",
+        ].join("\n"),
+      },
+      // Daemon task should stream updates without marking foreground work as running
+      {
+        step_index: 2,
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        created_at: "2026-11-14T22:01:06Z",
+        tool_calls: [
+          {
+            id: "call-daemon",
+            name: "run_command",
+            args: { CommandLine: '"npm run dev"', IsDaemon: true },
+          },
+        ],
+      },
+      {
+        step_index: 3,
+        type: "GENERIC",
+        status: "RUNNING",
+        created_at: "2026-11-14T22:01:07Z",
+        content: [
+          `Tool is running as a background task with task id: ${taskDaemon}`,
+          `Task logs are available at: ${pathToFileURL(daemonLog).href}`,
+        ].join("\n"),
+      },
+    ];
+    fs.writeFileSync(transcriptPath, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+
+    let redact = false;
+    const reader = new AgyTranscriptReader(transcriptPath, () => redact);
+    const snap = reader.readSnapshot();
+    const failUpdate = snap.events.find((e) => e.type === "tool_execution_update" && e.toolCallId === "call-fail") as any;
+    expect(failUpdate?.partialResult?.content?.[0]?.text).toContain("Safe log line");
+    expect(failUpdate?.partialResult?.content?.[0]?.text).not.toContain("root:");
+    // Foreground fail task is running, daemon is excluded from foreground status
+    expect(reader.hasRunningBackgroundTasks()).toBe(true);
+
+    // Finish fail task with code 1
+    fs.appendFileSync(
+      transcriptPath,
+      JSON.stringify({
+        step_index: 4,
+        type: "SYSTEM_MESSAGE",
+        status: "DONE",
+        created_at: "2026-11-14T22:01:20Z",
+        content: `[Message] timestamp=2026-11-14T22:01:20Z sender=${taskFail} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskFail}" finished with result:\n\nThe command exited with code 1`,
+      }) + "\n",
+    );
+    const evFail = reader.pollNewEvents();
+    const failEnd = evFail.find((e) => e.type === "tool_execution_end" && e.toolCallId === "call-fail") as any;
+    expect(failEnd).toBeDefined();
+    expect(failEnd.isError).toBe(true);
+    // Only daemon remains -> hasRunningBackgroundTasks() is false
+    expect(reader.hasRunningBackgroundTasks()).toBe(false);
+
+    // Start task-13 then kill it via manage_task while redacted
+    redact = true;
+    fs.appendFileSync(
+      transcriptPath,
+      [
+        {
+          step_index: 5,
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          created_at: "2026-11-14T22:01:30Z",
+          tool_calls: [{ id: "call-kill", name: "run_command", args: { CommandLine: '"sleep 99"' } }],
+        },
+        {
+          step_index: 6,
+          type: "GENERIC",
+          status: "RUNNING",
+          created_at: "2026-11-14T22:01:35Z",
+          content: `Tool is running as a background task with task id: ${taskKill}\nLog output:\nsecret output`,
+        },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join("\n") + "\n",
+    );
+    const evRedactedStart = reader.pollNewEvents();
+    expect(evRedactedStart.some((e) => e.type === "tool_execution_update")).toBe(false);
+    expect(reader.hasRunningBackgroundTasks()).toBe(true);
+
+    fs.appendFileSync(
+      transcriptPath,
+      [
+        {
+          step_index: 7,
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          created_at: "2026-11-14T22:01:40Z",
+          tool_calls: [{ id: "call-mt", name: "manage_task", args: { Action: '"kill"', TaskId: `"${taskKill}"` } }],
+        },
+        {
+          step_index: 8,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-14T22:01:41Z",
+          content: `Killed task ${taskKill}`,
+        },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join("\n") + "\n",
+    );
+    const evKilled = reader.pollNewEvents();
+    const killedEnd = evKilled.find((e) => e.type === "tool_execution_end" && e.toolCallId === "call-kill") as any;
+    expect(killedEnd).toBeDefined();
+    expect(killedEnd.result).toBeUndefined();
+    expect(reader.hasRunningBackgroundTasks()).toBe(false);
+  });
+
+  it("keeps BridgedAgentSession working with detail and streams live log tails even after Herdr reports done", async () => {
+    vi.useFakeTimers();
+    const { homeDir, convId, transcriptPath, tasksDir } = setupBgWorkspace();
+    const taskSender = `${convId}/task-99`;
+    const logPath = path.join(tasksDir, "task-99.log");
+    fs.writeFileSync(logPath, "Step 1: compiling\n");
+    const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(homeDir);
+
+    try {
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          {
+            step_index: 0,
+            type: "PLANNER_RESPONSE",
+            status: "DONE",
+            created_at: "2026-11-14T22:05:00Z",
+            tool_calls: [{ id: "call-bg-bridge", name: "run_command", args: { CommandLine: '"npm run build"', toolSummary: '"Build release"' } }],
+          },
+          {
+            step_index: 1,
+            type: "GENERIC",
+            status: "RUNNING",
+            created_at: "2026-11-14T22:05:05Z",
+            content: [
+              `Tool is running as a background task with task id: ${taskSender}`,
+              `Task logs are available at: ${pathToFileURL(logPath).href}`,
+              "Log output:",
+              "Step 1: compiling",
+            ].join("\n"),
+          },
+        ]
+          .map((l) => JSON.stringify(l))
+          .join("\n") + "\n",
+      );
+
+      const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
+      const t = { instance: null as FakeTransport | null };
+      const session = new BridgedAgentSession(
+        { agent: "agy", sessionId: convId, status: "working", cwd: homeDir, paneId: "w1:p1", tabId: "t1", workspaceId: "w1", title: null, stateChangeSeq: 1 },
+        {
+          relayUrl: "https://relay.example.com",
+          machineId: "M1",
+          token: "T1",
+          cfg,
+          herdrSession: null,
+          runner: async () => ({ code: 0, stdout: "{}", stderr: "" }),
+          connectionFactory: (opts) =>
+            new Connection({
+              ...opts,
+              transportFactory: (_name, handlers) => {
+                const ft = new FakeTransport("ws", handlers);
+                t.instance = ft;
+                return ft;
+              },
+            }),
+        },
+      );
+
+      try {
+        t.instance!.open();
+        t.instance!.receive({ v: 1, id: "w", t: "agent.welcome", ts: Date.now(), d: { serverTime: Date.now(), lastSeq: null, pendingAnswers: [] } });
+
+        // Herdr transitions to "done" while background task is still active
+        session.updateFromHerdr({
+          agent: "agy",
+          sessionId: convId,
+          status: "done",
+          cwd: homeDir,
+          paneId: "w1:p1",
+          tabId: "t1",
+          workspaceId: "w1",
+          title: null,
+          stateChangeSeq: 2,
+        });
+
+        const statusesWhileBg = t.instance!.sent.filter((e) => e.t === "agent.status").map((e) => (e.d as any).status);
+        expect(statusesWhileBg).not.toContain("done");
+        expect(t.instance!.sent.some((e) => e.t === "agent.event" && (e.d as any).e?.type === "agent_settled")).toBe(false);
+
+        // Append live log line and advance 900ms poll timer
+        fs.appendFileSync(logPath, "Step 2: bundling\n");
+        await vi.advanceTimersByTimeAsync(950);
+
+        const updates = t.instance!.sent.filter((e) => e.t === "agent.event" && (e.d as any).e?.type === "tool_execution_update");
+        expect(updates.some((e) => String((e.d as any).e?.partialResult?.content?.[0]?.text ?? "").includes("Step 2: bundling"))).toBe(true);
+
+        // Reconnect / resync still restores the running background log tail
+        const sentBeforeResync = t.instance!.sent.length;
+        t.instance!.receive({ v: 1, id: "r1", t: "agent.resync", ts: Date.now(), d: {} });
+        const afterResync = t.instance!.sent.slice(sentBeforeResync);
+        expect(afterResync.some((e) => e.t === "agent.event" && (e.d as any).e?.type === "tool_execution_update")).toBe(true);
+
+        // Complete the background task via SYSTEM_MESSAGE -> settles and flips to done
+        fs.appendFileSync(
+          transcriptPath,
+          JSON.stringify({
+            step_index: 2,
+            type: "SYSTEM_MESSAGE",
+            status: "DONE",
+            created_at: "2026-11-14T22:05:25Z",
+            content: `[Message] timestamp=2026-11-14T22:05:25Z sender=${taskSender} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskSender}" finished with result:\n\nCommand exited with code 0.\n\nCommand output:\nAll built`,
+          }) + "\n",
+        );
+        await vi.advanceTimersByTimeAsync(950);
+
+        expect(t.instance!.sent.some((e) => e.t === "agent.event" && (e.d as any).e?.type === "tool_execution_end" && (e.d as any).e?.toolCallId === "call-bg-bridge")).toBe(true);
+        expect(t.instance!.sent.some((e) => e.t === "agent.status" && (e.d as any).status === "done")).toBe(true);
+        expect(t.instance!.sent.some((e) => e.t === "agent.event" && (e.d as any).e?.type === "agent_settled")).toBe(true);
+      } finally {
+        session.stop();
+      }
+    } finally {
+      homeSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});
