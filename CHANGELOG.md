@@ -5,6 +5,13 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] - 2026-11-16
+
+Per-model Antigravity CLI (`agy`) context window telemetry instead of a hardcoded `256k` cap.
+
+### Fixed
+- **Model-Specific AGY Context Windows**: Resolved actual `agy` context limits in `agy-transcript.ts` and `herdr-bridge.ts` (`1,048,576` for Gemini 4 / 3.8 Flash / Orchestrator, `1,000,000` for Claude 5.5 Opus/Sonnet, `131,072` for GPT-OSS 120B, `256,000` fallback) and recalculated `rp:context` + `herdr.tabId` dynamically on live `/model` switches.
+
 ## [0.4.5] - 2026-11-15
 
 Live Antigravity CLI (`agy`) background command log streaming and substantive session topic detection.
