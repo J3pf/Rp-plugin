@@ -8,8 +8,14 @@ Extension for the [Pi](https://github.com/earendil-works/pi) coding agent and co
 - **Target OS**: Linux (systemd `--user`), macOS (`launchd`), Windows (Task Scheduler with `conhost.exe --headless`).
 - **Core Components**:
   - `src/extension/`: Pi extension hooking into `session_start`, `ui_prompt_start`, questions, and tool execution events.
-  - `src/host/`: The `rp-host` daemon process that maintains WebSocket communication with the relay, executes host tools (`git.ts`, `quota.ts`, `herdr-bridge.ts`, `agy-transcript.ts`), and manages background autostart (`service.ts`).
+  - `src/host/`: The `rp-host` daemon process that maintains WebSocket communication with the relay, executes host tools (`git.ts`, `quota.ts`, `herdr-bridge.ts`, `agy-transcript.ts`), manages session backends (`backends/herdr.ts`, `tmux.ts`, `windows.ts`) and bridges (`bridge/agy-hooks.ts`, `external-metadata.ts`), and configures OS autostart (`service.ts`).
   - `src/shared/`: Shared wire protocol types, HTTP/proxy helpers, platform path discovery, and bounded LRU utilities.
+
+## Sibling Repositories & Cross-Repo Contracts
+
+- **Relay & Canonical Protocol ([`J3pf/Rp-relay`](https://github.com/J3pf/Rp-relay), sibling `../Rp-relay`)**: Canonical source for wire schemas and fixtures (`docs/PROTOCOLO.md`, `packages/protocol/`). Keep `src/shared/protocol.ts` compatible and regenerate/verify `test/fixtures/protocol/*.json` via `npm run fixtures` and `test/contract.test.ts`.
+- **Mobile Client ([`J3pf/Rp-app`](https://github.com/J3pf/Rp-app), sibling `../Rp-app`)**: Android & iOS Compose Multiplatform app consuming agent streams, `activeTask`, `gitDirty`, context usage (`contextTokens`/`contextWindow`/`contextPercent`), subagents, `piquota` machine quotas, and `host.*` RPCs.
+- **Distribution**: Distributed via Git refs (`git:github.com/J3pf/Rp-plugin@vX.Y.Z`) and GitHub Releases rather than public npm.
 
 ## Commands
 

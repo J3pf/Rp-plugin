@@ -5,8 +5,9 @@ actividad del agente al móvil, recibe mensajes y adjuntos, y lleva **preguntas 
 terminal o el móvil, la primera respuesta gana). Funciona con `gentle-shell`/gentle-pi y dentro de herdr. Incluye `rp-host`
 para lanzar agentes nuevos desde el móvil (en herdr, tmux o Windows Terminal).
 
-> Estado: **implementado** (extensión + `rp-host`). Verificado contra Pi 1.2.0 y gentle-pi 4.1.0 reales; ver
-> [docs/spikes](docs/spikes/README.md) para lo que queda por confirmar en tu hardware (Windows de la empresa, herdr real).
+> Estado: **implementado** (extensión + `rp-host`, **`v0.4.6`**). Verificado contra **Pi 1.5.2** y **gentle-pi 4.8.0** reales; ver
+> [docs/spikes](docs/spikes/README.md) para casos particulares (Windows corporativo, escenarios de `herdr`).
+> Repos hermanos: [`Rp-relay`](https://github.com/J3pf/Rp-relay) (servidor relay + contrato canónico [`docs/PROTOCOLO.md`](https://github.com/J3pf/Rp-relay/blob/main/docs/PROTOCOLO.md)) · [`Rp-app`](https://github.com/J3pf/Rp-app) (app móvil Android e iOS).
 
 ## Instalación (por cada PC)
 
@@ -83,18 +84,20 @@ Una vez instalado, abre Pi (`pi` o `gentle-shell`) y ejecuta:
 | Adaptadores de `ask_user` (@eko24ive/pi-ask) y `ask_user_choice` / `ask_user_question` (gentle-pi) (`custom()`) | `prompts/adapters/` |
 | Autorizaciones propias (si no hay gentle-pi) y herramienta `rp_ask_user` condicional | `prompts/gate.ts`, `prompts/askUser.ts` |
 | Mensajes del móvil: `api`, **`interactive`** (teclea en la TUI → autoriza en modo Auto), `herdr`, comandos | `delivery/` |
-| Comandos slash desde móvil: `/model` (con arg o interactivo) y `/thinking` (con nivel o interactivo) ejecutados en sesión | `src/extension/delivery/slash-commands.ts` |
+| Comandos slash e inspección de terminal: `/model`, `/thinking` y `/term` (live pane peek) | `src/extension/delivery/slash-commands.ts`, `src/host/` |
 | Adjuntos (imágenes inline, resto en el inbox con ruta citada) | `attachments.ts` |
 | Agent Mesh: telemetría de comunicación inter-agente (`intercom` y `orchestrator_send_message` entrante/saliente → `CommEvent`) | `src/extension/comm.ts` |
 | Comandos `/rp pair\|status\|doctor\|on\|off\|gate\|test\|unpair` | `commands.ts` |
 | `rp-host`: autostart per-OS (systemd linger/PATH, Task Scheduler XML PT0S/batteries/restart, launchd bootstrap/logs), auto-repair on Pi `session_start`, `rp-host doctor` | `src/host/`, `src/extension/host-autostart.ts` |
-| `rp-host`: recolección periódica de cuotas de IA (`piquota --json`) y reporte a `rp-relay` | `src/host/quota.ts` |
+| `rp-host`: backends de sesión (`herdr`, `tmux`, `windows`) y lanzadores para Pi, **Antigravity (AGY)**, Claude Code y Codex | `src/host/backends/`, `src/host/bridge/` |
+| `rp-host`: puente de sesiones **AGY** (detección de topic inicial filtrando confirmaciones cortas, subagentes async y transcripts hijos, logs live en segundo plano y ventana de contexto por familia de modelo vía `resolveAgyContextWindow`) | `src/host/agy-transcript.ts`, `src/host/herdr-bridge.ts` |
+| `rp-host`: telemetría en vivo de `activeTask`, estado Git (`gitDirty`), uso de contexto por sesión y cuotas de IA (`piquota --json`) hacia `rp-relay` | `src/host/git.ts`, `src/host/quota.ts`, `src/host/herdr-bridge.ts` |
 | Consentimiento de review de gentle-pi respondible desde el móvil (espejo guardado del componente: acciones, `Effect:` y cuerpo renderizado; la respuesta se entrega por el `done` del propio componente) | `src/extension/prompts/adapters/review-consent.ts` |
 | Sincronía de ciclo de vida con herdr en ambos sentidos: cerrar el panel lo borra de la app (`agent.closed`) y olvidar el agente en la app cierra su panel (`host.herdr_close` → `herdr pane close`) | `src/host/herdr-bridge.ts`, `src/host/connection.ts` |
 
 Documentos: [INSTALACION](docs/INSTALACION.md) (instalación y troubleshooting) · [PLAN-PLUGIN](docs/PLAN-PLUGIN.md) (plan + estado de implementación) · [RESILIENCIA](docs/RESILIENCIA.md) ·
 [COMPATIBILIDAD](docs/COMPATIBILIDAD.md) · [ARQUITECTURA](docs/ARQUITECTURA.md) · [QA manual](docs/QA.md) ·
-[Spikes](docs/spikes/README.md) · contrato de red: [`rp-relay/docs/PROTOCOLO.md`](https://github.com/j3pf/rp-relay/blob/main/docs/PROTOCOLO.md).
+[Spikes](docs/spikes/README.md) · contrato de red: [`Rp-relay/docs/PROTOCOLO.md`](https://github.com/J3pf/Rp-relay/blob/main/docs/PROTOCOLO.md) · repos hermanos: [`Rp-relay`](https://github.com/J3pf/Rp-relay) · [`Rp-app`](https://github.com/J3pf/Rp-app).
 
 ## Configuración
 
@@ -139,16 +142,16 @@ GENTLE_AI_BIN=/ruta/gentle-ai npx vitest run test/gentle-ai-sync.test.ts   # reg
 npm run fixtures        # regenera test/fixtures/protocol/*.json (compartidos con rp-relay / rp-app)
 ```
 
-El protocolo (v1) está replicado en `src/shared/protocol.ts` y validado por `test/contract.ts` contra `PROTOCOLO.md`
+El protocolo (v1) está replicado en `src/shared/protocol.ts` y validado por `test/contract.test.ts` (y `test/contract.ts`) contra `PROTOCOLO.md`
 mientras `@j3pf/rp-protocol` no esté publicado.
 
 ## Referencias investigadas
 
-- Pi (`earendil-works/pi`, v1.2.0): `packages/coding-agent/docs/{extensions,packages,rpc,rpc-extension-ui,json,security,sessions}.md`,
+- Pi (`earendil-works/pi`, base investigada v1.2.0; verificado contra **v1.5.2**): `packages/coding-agent/docs/{extensions,packages,rpc,rpc-extension-ui,json,security,sessions}.md`,
   `src/core/extensions/{types,runner}.ts`, `src/modes/{interactive/interactive-mode,rpc/rpc-mode}.ts`,
   ejemplos `permission-gate.ts`, `question.ts`, `notify.ts`, `send-user-message.ts`.
 - [Remote Pi](https://github.com/jacobaraujo7/remote_pi) (Flutter + relay Rust + extensión Pi): emparejamiento QR, aprobaciones vía
   `@eko24ive/pi-ask`; **sin push real** — es la principal carencia que este proyecto cubre.
 - [Happy](https://github.com/slopus/happy) / Happier (happier-dev): wrapper de CLI + servidor Fastify/Socket.IO con cifrado E2E.
 - [Moshi](https://getmoshi.app/docs): terminal móvil + hook en el host que genera bandeja de aprobaciones y push.
-- [gentle-shell / gentle-pi](https://github.com/Gentleman-Programming/gentle-shell) 4.1.0, [gentle-ai](https://github.com/Gentleman-Programming/gentle-ai), [herdr](https://github.com/herdrdev/herdr) 0.9.3: entorno del usuario, ver `docs/COMPATIBILIDAD.md`.
+- [gentle-shell / gentle-pi](https://github.com/Gentleman-Programming/gentle-shell) (probado hasta **4.8.0**), [gentle-ai](https://github.com/Gentleman-Programming/gentle-ai), [herdr](https://github.com/herdrdev/herdr) 0.9.3: entorno del usuario, ver `docs/COMPATIBILIDAD.md`.
