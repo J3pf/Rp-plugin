@@ -830,6 +830,77 @@ describe("agy-transcript", () => {
       id: "gpt-5.3-codex",
     });
   });
+
+  it("getSessionTopic skips short confirmations and locks onto the first substantive prompt", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-topic-"));
+    tmpDirs.push(dir);
+    const tPath = path.join(dir, "transcript.jsonl");
+
+    fs.writeFileSync(
+      tPath,
+      JSON.stringify({
+        step_index: 0,
+        type: "USER_INPUT",
+        status: "DONE",
+        created_at: "2026-11-15T10:00:00Z",
+        content: "<USER_REQUEST>\nsiii\n</USER_REQUEST>",
+      }) + "\n",
+    );
+
+    const reader = new AgyTranscriptReader(tPath);
+    reader.readSnapshot();
+    expect(reader.getSessionTopic()).toBeNull();
+
+    fs.appendFileSync(
+      tPath,
+      [
+        {
+          step_index: 1,
+          type: "USER_INPUT",
+          status: "DONE",
+          created_at: "2026-11-15T10:01:00Z",
+          content: "<USER_REQUEST>\nok si hagamole!\n</USER_REQUEST>",
+        },
+        {
+          step_index: 2,
+          type: "USER_INPUT",
+          status: "DONE",
+          created_at: "2026-11-15T10:02:00Z",
+          content: "<USER_REQUEST>\nAdelante!\n</USER_REQUEST>",
+        },
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+    );
+    reader.pollNewEvents();
+    expect(reader.getSessionTopic()).toBeNull();
+
+    fs.appendFileSync(
+      tPath,
+      JSON.stringify({
+        step_index: 3,
+        type: "USER_INPUT",
+        status: "DONE",
+        created_at: "2026-11-15T10:03:00Z",
+        content: "<USER_REQUEST>\nOk,\nCompactar tarjetas del panel de agentes\n</USER_REQUEST>",
+      }) + "\n",
+    );
+    reader.pollNewEvents();
+    expect(reader.getSessionTopic()).toBe("Compactar tarjetas del panel de agentes");
+
+    fs.appendFileSync(
+      tPath,
+      JSON.stringify({
+        step_index: 4,
+        type: "USER_INPUT",
+        status: "DONE",
+        created_at: "2026-11-15T10:04:00Z",
+        content: "<USER_REQUEST>\nCambiar completamente de tema después\n</USER_REQUEST>",
+      }) + "\n",
+    );
+    reader.pollNewEvents();
+    expect(reader.getSessionTopic()).toBe("Compactar tarjetas del panel de agentes");
+  });
 });
 
 describe("herdr-bridge & PreToolUse gate", () => {

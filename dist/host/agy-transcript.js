@@ -19,6 +19,46 @@ const MODEL_CHANGE_RE = /changed setting `Model Selection` from [^\n]+? to ([^\n
 /** Empirical context window before Antigravity CLI (agy) triggers conversation compaction (~256k tokens). */
 export const AGY_CONTEXT_WINDOW = 256_000;
 const USER_REQ_RE = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i;
+const TRIVIAL_TOPIC_WORDS = new Set([
+    "si", "no", "ok", "okay", "okey", "oki", "okis", "k", "kk",
+    "dale", "listo", "bueno", "bien", "vale", "claro", "va", "pues", "aja",
+    "adelante", "perfecto", "genial", "excelente", "super", "gracias",
+    "hola", "holi", "buenas", "hey", "ey", "yap", "sip", "nop", "simon",
+    "obvio", "hagamoslo", "hagamole", "hazlo",
+    "yes", "yep", "yeah", "yup", "nope", "sure", "fine", "good",
+    "great", "nice", "cool", "perfect", "thanks", "thx", "ty",
+    "hi", "hello", "yo", "go", "ahead", "continue", "proceed",
+    "please", "do", "it", "sounds", "lgtm", "ya",
+]);
+function normalizeTopicWord(word) {
+    return word.replace(/(.)\1{2,}/g, "$1").replace(/(.)\1+$/g, "$1");
+}
+function isTrivialTopicLine(line) {
+    if (/^\[Archivo adjunto\b/i.test(line))
+        return true;
+    const cleaned = line
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/\p{Diacritic}/gu, "")
+        .replace(/[^\p{L}\p{N}\s]/gu, " ")
+        .trim();
+    if (!cleaned || !/\p{L}/u.test(cleaned))
+        return true;
+    const words = cleaned.split(/\s+/).filter(Boolean).map(normalizeTopicWord);
+    if (words.length === 0)
+        return true;
+    return words.length <= 4 && words.every((w) => TRIVIAL_TOPIC_WORDS.has(w) || w.length <= 1);
+}
+/** Pick the first substantive non-trivial line from user prompt text for session naming. */
+export function extractSessionTopic(rawText) {
+    for (const rawLine of rawText.split("\n")) {
+        const line = rawLine.trim();
+        if (!line || isTrivialTopicLine(line))
+            continue;
+        return line.length > 42 ? `${line.slice(0, 41)}…` : line;
+    }
+    return null;
+}
 /** Extract clean user message text from an agy USER_INPUT content payload. */
 export function extractAgyUserText(rawContent) {
     if (!rawContent || typeof rawContent !== "string")
@@ -1062,9 +1102,8 @@ export class AgyTranscriptReader {
                 outEvents.push({ type: "session_compact", ...(isRedacted ? {} : { summary: extracted.text }) });
                 return;
             }
-            const firstLine = extracted.text.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
-            if (!this.lastTopic && firstLine) {
-                this.lastTopic = firstLine.length > 42 ? firstLine.slice(0, 41) + "…" : firstLine;
+            if (!this.lastTopic) {
+                this.lastTopic = extractSessionTopic(extracted.text);
             }
             const contentBlocks = [{ type: "text", text: truncateBytes(extracted.text, LIMITS.resultMaxBytes).text }];
             if (Array.isArray(step.media)) {
