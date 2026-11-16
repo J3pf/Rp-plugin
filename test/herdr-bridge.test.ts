@@ -14,6 +14,7 @@ import {
   normalizeAgyToolCall,
   normalizeAgyToolCalls,
   parseAgyArgs,
+  resolveAgyContextWindow,
   resolveAgyTranscriptPath,
 } from "../src/host/agy-transcript.ts";
 import {
@@ -338,6 +339,84 @@ describe("agy-transcript", () => {
       totalTokens: 128_000,
       contextWindow: AGY_CONTEXT_WINDOW,
       contextPercent: 50,
+    });
+  });
+
+  it("resolves model-specific AGY context windows for Gemini, Claude, GPT-OSS, and mid-session switches", () => {
+    expect(resolveAgyContextWindow("gemini-4-hydrogen-xhigh")).toBe(1_048_576);
+    expect(resolveAgyContextWindow("Gemini 4 Carbon (Medium)")).toBe(1_048_576);
+    expect(resolveAgyContextWindow("gemini-3.8-flash-medium")).toBe(1_048_576);
+    expect(resolveAgyContextWindow("gemini-pro-orchestrator")).toBe(1_048_576);
+    expect(resolveAgyContextWindow("Orchestrator (Argon)")).toBe(1_048_576);
+    expect(resolveAgyContextWindow("claude-opus-5-5-medium")).toBe(1_000_000);
+    expect(resolveAgyContextWindow("Claude Sonnet 5.5 (High)")).toBe(1_000_000);
+    expect(resolveAgyContextWindow("gpt-oss-120b-medium")).toBe(131_072);
+    expect(resolveAgyContextWindow("GPT-OSS 120B (Medium)")).toBe(131_072);
+    expect(resolveAgyContextWindow(null)).toBe(AGY_CONTEXT_WINDOW);
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-agy-model-win-"));
+    tmpDirs.push(dir);
+    const tPath = path.join(dir, "transcript.jsonl");
+    fs.writeFileSync(
+      tPath,
+      [
+        {
+          step_index: 0,
+          type: "USER_INPUT",
+          content: "<USER_REQUEST>Analizar arquitectura</USER_REQUEST>",
+        },
+        {
+          step_index: 1,
+          type: "PLANNER_RESPONSE",
+          content: "Paso 1",
+          input_tokens: 4_400,
+          cache_read_tokens: 429_000,
+          output_tokens: 1_000,
+        },
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+    );
+
+    const reader = new AgyTranscriptReader(tPath, () => false, () => "gemini-4-hydrogen-xhigh");
+    const snap = reader.readSnapshot();
+    expect(reader.getContextUsage()).toEqual({
+      tokens: 434_400,
+      contextWindow: 1_048_576,
+      percent: 41,
+    });
+    expect((snap.entries[1]!.msg as any).usage.contextWindow).toBe(1_048_576);
+    expect((snap.entries[1]!.msg as any).usage.contextPercent).toBe(41);
+
+    // Mid-session switch via USER_SETTINGS_CHANGE without external callback override
+    const standalone = new AgyTranscriptReader(tPath);
+    standalone.readSnapshot();
+    fs.appendFileSync(
+      tPath,
+      [
+        {
+          step_index: 2,
+          type: "USER_INPUT",
+          content:
+            "<USER_REQUEST>Cambiar modelo</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Hydrogen (XHigh) to GPT-OSS 120B (Medium).\n</USER_SETTINGS_CHANGE>",
+        },
+        {
+          step_index: 3,
+          type: "PLANNER_RESPONSE",
+          content: "Paso 2",
+          input_tokens: 1_000,
+          cache_read_tokens: 33_500,
+          output_tokens: 500,
+        },
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+    );
+    standalone.pollNewEvents();
+    expect(standalone.getContextUsage()).toEqual({
+      tokens: 35_000,
+      contextWindow: 131_072,
+      percent: 27,
     });
   });
 

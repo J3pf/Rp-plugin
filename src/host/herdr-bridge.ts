@@ -257,7 +257,11 @@ export class BridgedAgentSession {
     if (!d.retireOnly && info.agent === "agy" && info.sessionId) {
       try {
         const canonical = resolveAgyTranscriptPath(info.sessionId);
-        this.transcriptReader = new AgyTranscriptReader(canonical, () => this.d.cfg.redactContent);
+        this.transcriptReader = new AgyTranscriptReader(
+          canonical,
+          () => this.d.cfg.redactContent,
+          () => this.activeAgyModelId(),
+        );
       } catch {
         this.transcriptReader = null;
       }
@@ -329,7 +333,13 @@ export class BridgedAgentSession {
     });
   }
 
-  private syncContextIfChanged(direct = false): void {
+  private activeAgyModelId(): string | null {
+    if (this.lastSentModelId) return this.lastSentModelId;
+    const { model } = readExternalAgentModelWithState(this.info.agent, this.info.cwd, this.info.sessionId);
+    return model.id || null;
+  }
+
+  private syncContextIfChanged(direct = false, sendHelloOnTabChange = true): void {
     const ctx = this.getContextUsage();
     if (!ctx || ctx.tokens <= 0 || ctx.contextWindow <= 0) return;
     const spec = `${ctx.tokens}/${ctx.contextWindow}`;
@@ -342,7 +352,7 @@ export class BridgedAgentSession {
         this.conn.send("agent.statuses", { items: { "rp:context": spec } });
       }
     }
-    if (this.conn.connected && this.initialSnapshotSent && nextTab !== this.lastSentTabId) {
+    if (sendHelloOnTabChange && this.conn.connected && this.initialSnapshotSent && nextTab !== this.lastSentTabId) {
       this.conn.sendDirect("agent.hello", this.makeHello());
     }
   }
@@ -372,6 +382,7 @@ export class BridgedAgentSession {
     );
     if (uncertain || !nextModel.id || nextModel.id === this.lastSentModelId) return;
     this.lastSentModelId = nextModel.id;
+    this.syncContextIfChanged(false, false);
     this.conn.sendDirect("agent.hello", this.makeHello());
     this.sendEvent({ type: "model_select", model: nextModel });
   }
@@ -447,7 +458,11 @@ export class BridgedAgentSession {
       try {
         const tPath = resolveAgyTranscriptPath(next.sessionId);
         this.info.sessionId = next.sessionId;
-        this.transcriptReader = new AgyTranscriptReader(tPath, () => this.d.cfg.redactContent);
+        this.transcriptReader = new AgyTranscriptReader(
+          tPath,
+          () => this.d.cfg.redactContent,
+          () => this.activeAgyModelId(),
+        );
         this.setupFileWatcher();
       } catch {
         /* ignore invalid sessionId */

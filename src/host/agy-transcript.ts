@@ -20,8 +20,21 @@ const MAX_POLL_DELTA_BYTES = 2 * 1024 * 1024;
 const MAX_REMAINDER_BYTES = 1024 * 1024;
 const MODEL_CHANGE_RE = /changed setting `Model Selection` from [^\n]+? to ([^\n<]+?)\.(?:\s|$)/i;
 
-/** Empirical context window before Antigravity CLI (agy) triggers conversation compaction (~256k tokens). */
+/** Default fallback context window for Antigravity CLI (agy) when model is unknown. */
 export const AGY_CONTEXT_WINDOW = 256_000;
+export const AGY_GEMINI_CONTEXT_WINDOW = 1_048_576;
+export const AGY_CLAUDE_CONTEXT_WINDOW = 1_000_000;
+export const AGY_GPT_OSS_CONTEXT_WINDOW = 131_072;
+
+/** Resolve the actual AGY context window in tokens from a model ID or display label. */
+export function resolveAgyContextWindow(model: string | null | undefined): number {
+  const m = (model ?? "").trim().toLowerCase();
+  if (!m) return AGY_CONTEXT_WINDOW;
+  if (m.includes("gemini") || m.includes("orchestrator")) return AGY_GEMINI_CONTEXT_WINDOW;
+  if (m.includes("claude")) return AGY_CLAUDE_CONTEXT_WINDOW;
+  if (m.includes("gpt-oss")) return AGY_GPT_OSS_CONTEXT_WINDOW;
+  return AGY_CONTEXT_WINDOW;
+}
 
 export interface ContextUsageInfo {
   tokens: number;
@@ -799,6 +812,12 @@ function compactSnapshotEntry(entry: SnapshotEntry, isRecent: boolean): Snapshot
   };
 }
 
+function computeContextUsage(tokens: number, model: string | null | undefined): ContextUsageInfo {
+  const contextWindow = resolveAgyContextWindow(model);
+  const percent = Math.min(100, Math.max(0, Math.round((tokens / contextWindow) * 100)));
+  return { tokens, contextWindow, percent };
+}
+
 /**
  * Stateful incremental reader for an agy `transcript.jsonl` file.
  * Produces SnapshotEntries for initial history and live AgentEventPayloads on new lines.
@@ -814,11 +833,13 @@ export class AgyTranscriptReader {
   private childCursors = new Map<string, ChildCursor>();
   private bgTasks = new Map<string, BackgroundTaskCursor>();
   private lastTopic: string | null = null;
+  private lastModel: string | null = null;
   private lastContextUsage: ContextUsageInfo | null = null;
 
   constructor(
     readonly transcriptPath: string,
     private redact: () => boolean = () => false,
+    private resolveModel: () => string | null = () => null,
   ) {}
 
   hasRunningSubagents(): boolean {
@@ -885,7 +906,8 @@ export class AgyTranscriptReader {
 
   /** Return the most recent context window token usage observed in the transcript, if any. */
   getContextUsage(): ContextUsageInfo | null {
-    return this.lastContextUsage ? { ...this.lastContextUsage } : null;
+    if (!this.lastContextUsage) return null;
+    return computeContextUsage(this.lastContextUsage.tokens, this.resolveModel() ?? this.lastModel);
   }
 
   /** Return a compact description of the currently executing tool call, if any. */
@@ -1255,6 +1277,12 @@ export class AgyTranscriptReader {
     if (step.type === "USER_INPUT") {
       // Flush any unmatched pending tools before a new user turn
       this.pendingTools = [];
+      if (typeof step.content === "string") {
+        const modelChange = MODEL_CHANGE_RE.exec(step.content);
+        if (modelChange?.[1]?.trim()) {
+          this.lastModel = modelChange[1].trim();
+        }
+      }
       const extracted = extractAgyUserText(step.content);
       if (extracted.kind === "skip") return;
       if (extracted.kind === "compaction") {
@@ -1346,20 +1374,16 @@ export class AgyTranscriptReader {
       const totalTok = inTok + cacheReadTok + cacheWriteTok + outTok;
       let stepUsage: Record<string, number> | undefined;
       if (totalTok > 0) {
-        const pct = Math.min(100, Math.max(0, Math.round((totalTok / AGY_CONTEXT_WINDOW) * 100)));
-        this.lastContextUsage = {
-          tokens: totalTok,
-          contextWindow: AGY_CONTEXT_WINDOW,
-          percent: pct,
-        };
+        const usageInfo = computeContextUsage(totalTok, this.lastModel ?? this.resolveModel());
+        this.lastContextUsage = usageInfo;
         stepUsage = {
           input: inTok,
           output: outTok,
           cacheRead: cacheReadTok,
           cacheWrite: cacheWriteTok,
           totalTokens: totalTok,
-          contextWindow: AGY_CONTEXT_WINDOW,
-          contextPercent: pct,
+          contextWindow: usageInfo.contextWindow,
+          contextPercent: usageInfo.percent,
         };
       }
 
