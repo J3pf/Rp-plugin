@@ -5,6 +5,16 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] - 2026-11-15
+
+Live Antigravity CLI (`agy`) background command log streaming and substantive session topic detection.
+
+### Added
+- **Live AGY Background Command Logs**: Streamed active `run_command` log tails for bridged `agy` sessions in `agy-transcript.ts` and `herdr-bridge.ts`, keeping running command progress live until completion `SYSTEM_MESSAGE` reports.
+
+### Fixed
+- **Substantive Initial AGY Session Topic**: Skipped short confirmation replies and trivial interjections (`"siii"`, `"ok"`, `"dale"`, `"Adelante!"`, etc.) in `extractSessionTopic` so `agy` session names lock onto the first real user prompt instead of freezing on an opening acknowledgment.
+
 ## [0.4.4] - 2026-11-14
 
 Full Antigravity CLI (`agy`) subagent lifecycle visibility, per-child model tracking, and snapshot replay cleanup.
