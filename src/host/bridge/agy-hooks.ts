@@ -45,7 +45,7 @@ export function signGatePayload(token: string | null | undefined, parts: string[
 
 export function verifyGateSignature(token: string | null | undefined, parts: string[], sig: unknown): boolean {
   const expected = signGatePayload(token, parts);
-  if (!expected) return true;
+  if (!expected) return false;
   if (typeof sig !== "string" || sig.length !== expected.length) return false;
   try {
     return timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(sig, "hex"));
@@ -84,7 +84,7 @@ export async function runAgyHook(
   stdinText: string,
   sockPath = gateSocketPath(),
 ): Promise<GateHookDecision> {
-  if (!cfg.enabled) return { decision: "ask" };
+  if (!cfg.enabled || !cfg.machineToken) return { decision: "ask" };
   let payload: any;
   try {
     payload = JSON.parse(stdinText);

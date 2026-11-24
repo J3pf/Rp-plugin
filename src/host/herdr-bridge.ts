@@ -5,7 +5,6 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
 import { Connection } from "../extension/connection.ts";
 import { resolveInboxDir, type RpConfig } from "../extension/config.ts";
 import { relayBlobFetcher, resolveAttachments } from "../extension/attachments.ts";
@@ -18,6 +17,7 @@ import { parseJson, pick } from "./backends/herdr.ts";
 import { run as realRun, type Runner } from "./runner.ts";
 import { AgyTranscriptReader, resolveAgyTranscriptPath, type ContextUsageInfo } from "./agy-transcript.ts";
 import { readGitHeadAndDirty } from "./git.ts";
+import { validatePaneId } from "./validate.ts";
 import {
   parseTerminalContextUsage,
   readExternalAgentContextUsage,
@@ -47,7 +47,7 @@ import {
   type UserMessageBody,
   type WelcomeBody,
 } from "../shared/protocol.ts";
-import { LruSet, SAFE_CONV_ID_RE, errMsg, safeUser, stripAnsi, truncateBytes } from "../shared/util.ts";
+import { LruSet, SAFE_CONV_ID_RE, atomicWriteFileSync, errMsg, safeUser, stripAnsi, truncateBytes } from "../shared/util.ts";
 
 export {
   gateSocketPath,
@@ -471,6 +471,8 @@ export class BridgedAgentSession {
 
     if (next.status !== "idle" && next.status !== "done") {
       this.clearOptimisticWorking();
+    } else {
+      this.transcriptReader?.pruneStaleBackgroundTasks?.();
     }
 
     const prevTab = this.encodedTabId();
@@ -556,8 +558,10 @@ export class BridgedAgentSession {
       this.initialSnapshotSent &&
       !this.conn.needsSnapshot &&
       typeof w.lastSeq === "number" &&
-      w.lastSeq >= 0;
-    if (!canSkipSnapshot) {
+      w.lastSeq >= this.seq;
+    if (canSkipSnapshot) {
+      this.conn.dropQueuedEventsUpTo(w.lastSeq!);
+    } else {
       this.sendSnapshot(true);
     }
     const status = this.effectiveStatus();
@@ -573,9 +577,25 @@ export class BridgedAgentSession {
   private sendSnapshot(direct: boolean): void {
     this.initialSnapshotSent = true;
     if (this.transcriptReader) {
-      const hadRunning = this.hasRunningTranscriptWork();
-      const { entries, truncated, events } = this.transcriptReader.readSnapshot();
-      const lastActivityAt = this.transcriptReader.getLastActivityAt();
+      let hadRunning = false;
+      let snap: ReturnType<AgyTranscriptReader["readSnapshot"]>;
+      let lastActivityAt: number | null = null;
+      try {
+        hadRunning = this.hasRunningTranscriptWork();
+        snap = this.transcriptReader.readSnapshot();
+        lastActivityAt = this.transcriptReader.getLastActivityAt();
+      } catch (e) {
+        this.d.onLog?.(`sendSnapshot transcript read error: ${errMsg(e)}`);
+        const emptyBody = { epoch: this.epoch, seq: this.seq, entries: [], truncated: false };
+        if (direct) {
+          this.conn.dropQueuedEventsUpTo(this.seq);
+          this.conn.sendDirect("agent.snapshot", { ...emptyBody, seq: this.seq });
+        } else {
+          this.conn.send("agent.snapshot", emptyBody);
+        }
+        return;
+      }
+      const { entries, truncated, events } = snap;
       const body = {
         epoch: this.epoch,
         seq: this.seq,
@@ -738,6 +758,10 @@ export class BridgedAgentSession {
           const prevTab = this.encodedTabId();
           const prevOffset = this.transcriptReader.byteOffset;
           const events = this.transcriptReader.pollNewEvents();
+          const prunedBg =
+            this.currentStatus === "idle" || this.currentStatus === "done"
+              ? (this.transcriptReader.pruneStaleBackgroundTasks?.() ?? 0)
+              : 0;
           const offsetAdvanced = this.transcriptReader.byteOffset !== prevOffset;
           let shouldRefreshGit = false;
           for (const ev of events) {
@@ -757,7 +781,7 @@ export class BridgedAgentSession {
             this.syncContextIfChanged();
             this.syncModelIfChanged();
           }
-          if (events.length > 0) {
+          if (events.length > 0 || prunedBg > 0) {
             this.reconcileStatus();
             const nextTab = this.encodedTabId();
             if (this.conn.connected && this.initialSnapshotSent && nextTab !== prevTab && nextTab !== this.lastSentTabId) {
@@ -879,7 +903,7 @@ export class BridgedAgentSession {
       if (res.code === 0) {
         const parsed = parseJson(res.stdout);
         const rawText: string = (typeof parsed?.result?.text === "string" ? parsed.result.text : res.stdout).trim();
-        const cleaned = rawText.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "").trim();
+        const cleaned = stripAnsi(rawText).trim();
         const lines = cleaned
           .split(/\r?\n/)
           .map((l) => l.trimEnd())
@@ -1011,26 +1035,30 @@ export class BridgedAgentSession {
       this.commandTimer = setTimeout(async () => {
         this.commandTimer = null;
         if (this.disposed) return;
-        if (this.transcriptReader) {
-          const prevOffset = this.transcriptReader.byteOffset;
-          const events = this.transcriptReader.pollNewEvents();
-          const offsetAdvanced = this.transcriptReader.byteOffset !== prevOffset;
-          if (events.length > 0) {
-            for (const ev of events) this.sendEvent(ev);
+        try {
+          if (this.transcriptReader) {
+            const prevOffset = this.transcriptReader.byteOffset;
+            const events = this.transcriptReader.pollNewEvents();
+            const offsetAdvanced = this.transcriptReader.byteOffset !== prevOffset;
+            if (events.length > 0) {
+              for (const ev of events) this.sendEvent(ev);
+            }
+            if (offsetAdvanced || events.length > 0) {
+              this.syncSessionNameIfChanged();
+              this.syncContextIfChanged();
+              this.syncModelIfChanged();
+              return;
+            }
           }
-          if (offsetAdvanced || events.length > 0) {
-            this.syncSessionNameIfChanged();
-            this.syncContextIfChanged();
-            this.syncModelIfChanged();
-            return;
+          if (b.asCommand) {
+            await this.pollPaneFallback(text);
+            if (this.currentStatus === "idle" || this.currentStatus === "done") {
+              this.clearOptimisticWorking();
+              this.reconcileStatus();
+            }
           }
-        }
-        if (b.asCommand) {
-          await this.pollPaneFallback(text);
-          if (this.currentStatus === "idle" || this.currentStatus === "done") {
-            this.clearOptimisticWorking();
-            this.reconcileStatus();
-          }
+        } catch (e) {
+          this.d.onLog?.(`commandTimer error: ${errMsg(e)}`);
         }
       }, 800);
       this.commandTimer.unref?.();
@@ -1224,6 +1252,9 @@ export class HerdrAgentBridge {
   private pollPromise: Promise<void> | null = null;
   private stopped = false;
   private gateServer: net.Server | null = null;
+  private ownsGateSocket = false;
+  private gateSocketIno: number | null = null;
+  private herdrListFailing = false;
   private clientSockets = new Set<net.Socket>();
   private runner: Runner;
   private sockPath: string;
@@ -1273,11 +1304,7 @@ export class HerdrAgentBridge {
       const items = [...this.persistedSessions.values()];
       const serialized = JSON.stringify(items, null, 2);
       if (serialized === this.lastSavedSessionsJson) return;
-      const dir = path.dirname(this.stateFile);
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      const tmp = `${this.stateFile}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, serialized, { mode: 0o600 });
-      fs.renameSync(tmp, this.stateFile);
+      atomicWriteFileSync(this.stateFile, serialized, 0o600);
       this.lastSavedSessionsJson = serialized;
     } catch {
       /* best effort */
@@ -1339,9 +1366,16 @@ export class HerdrAgentBridge {
       }
     }
     this.clientSockets.clear();
-    if (process.platform !== "win32" && fs.existsSync(this.sockPath)) {
+    const shouldUnlink = this.ownsGateSocket && this.gateSocketIno !== null;
+    const expectedIno = this.gateSocketIno;
+    this.ownsGateSocket = false;
+    this.gateSocketIno = null;
+    if (process.platform !== "win32" && shouldUnlink) {
       try {
-        fs.unlinkSync(this.sockPath);
+        const st = fs.lstatSync(this.sockPath);
+        if (st.ino === expectedIno) {
+          fs.unlinkSync(this.sockPath);
+        }
       } catch {
         /* ignore */
       }
@@ -1393,7 +1427,19 @@ export class HerdrAgentBridge {
     try {
       const env = this.o.herdrSession ? { HERDR_SESSION: this.o.herdrSession } : {};
       const res = await this.runner("herdr", ["agent", "list"], { timeoutMs: 5_000, env });
-      if (this.stopped || res.code !== 0) return;
+      if (this.stopped) return;
+      if (res.code !== 0) {
+        if (!this.herdrListFailing) {
+          this.herdrListFailing = true;
+          const detail = (res.stderr || res.stdout || "").trim().slice(0, 200);
+          this.o.onLog?.(`herdr agent list failed (code=${res.code})${detail ? `: ${detail}` : ""}`);
+        }
+        return;
+      }
+      if (this.herdrListFailing) {
+        this.herdrListFailing = false;
+        this.o.onLog?.("herdr agent list recovered");
+      }
 
       const now = Date.now();
       for (const [paneId, until] of this.closedPanesUntil.entries()) {
@@ -1517,30 +1563,62 @@ export class HerdrAgentBridge {
       });
 
       let buf = "";
+      let handled = false;
+      const sendResponse = (resp: Record<string, unknown>) => {
+        if (socket.destroyed || socket.writableEnded) return;
+        try {
+          socket.end(JSON.stringify(resp) + "\n");
+        } catch {
+          try {
+            socket.destroy();
+          } catch {
+            /* ignore */
+          }
+        }
+      };
       socket.on("data", (chunk: string) => {
+        if (handled) return;
         if (buf.length + chunk.length > GATE_MAX_LINE_BYTES) {
+          handled = true;
           socket.destroy();
           return;
         }
         buf += chunk;
         const nl = buf.indexOf("\n");
         if (nl < 0) return;
+        handled = true;
         const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        void this.handleGateSocketRequest(line, ac.signal).then((resp) => {
-          if (!socket.destroyed) {
-            socket.end(JSON.stringify(resp) + "\n");
-          }
-        });
+        buf = "";
+        void this.handleGateSocketRequest(line, ac.signal)
+          .then((resp) => sendResponse(resp))
+          .catch((e) => {
+            this.o.onLog?.(`gate request error: ${errMsg(e)}`);
+            sendResponse({ decision: "ask", reason: "RP: error interno en gate; confirmar en terminal" });
+          });
       });
     });
+    server.maxConnections = 64;
     server.on("error", (e) => this.o.onLog?.(`gate socket error: ${errMsg(e)}`));
     server.listen(this.sockPath, () => {
+      if (this.stopped) {
+        try {
+          server.close();
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      this.ownsGateSocket = true;
       if (process.platform !== "win32") {
         try {
           fs.chmodSync(this.sockPath, 0o600);
         } catch {
           /* ignore */
+        }
+        try {
+          this.gateSocketIno = fs.lstatSync(this.sockPath).ino;
+        } catch {
+          this.gateSocketIno = null;
         }
       }
     });
@@ -1602,12 +1680,17 @@ export class HerdrAgentBridge {
     const nonce = typeof req?.nonce === "string" ? req.nonce : "";
     const conversationId = typeof req?.conversationId === "string" ? req.conversationId : "";
     const command = typeof req?.command === "string" ? req.command : "";
-    const paneId = typeof req?.paneId === "string" ? req.paneId : "";
-    if (!verifyGateSignature(this.o.token, ["req", conversationId, paneId, command, nonce], req?.sig)) {
-      return this.signGateResponse(
-        { decision: "ask", reason: "RP: solicitud de gate no autenticada; confirmar en terminal" },
-        nonce,
-      );
+    const rawPaneId = typeof req?.paneId === "string" ? req.paneId : "";
+    if (!verifyGateSignature(this.o.token, ["req", conversationId, rawPaneId, command, nonce], req?.sig)) {
+      return { decision: "ask", reason: "RP: solicitud de gate no autenticada; confirmar en terminal" };
+    }
+    let paneId = "";
+    if (rawPaneId) {
+      try {
+        paneId = validatePaneId(rawPaneId);
+      } catch {
+        paneId = "";
+      }
     }
     if (!conversationId || !SAFE_CONV_ID_RE.test(conversationId) || !command) {
       return this.signGateResponse({ decision: "ask", reason: "RP: solicitud de autorización incompleta" }, nonce);
@@ -1646,6 +1729,17 @@ export class HerdrAgentBridge {
           runner: this.runner,
           onLog: this.o.onLog,
           connectionFactory: this.o.connectionFactory,
+          onSessionClosedByCommand: (closedKey, closedPaneId) => {
+            if (closedPaneId) {
+              this.notifyPaneClosed(closedPaneId);
+            }
+            if (this.sessionsByKey.has(closedKey)) {
+              this.sessionsByKey.delete(closedKey);
+              this.missingPolls.delete(closedKey);
+              this.gateCreatedAt.delete(closedKey);
+              if (this.persistedSessions.delete(closedKey)) this.savePersistedSessions();
+            }
+          },
         },
       );
       this.sessionsByKey.set(key, session);
