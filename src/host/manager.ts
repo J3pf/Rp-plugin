@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { newId, type MachineQuota } from "../shared/protocol.ts";
-import { splitCommand } from "../shared/util.ts";
+import { atomicWriteFileSync, splitCommand } from "../shared/util.ts";
 import { configDir } from "../shared/platform.ts";
 import type { BackendName, HostConfig } from "./config.ts";
 import type { Backend, HerdrTarget, SpawnRecord } from "./backends/types.ts";
@@ -96,11 +96,7 @@ export class HostManager {
   }
   private save(): void {
     try {
-      const dir = path.dirname(this.storeFile);
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      const tmpFile = `${this.storeFile}.${process.pid}.tmp`;
-      fs.writeFileSync(tmpFile, JSON.stringify([...this.records.values()], null, 2), { mode: 0o600 });
-      fs.renameSync(tmpFile, this.storeFile);
+      atomicWriteFileSync(this.storeFile, JSON.stringify([...this.records.values()], null, 2), 0o600);
     } catch {
       /* best effort */
     }

@@ -25,8 +25,9 @@ Usage: rp-host <command>
 Requires the PC to be paired first (/rp pair inside Pi). Config: host.json next to RP's config.json.`;
 
 const INBOX_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+export const INBOX_CLEANUP_INTERVAL_MS = 12 * 60 * 60 * 1000;
 
-function cleanupExpiredInboxFiles(inboxDir: string, now = Date.now()): void {
+export function cleanupExpiredInboxFiles(inboxDir: string, now = Date.now()): void {
   let dirs: fs.Dirent[];
   try {
     dirs = fs.readdirSync(inboxDir, { withFileTypes: true });
@@ -65,6 +66,13 @@ function cleanupExpiredInboxFiles(inboxDir: string, now = Date.now()): void {
       }
     }
   }
+}
+
+export function scheduleInboxCleanup(inboxDir: string, intervalMs = INBOX_CLEANUP_INTERVAL_MS): NodeJS.Timeout {
+  cleanupExpiredInboxFiles(inboxDir);
+  const timer = setInterval(() => cleanupExpiredInboxFiles(inboxDir), intervalMs);
+  timer.unref?.();
+  return timer;
 }
 
 async function readStdinText(maxBytes = 2 * 1024 * 1024): Promise<string> {
@@ -142,8 +150,10 @@ export async function main(argv: string[]): Promise<void> {
         platform: process.platform,
       };
       const inspection = await inspectService(spec);
+      const { cfg: hostCfg } = loadHostConfig();
+      const hasMissingRoots = missingRoots(hostCfg);
       const healthy = inspection.installed && inspection.enabled !== false && inspection.running && !inspection.stale && inspection.nodePathValid && inspection.scriptPathValid &&
-        (inspection.platform !== "linux" || inspection.details?.linger === true) && !missingRoots(loadHostConfig().cfg);
+        (inspection.platform !== "linux" || inspection.details?.linger === true) && !hasMissingRoots;
       const status = healthy ? "OK" : "PROBLEM";
       if (argv.includes("--json")) {
         console.log(JSON.stringify({ status, healthy, ...inspection }, null, 2));
@@ -156,8 +166,7 @@ export async function main(argv: string[]): Promise<void> {
         console.log(`Script Path: ${inspection.scriptPath ?? "not reported"} (${inspection.scriptPathValid ? "valid" : "missing"})`);
         console.log(`Stale: ${inspection.stale ? "yes" : "no"}`);
         if (inspection.staleReason) console.log(`Stale Reason: ${inspection.staleReason}`);
-        const roots = loadHostConfig().cfg.roots;
-        for (const root of roots) console.log(`Roots: ${root} (${fs.existsSync(root) ? "found" : "missing"})`);
+        for (const root of hostCfg.roots) console.log(`Roots: ${root} (${fs.existsSync(root) ? "found" : "missing"})`);
         if (inspection.platform === "linux") {
           console.log(`Linger: ${inspection.details?.linger === true ? "enabled" : "disabled"}`);
           if (inspection.details?.lingerError) console.log(`Linger Error: ${inspection.details.lingerError}`);
@@ -173,7 +182,7 @@ export async function main(argv: string[]): Promise<void> {
           if (!inspection.nodePathValid) problems.push("node path is invalid or stale");
           if (!inspection.scriptPathValid) problems.push("host script path is missing");
           if (inspection.platform === "linux" && inspection.details?.linger !== true) problems.push("systemd user lingering is disabled");
-          if (missingRoots(loadHostConfig().cfg)) problems.push(NO_ROOTS_HINT);
+          if (hasMissingRoots) problems.push(NO_ROOTS_HINT);
           for (const problem of problems) console.log(`Problem: ${problem}`);
         }
       }
@@ -199,7 +208,7 @@ export async function main(argv: string[]): Promise<void> {
           /* ignore */
         }
       }
-      cleanupExpiredInboxFiles(resolveInboxDir(cfg));
+      const inboxCleanupTimer = scheduleInboxCleanup(resolveInboxDir(cfg));
       let bridge: HerdrAgentBridge | undefined;
       const manager = new HostManager(host, {
         onLog: (m) => console.error(`[rp-host] ${m}`),
@@ -229,6 +238,7 @@ export async function main(argv: string[]): Promise<void> {
       const stop = () => {
         if (stopping) return;
         stopping = true;
+        clearInterval(inboxCleanupTimer);
         bridge?.stop();
         conn.stop();
         // Allow a brief flush window for final close/agent.closed frames before exit.

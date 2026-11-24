@@ -95,9 +95,7 @@ function readRawHostConfig(p: string): Record<string, unknown> {
 }
 
 function writeRawHostConfig(p: string, raw: Record<string, unknown>): void {
-  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(p, JSON.stringify(raw, null, 2) + "\n", { mode: 0o600 });
-  fs.chmodSync(p, 0o600);
+  atomicWriteFileSync(p, JSON.stringify(raw, null, 2) + "\n", 0o600);
 }
 
 /** Roots written in the file, minus the untouched default when it is missing on disk (it is only a guess). */

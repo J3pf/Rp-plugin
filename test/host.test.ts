@@ -178,11 +178,22 @@ describe("herdr backend", () => {
   });
   it("starts the herdr server headless when it is not running", async () => {
     let up = false;
-    const { b, calls } = mkH({ "herdr status server": () => ({ code: up ? 0 : 1 }) });
-    // simulate the server coming up shortly after being asked to start
-    setTimeout(() => (up = true), 300);
+    const f = fakeRun({ "herdr status server": () => ({ code: up ? 0 : 1 }) });
+    const spawned: Array<{ cmd: string; args: string[] }> = [];
+    const b = new HerdrBackend(
+      { run: f.run, platform: "linux", herdrSession: null },
+      {
+        pollIntervalMs: 50,
+        spawnServer: (cmd, args) => {
+          spawned.push({ cmd, args });
+          setTimeout(() => (up = true), 70);
+          return { on: () => {}, unref: () => {}, kill: () => true };
+        },
+      },
+    );
     await expect(b.ensureServer()).resolves.toBeUndefined();
-    expect(calls.filter((c) => c.args[0] === "status").length).toBeGreaterThan(1);
+    expect(spawned).toEqual([{ cmd: "herdr", args: ["server"] }]);
+    expect(f.calls.filter((c) => c.args[0] === "status").length).toBeGreaterThan(1);
   });
   it("layout: workspaces with their tabs and panes", async () => {
     const { b } = mkH({
@@ -240,7 +251,8 @@ describe("Windows backends (id travels as --rp-spawn-id because wt/cmd do not pa
     expect(() => wtArgs({ ...req, cwd: "C:\\a;b" })).toThrow(/;/);
   });
   it("cmd /c start arguments", () => {
-    expect(consoleArgs(req)).toEqual(["/c", "start", '"api"', "/D", "C:\\proyectos\\api", "gentle-shell", "--link", "--rp-spawn-id", "SPAWNID12345"]);
+    expect(consoleArgs(req)).toEqual(["/c", "start", "", "/D", "C:\\proyectos\\api", "gentle-shell", "--link", "--rp-spawn-id", "SPAWNID12345"]);
+    expect(consoleArgs({ ...req, name: 'api" calc.exe' })).toEqual(["/c", "start", "", "/D", "C:\\proyectos\\api", "gentle-shell", "--link", "--rp-spawn-id", "SPAWNID12345"]);
     expect(() => consoleArgs({ ...req, cwd: "C:\\proyectos\\api&calc" })).toThrow(/unsafe/);
     expect(() => consoleArgs({ ...req, launcherCommand: "pi & whoami" })).toThrow(/unsafe/);
   });
@@ -249,16 +261,26 @@ describe("Windows backends (id travels as --rp-spawn-id because wt/cmd do not pa
     expect(killScript("SPAWNID12345")).toContain("$_.ProcessId -ne $PID");
     expect(() => killScript("bad'; Stop-Process")).toThrow(HostError);
   });
-  it("spawn/kill run wt.exe / cmd.exe / powershell without a shell string", async () => {
-    const f = fakeRun({ "wt.exe": () => ({}), "cmd.exe": () => ({}), "powershell.exe": () => ({}), "where wt.exe": () => ({}) });
+  it("spawn/kill run wt.exe / direct detached console / powershell without a shell string", async () => {
+    const f = fakeRun({ "wt.exe": () => ({}), "powershell.exe": () => ({}), "where wt.exe": () => ({}) });
     const wt = new WindowsTerminalBackend({ run: f.run, platform: "win32", herdrSession: null });
     expect(await wt.detect()).toBe(true);
     const rec = await wt.spawn(req);
     expect(rec.backend).toBe("wt");
     await wt.kill(rec);
-    const con = new ConsoleBackend({ run: f.run, platform: "win32", herdrSession: null });
-    await con.spawn(req);
-    expect(f.calls.map((c) => c.cmd)).toEqual(["where", "wt.exe", "powershell.exe", "cmd.exe"]);
+    const spawned: Array<{ cmd: string; args: string[]; opts: any }> = [];
+    const con = new ConsoleBackend({ run: f.run, platform: "win32", herdrSession: null }, async (cmd, args, opts) => {
+      spawned.push({ cmd, args, opts });
+    });
+    await con.spawn({ ...req, name: 'bad" calc.exe' });
+    expect(f.calls.map((c) => c.cmd)).toEqual(["where", "wt.exe", "powershell.exe"]);
+    expect(spawned).toEqual([
+      {
+        cmd: "gentle-shell",
+        args: ["--link", "--rp-spawn-id", "SPAWNID12345"],
+        opts: { cwd: "C:\\proyectos\\api", detached: true, stdio: "ignore", windowsHide: false },
+      },
+    ]);
     expect(await new WindowsTerminalBackend({ run: f.run, platform: "linux", herdrSession: null }).detect()).toBeNull();
     expect(await new ConsoleBackend({ run: f.run, platform: "linux", herdrSession: null }).detect()).toBeNull();
   });

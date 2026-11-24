@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { NO_ROOTS_HINT, missingRoots, type HostConfig } from "./config.ts";
-import { splitCommand } from "../shared/util.ts";
+import { SAFE_CONV_ID_RE, splitCommand } from "../shared/util.ts";
 
 export { splitCommand };
 
@@ -20,15 +20,41 @@ export function isInside(root: string, target: string, platform: NodeJS.Platform
   return rel === "" || (!rel.startsWith("..") && !p.isAbsolute(rel));
 }
 
-/** Canonicalize with realpath and require the result to live under one of the roots. */
+/** Canonicalize with realpath and require the result to live under one of the roots without leaking outside existence/type. */
 export function resolveWithinRoots(cfg: HostConfig, requested: string, platform: NodeJS.Platform = process.platform): string {
   if (typeof requested !== "string" || !requested || requested.includes("\0")) throw new HostError("bad_request", "invalid path");
+  const p = platform === "win32" ? path.win32 : path.posix;
+  const resolvePath = platform === process.platform ? path.resolve : p.resolve;
+
+  const lexicalRoots: string[] = [];
+  const canonicalRoots: string[] = [];
+  for (const r of cfg.roots) {
+    const absRoot = resolvePath(r);
+    lexicalRoots.push(absRoot);
+    try {
+      const realRoot = fs.realpathSync(absRoot);
+      canonicalRoots.push(realRoot);
+      if (realRoot !== absRoot) lexicalRoots.push(realRoot);
+    } catch {
+      canonicalRoots.push(absRoot);
+    }
+  }
+
+  const resolvedRequested = resolvePath(requested);
+  if (!lexicalRoots.some((r) => isInside(r, resolvedRequested, platform))) {
+    throw new HostError("bad_request", "path is outside the allowed roots");
+  }
+
   let real: string;
   try {
-    real = fs.realpathSync(requested);
+    real = fs.realpathSync(resolvedRequested);
   } catch {
     throw new HostError("not_found", "directory does not exist");
   }
+  if (!canonicalRoots.some((r) => isInside(r, real, platform))) {
+    throw new HostError("bad_request", "path is outside the allowed roots");
+  }
+
   let st: fs.Stats;
   try {
     st = fs.statSync(real);
@@ -36,19 +62,11 @@ export function resolveWithinRoots(cfg: HostConfig, requested: string, platform:
     throw new HostError("not_found", "directory does not exist");
   }
   if (!st.isDirectory()) throw new HostError("bad_request", "not a directory");
-  const roots = cfg.roots.map((r) => {
-    try {
-      return fs.realpathSync(r);
-    } catch {
-      return r;
-    }
-  });
-  if (!roots.some((r) => isInside(r, real, platform))) throw new HostError("bad_request", "path is outside the allowed roots");
   return real;
 }
 
 export function listDirs(cfg: HostConfig, requested: string): { path: string; dirs: string[] } {
-  if (!requested || requested === "/" || requested === "") {
+  if (!requested || requested === "/") {
     if (missingRoots(cfg)) throw new HostError("not_found", NO_ROOTS_HINT);
     return { path: "", dirs: cfg.roots.filter((r) => fs.existsSync(r)) };
   }
@@ -69,14 +87,19 @@ export function resolveLauncher(cfg: HostConfig, key: string | undefined): { key
   return { key: k, command: cfg.launchers[k]! };
 }
 
-/** Labels end up in CLI args and terminal titles: strip control chars and `;` (wt command separator). */
-export function sanitizeLabel(name: string | undefined, fallback: string): string {
-  const cleaned = (name ?? "")
+function cleanLabelValue(value: string | undefined): string {
+  return (value ?? "")
     .replace(/[\u0000-\u001f\u007f;"`$\\&|^%<>()]/g, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 60);
-  return cleaned || fallback;
+    .replace(/^[-\s]+/, "")
+    .slice(0, 60)
+    .trim();
+}
+
+/** Labels end up in CLI args and terminal titles: strip control chars, metacharacters, and leading dashes. */
+export function sanitizeLabel(name: string | undefined, fallback: string): string {
+  return cleanLabelValue(name) || cleanLabelValue(fallback) || "agent";
 }
 
 export function validateSpawnId(id: unknown): string {
@@ -85,7 +108,7 @@ export function validateSpawnId(id: unknown): string {
 }
 
 export function validateSessionId(id: unknown): string {
-  if (typeof id !== "string" || !/^[0-9A-Za-z_][0-9A-Za-z_-]{0,127}$/.test(id)) {
+  if (typeof id !== "string" || !SAFE_CONV_ID_RE.test(id)) {
     throw new HostError("bad_request", "invalid sessionId");
   }
   return id;
