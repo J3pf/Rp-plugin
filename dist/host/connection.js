@@ -6,16 +6,23 @@ import { WsKeepalive, getProxyAgent, toWsUrl } from "../shared/http.js";
 import { backoffDelay, errMsg } from "../shared/util.js";
 import { HostError, listDirs, validateSessionId } from "./validate.js";
 import { gitDiff, gitDiscard } from "./git.js";
+const MAX_CONCURRENT_RPCS = 4;
+const MAX_QUEUED_RPCS = 32;
+const STABILITY_WINDOW_MS = 5_000;
 export class HostConnection {
     o;
     ws = null;
     stopped = false;
     attempt = 0;
+    restartAttempt = 0;
     timer = null;
+    stabilityTimer = null;
     /** The relay pings every 25 s, client pings every 20 s; silence beyond 70 s means a dead socket. */
     keepalive = new WsKeepalive(70_000, 20_000);
     quotaTimer = null;
     quotaPolling = false;
+    inFlightRpcs = 0;
+    rpcQueue = [];
     constructor(o) {
         this.o = o;
     }
@@ -25,19 +32,43 @@ export class HostConnection {
     start() {
         void this.connect();
     }
+    clearStabilityTimer() {
+        if (this.stabilityTimer) {
+            clearTimeout(this.stabilityTimer);
+            this.stabilityTimer = null;
+        }
+    }
+    armStabilityTimer() {
+        this.clearStabilityTimer();
+        this.stabilityTimer = setTimeout(() => {
+            this.stabilityTimer = null;
+            this.attempt = 0;
+            this.restartAttempt = 0;
+        }, STABILITY_WINDOW_MS);
+        this.stabilityTimer.unref?.();
+    }
     stop() {
         this.stopped = true;
         this.keepalive.stop();
         this.stopQuotaTimer();
+        this.clearStabilityTimer();
         if (this.timer)
             clearTimeout(this.timer);
         this.timer = null;
+        const ws = this.ws;
+        this.ws = null;
         try {
-            this.ws?.close(1000);
+            ws?.close(1000);
         }
         catch {
             /* ignore */
         }
+    }
+    computeRestartDelay() {
+        const rnd = this.o.random ?? Math.random;
+        const baseJitter = 250 + rnd() * 1250; // 250–1500ms
+        const factor = 2 ** Math.min(this.restartAttempt++, 5);
+        return Math.min(30_000, Math.round(baseJitter * factor));
     }
     scheduleReconnect(code) {
         if (this.stopped)
@@ -47,7 +78,15 @@ export class HostConnection {
             this.stopped = true;
             return;
         }
-        const delay = code === CLOSE.SERVICE_RESTART ? 0 : (this.o.backoff ?? backoffDelay)(this.attempt++);
+        let delay;
+        if (code === CLOSE.SERVICE_RESTART) {
+            delay = this.computeRestartDelay();
+        }
+        else {
+            this.restartAttempt = 0;
+            delay = (this.o.backoff ?? backoffDelay)(this.attempt++);
+        }
+        this.log(`reconnecting in ${delay}ms (close=${code ?? "none"})`);
         if (this.timer)
             clearTimeout(this.timer);
         this.timer = setTimeout(() => void this.connect(), delay);
@@ -79,8 +118,19 @@ export class HostConnection {
             return;
         }
         this.ws = ws;
+        let lastWsError = null;
         ws.on("open", () => {
-            this.attempt = 0;
+            if (this.stopped || this.ws !== ws) {
+                try {
+                    ws.terminate();
+                }
+                catch {
+                    /* ignore */
+                }
+                return;
+            }
+            lastWsError = null;
+            this.armStabilityTimer();
             this.keepalive.start(ws, WebSocket.OPEN);
             this.startQuotaTimer();
             void this.hello(ws).catch((e) => this.log(`hello failed: ${errMsg(e)}`));
@@ -88,17 +138,27 @@ export class HostConnection {
         ws.on("ping", () => this.keepalive.arm(ws));
         ws.on("pong", () => this.keepalive.arm(ws));
         ws.on("message", (data) => {
+            if (this.stopped || this.ws !== ws)
+                return;
             this.keepalive.arm(ws);
             const env = parseEnvelope(data.toString("utf8"));
             if (env)
                 void this.handle(env);
         });
-        ws.on("error", () => { });
+        ws.on("error", (err) => {
+            lastWsError = errMsg(err);
+            if (!this.stopped && this.ws === ws) {
+                this.log(`ws error: ${lastWsError}`);
+            }
+        });
         ws.on("unexpected-response", (_req, res) => {
             res.resume();
             if (res.statusCode === 401 || res.statusCode === 403) {
                 this.log(`relay rejected auth with http ${res.statusCode}; not reconnecting`);
                 this.stopped = true;
+            }
+            else {
+                this.log(`relay rejected upgrade with http ${res.statusCode ?? "unknown"}`);
             }
             try {
                 ws.terminate();
@@ -107,12 +167,16 @@ export class HostConnection {
                 /* ignore */
             }
         });
-        ws.on("close", (code) => {
+        ws.on("close", (code, reasonBuf) => {
             this.keepalive.stop();
             this.stopQuotaTimer();
+            this.clearStabilityTimer();
             if (this.ws !== ws)
                 return;
             this.ws = null;
+            const reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString("utf8").trim() : String(reasonBuf ?? "").trim();
+            const details = [reason ? `reason=${reason}` : "", lastWsError ? `error=${lastWsError}` : ""].filter(Boolean).join(", ");
+            this.log(`ws closed (code=${code}${details ? `, ${details}` : ""})`);
             this.scheduleReconnect(code);
         });
     }
@@ -180,10 +244,44 @@ export class HostConnection {
         this.sendEnv(envelope("host.hello", body));
         void this.pollQuotas();
     }
+    async acquireRpcSlot() {
+        const maxConcurrent = Math.max(1, this.o.maxConcurrentRpcs ?? MAX_CONCURRENT_RPCS);
+        const maxQueued = Math.max(0, this.o.maxQueuedRpcs ?? MAX_QUEUED_RPCS);
+        if (this.inFlightRpcs < maxConcurrent) {
+            this.inFlightRpcs++;
+            return true;
+        }
+        if (this.rpcQueue.length >= maxQueued) {
+            return false;
+        }
+        await new Promise((resolve) => {
+            this.rpcQueue.push(resolve);
+        });
+        // Slot ownership is transferred synchronously by releaseRpcSlot().
+        return true;
+    }
+    releaseRpcSlot() {
+        const next = this.rpcQueue.shift();
+        if (next) {
+            next();
+            return;
+        }
+        this.inFlightRpcs = Math.max(0, this.inFlightRpcs - 1);
+    }
     /** Handle one relay request; always answers with `re` = request id. */
     async handle(env) {
         const d = env.d ?? {};
         const reply = (t, body) => this.sendEnv(envelope(t, body, { re: env.id }));
+        if (env.t === "error") {
+            this.log(`relay error: ${d.code} ${d.message}`);
+            return;
+        }
+        const acquired = await this.acquireRpcSlot();
+        if (!acquired) {
+            this.log(`${env.t} rejected: too many concurrent host requests`);
+            reply("error", { code: "internal", message: "too many concurrent host requests" });
+            return;
+        }
         try {
             if (d.machineId && d.machineId !== this.o.machineId)
                 throw new HostError("bad_request", "machineId mismatch");
@@ -221,9 +319,6 @@ export class HostConnection {
                     return reply("ack", {});
                 case "host.herdr_close":
                     return reply("host.herdr_closed", await this.o.manager.herdrClose(d.paneId));
-                case "error":
-                    this.log(`relay error: ${d.code} ${d.message}`);
-                    return;
                 default:
                     return;
             }
@@ -232,6 +327,9 @@ export class HostConnection {
             const code = e instanceof HostError ? e.code : "internal";
             this.log(`${env.t} failed: ${errMsg(e)}`);
             reply("error", { code, message: errMsg(e) });
+        }
+        finally {
+            this.releaseRpcSlot();
         }
     }
 }

@@ -1,3 +1,4 @@
+import { parseOptionIndex } from "../broker.js";
 export const gentleAskUserQuestion = {
     tool: "ask_user_question",
     extension: "gentle-pi",
@@ -32,25 +33,33 @@ export const gentleAskUserQuestion = {
         const any = answer;
         if (any.cancelled || !Array.isArray(any.answers))
             return { cancelled: true, answers: [] };
-        const rows = [];
+        const byQuestion = new Map();
         for (const item of any.answers) {
+            if (!item || typeof item !== "object" || typeof item.questionIndex !== "number" || !Number.isInteger(item.questionIndex))
+                continue;
             const q = a.questions[item.questionIndex];
             if (!q)
                 continue;
-            const picked = (item.optionIds ?? []).map((id) => q.options[Number(id)]).filter((o) => !!o);
+            const rawIds = Array.isArray(item.optionIds) ? item.optionIds : [];
+            const picked = rawIds
+                .map((id) => {
+                const idx = parseOptionIndex(id);
+                return idx >= 0 ? q.options[idx] : undefined;
+            })
+                .filter((o) => !!o);
             const text = typeof item.text === "string" && item.text.trim() ? item.text : undefined;
             if (q.multiSelect) {
                 const selected = picked.map((o) => o.label);
                 if (text !== undefined)
-                    rows.push({ questionIndex: item.questionIndex, question: q.question, kind: "custom", answer: text, selected });
-                else
-                    rows.push({ questionIndex: item.questionIndex, question: q.question, kind: "multi", answer: null, selected });
+                    byQuestion.set(item.questionIndex, { questionIndex: item.questionIndex, question: q.question, kind: "custom", answer: text, selected });
+                else if (selected.length > 0)
+                    byQuestion.set(item.questionIndex, { questionIndex: item.questionIndex, question: q.question, kind: "multi", answer: null, selected });
             }
             else if (text !== undefined) {
-                rows.push({ questionIndex: item.questionIndex, question: q.question, kind: "custom", answer: text });
+                byQuestion.set(item.questionIndex, { questionIndex: item.questionIndex, question: q.question, kind: "custom", answer: text });
             }
             else if (picked[0]) {
-                rows.push({
+                byQuestion.set(item.questionIndex, {
                     questionIndex: item.questionIndex,
                     question: q.question,
                     kind: "option",
@@ -59,10 +68,10 @@ export const gentleAskUserQuestion = {
                 });
             }
         }
-        rows.sort((x, y) => x.questionIndex - y.questionIndex);
         // every question must be answered, otherwise treat as cancelled (never commit a partial questionnaire silently)
-        if (rows.length !== a.questions.length)
+        if (byQuestion.size !== a.questions.length)
             return { cancelled: true, answers: [] };
+        const rows = [...byQuestion.values()].sort((x, y) => x.questionIndex - y.questionIndex);
         return { cancelled: false, answers: rows };
     },
     fromResult(args, result) {

@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -177,6 +178,21 @@ describe("wire contract (PROTOCOLO v1)", () => {
     expect(validators["agent.event"]!({ epoch: "e", seq: 0, e: { type: "x" } })).not.toEqual([]);
     expect(check({ options: [{ id: 1 }] }, { options: promptOpenShape.options }, "x")).not.toEqual([]);
     expect(validateEnvelope({ v: 2, t: "agent.hello", ts: 1, d: {} })).not.toEqual([]);
+    // Stale host.herdr_layout.result shape ({ available, workspaces: [{ name, panes }] }) must be rejected
+    expect(validators["host.herdr_layout.result"]!({ available: true, workspaces: [{ id: "w1", name: "old", panes: [] }] })).not.toEqual([]);
+    expect(validators["host.herdr_layout.result"]!({ workspaces: [{ id: "w1", label: "Main", cwd: "/repo", tabs: [{ id: "t1", label: "T1", panes: [{ id: "p1", agent: "pi" }] }] }] })).toEqual([]);
+    expect(validators["host.herdr_layout.result"]!({ workspaces: [{ id: "w1", label: "Main", cwd: null, tabs: [{ id: "t1", label: "T1", panes: [{ id: "p1", agent: 123 }] }] }] })).not.toEqual([]);
+    // Removed "untracked" status in host.git_diff.result must be rejected
+    expect(
+      validators["host.git_diff.result"]!({
+        cwd: "/repo",
+        branch: "main",
+        files: [{ path: "a.ts", status: "untracked", additions: 1, deletions: 0, binary: false, patch: "+a", truncated: false }],
+        totalAdditions: 1,
+        totalDeletions: 0,
+      }),
+    ).not.toEqual([]);
+    expect(validators["host.git_discard.result"]!({ cwd: "/repo", path: "", ok: true })).not.toEqual([]);
   });
 
   it("rp-host messages validate", async () => {
@@ -184,24 +200,86 @@ describe("wire contract (PROTOCOLO v1)", () => {
     const { HostManager } = await import("../src/host/manager.ts");
     const { normalizeHostConfig } = await import("../src/host/config.ts");
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "rpch-"));
-    fs.mkdirSync(path.join(root, "p"));
+    const repoDir = path.join(root, "p");
+    fs.mkdirSync(repoDir);
+    execSync("git init", { cwd: repoDir, stdio: "ignore" });
+    execSync('git config user.email "test@test.com" && git config user.name "Test"', { cwd: repoDir, stdio: "ignore" });
+    fs.writeFileSync(path.join(repoDir, "file.txt"), "hello\n");
+    execSync("git add file.txt && git commit -m init", { cwd: repoDir, stdio: "ignore" });
+    fs.writeFileSync(path.join(repoDir, "file.txt"), "hello world\n");
+    fs.writeFileSync(path.join(repoDir, "new.txt"), "brand new\n");
+
     const cfg = normalizeHostConfig({ roots: [root] });
-    const run = async (cmd: string, args: string[]) => (cmd === "tmux" ? { code: 0, stdout: args[0] === "-V" ? "tmux 3.4" : "", stderr: "" } : { code: 1, stdout: "", stderr: "" });
+    const run = async (cmd: string, args: string[]) => {
+      if (cmd === "tmux") {
+        return { code: 0, stdout: args[0] === "-V" ? "tmux 3.4" : "", stderr: "" };
+      }
+      if (cmd === "herdr") {
+        if (args.includes("--version")) return { code: 0, stdout: "herdr 0.9.3", stderr: "" };
+        if (args.includes("workspace") && args.includes("list")) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({ result: { workspaces: [{ workspace_id: "w1", label: "Work", cwd: repoDir }] } }),
+            stderr: "",
+          };
+        }
+        if (args.includes("tab") && args.includes("list")) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              result: {
+                tabs: [
+                  {
+                    tab_id: "t1",
+                    workspace_id: "w1",
+                    label: "Main",
+                    panes: [{ pane_id: "p1", agent: "pi" }, { pane_id: "p2" }],
+                  },
+                ],
+              },
+            }),
+            stderr: "",
+          };
+        }
+        return { code: 0, stdout: "{}", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "" };
+    };
     const manager = new HostManager(cfg, { run, platform: "linux", storeFile: path.join(root, "s.json") });
     const hc = new HostConnection({ relayUrl: relay.url, machineId: "M", token: "t", cfg, manager, backoff: () => 20 });
     hc.start();
-    const hello = await waitUntil(() => relay.of("host.hello")[0]);
-    expect(validateEnvelope(hello)).toEqual([]);
-    const ask = async (t: string, d: any) => {
-      const id = "R" + t;
-      const before = relay.all.length;
-      relay.conns[0]!.ws.send(JSON.stringify({ v: 1, t, id, ts: 1, d }));
-      return waitUntil(() => relay.all.slice(before).find((e) => e.re === id));
-    };
-    expect(validateEnvelope(await ask("host.list_dirs", { machineId: "M", path: root }))).toEqual([]);
-    const sp = await ask("host.spawn", { machineId: "M", cwd: path.join(root, "p") });
-    expect(sp.t).toBe("host.spawned");
-    expect(validateEnvelope(sp)).toEqual([]);
-    hc.stop();
+    try {
+      const hello = await waitUntil(() => relay.of("host.hello")[0]);
+      expect(validateEnvelope(hello)).toEqual([]);
+      const ask = async (t: string, d: any) => {
+        const id = "R" + t;
+        const before = relay.all.length;
+        relay.conns[0]!.ws.send(JSON.stringify({ v: 1, t, id, ts: 1, d }));
+        return waitUntil(() => relay.all.slice(before).find((e) => e.re === id));
+      };
+      expect(validateEnvelope(await ask("host.list_dirs", { machineId: "M", path: root }))).toEqual([]);
+      const sp = await ask("host.spawn", { machineId: "M", cwd: repoDir, backend: "tmux" });
+      expect(sp.t).toBe("host.spawned");
+      expect(validateEnvelope(sp)).toEqual([]);
+
+      const layout = await ask("host.herdr_layout", { machineId: "M" });
+      expect(layout.t).toBe("host.herdr_layout.result");
+      expect(validateEnvelope(layout)).toEqual([]);
+      expect(layout.d.workspaces).toHaveLength(1);
+      expect(layout.d.workspaces[0].tabs[0].panes).toEqual([{ id: "p1", agent: "pi" }, { id: "p2" }]);
+
+      const diff = await ask("host.git_diff", { machineId: "M", cwd: repoDir });
+      expect(diff.t).toBe("host.git_diff.result");
+      expect(validateEnvelope(diff)).toEqual([]);
+      expect(diff.d.files.map((f: any) => f.status).sort()).toEqual(["added", "modified"]);
+
+      const discard = await ask("host.git_discard", { machineId: "M", cwd: repoDir, path: "new.txt" });
+      expect(discard.t).toBe("host.git_discard.result");
+      expect(validateEnvelope(discard)).toEqual([]);
+      expect(discard.d).toMatchObject({ ok: true, path: "new.txt" });
+    } finally {
+      hc.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

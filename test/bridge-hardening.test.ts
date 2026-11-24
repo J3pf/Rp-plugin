@@ -46,6 +46,14 @@ class FakeTransport implements Transport {
 
 describe("bridge hardening (T3 / S3)", () => {
   const tmpDirs: string[] = [];
+let testSockSeq = 0;
+
+function makeTestSocketPath(dir: string, name = "gate.sock"): string {
+  if (process.platform === "win32") {
+    return `\\\\.\\pipe\\rp-test-bh-${process.pid}-${Date.now()}-${++testSockSeq}`;
+  }
+  return path.join(dir, name);
+}
 
   afterEach(() => {
     vi.restoreAllMocks();
@@ -264,6 +272,7 @@ describe("bridge hardening (T3 / S3)", () => {
     });
 
     it("rejects symlinks in resolveTaskLogPath and non-tasks paths under brainRoot (W-02)", () => {
+      if (process.platform === "win32") return;
       const dir = mkTmp("rp-w02-tasklog-");
       const homeDir = path.join(dir, "home");
       const outsideSecret = path.join(dir, "secret.log");
@@ -327,6 +336,7 @@ describe("bridge hardening (T3 / S3)", () => {
     });
 
     it("rejects symlinks in resolveChildTranscriptPath (W-02)", () => {
+      if (process.platform === "win32") return;
       const dir = mkTmp("rp-w02-child-");
       const homeDir = path.join(dir, "home");
       const outsideTranscript = path.join(dir, "outside-transcript.jsonl");
@@ -604,7 +614,7 @@ describe("bridge hardening (T3 / S3)", () => {
 
     it("W-08 + W-09 + S-01: unsigned ask on bad HMAC, single-request socket, validatePaneId, and gate-created /quit cleanup", async () => {
       const dir = mkTmp("rp-w08-gate-");
-      const sockPath = path.join(dir, "gate.sock");
+      const sockPath = makeTestSocketPath(dir, "gate.sock");
       const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
       const transports = new Map<string, FakeTransport>();
 
@@ -631,7 +641,8 @@ describe("bridge hardening (T3 / S3)", () => {
 
       bridge.start();
       try {
-        await vi.waitFor(() => expect(fs.existsSync(sockPath)).toBe(true), { timeout: 2_000, interval: 10 });
+        await vi.waitFor(() => expect((bridge as any).ownsGateSocket).toBe(true), { timeout: 2_000, interval: 10 });
+        if (process.platform !== "win32") expect(fs.existsSync(sockPath)).toBe(true);
         expect((bridge as any).gateServer?.maxConnections).toBe(64);
 
         // S-01: failed HMAC must return UNSIGNED ask (no signing oracle)
@@ -764,7 +775,7 @@ describe("bridge hardening (T3 / S3)", () => {
           failing
             ? { code: 1, stdout: "", stderr: "daemon unreachable" }
             : { code: 0, stdout: '{"result":{"agents":[]}}', stderr: "" },
-        socketPath: path.join(dir, "gate.sock"),
+        socketPath: makeTestSocketPath(dir, "gate.sock"),
         stateFile: null,
         pollIntervalMs: 60_000,
         onLog: (m) => logs.push(m),

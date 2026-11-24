@@ -4,9 +4,47 @@ import path from "node:path";
 import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { resolveAgyTranscriptPath } from "../agy-transcript.js";
-import { SAFE_CONV_ID_RE } from "../../shared/util.js";
+import { LruMap, SAFE_CONV_ID_RE } from "../../shared/util.js";
 const CLAUDE_DEFAULT_WINDOW = 200_000;
 const CODEX_DEFAULT_WINDOW = 258_400;
+const AGY_MODEL_CACHE_THROTTLE_MS = 10_000;
+const AGY_MODEL_DB_TIMEOUT_MS = 25;
+export const MODEL_CHANGE_RE = /changed setting `Model Selection` from [^\n]+? to ([^\n<]+?)\.(?:\s|$)/i;
+const agyModelCache = new LruMap(256);
+function statMtimeMs(filePath) {
+    try {
+        const st = fs.statSync(filePath);
+        return st.isFile() ? st.mtimeMs : null;
+    }
+    catch {
+        return null;
+    }
+}
+export function readJsonlHeadLine(filePath, maxBytes = 8192) {
+    try {
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile() || stat.size <= 0)
+            return null;
+        const readSize = Math.min(stat.size, maxBytes);
+        const fd = fs.openSync(filePath, "r");
+        try {
+            const buf = Buffer.allocUnsafe(readSize);
+            const bytesRead = fs.readSync(fd, buf, 0, readSize, 0);
+            if (bytesRead <= 0)
+                return null;
+            const text = buf.subarray(0, bytesRead).toString("utf8");
+            const nl = text.indexOf("\n");
+            const firstLine = (nl >= 0 ? text.slice(0, nl) : text).trim();
+            return firstLine || null;
+        }
+        finally {
+            fs.closeSync(fd);
+        }
+    }
+    catch {
+        return null;
+    }
+}
 export function readJsonlTailLines(filePath, maxBytes = 64 * 1024) {
     try {
         const stat = fs.statSync(filePath);
@@ -131,8 +169,7 @@ function collectRecentCodexSessionFiles(home) {
     return candidates.slice(0, 8).map((c) => c.full);
 }
 function matchesCodexCwd(filePath, cwd) {
-    const headLines = readJsonlTailLines(filePath, 4096);
-    const firstLine = headLines[0]?.trim();
+    const firstLine = readJsonlHeadLine(filePath);
     if (!firstLine?.startsWith("{"))
         return true;
     try {
@@ -243,64 +280,96 @@ function extractAgyModelFromGenMetadataBlob(buf) {
 export function readAgySessionModel(sessionId, home = os.homedir()) {
     if (!sessionId || !SAFE_CONV_ID_RE.test(sessionId))
         return { model: null, uncertain: false };
-    let transcriptChangeModel = null;
-    let lastUserInputChangeModel = null;
+    let tPath = null;
     try {
-        const tPath = resolveAgyTranscriptPath(sessionId, home);
-        const lines = readJsonlTailLines(tPath, 256 * 1024);
-        let seenLatestUserInput = false;
-        for (let i = lines.length - 1; i >= 0; i--) {
-            const line = lines[i].trim();
-            if (!line.startsWith("{"))
-                continue;
-            try {
-                const obj = JSON.parse(line);
-                if (obj?.type === "USER_INPUT" && typeof obj?.content === "string") {
-                    const m = /changed setting `Model Selection` from [^\n]+ to ([^\n.<]+)\./i.exec(obj.content);
-                    if (m?.[1]?.trim()) {
-                        const candidate = m[1].trim();
-                        if (!transcriptChangeModel)
-                            transcriptChangeModel = candidate;
-                        if (!seenLatestUserInput)
-                            lastUserInputChangeModel = candidate;
-                    }
-                    seenLatestUserInput = true;
-                    if (transcriptChangeModel)
-                        break;
-                }
-            }
-            catch {
-                /* ignore */
-            }
-        }
+        tPath = resolveAgyTranscriptPath(sessionId, home);
     }
     catch {
-        /* ignore */
+        tPath = null;
     }
-    if (lastUserInputChangeModel)
-        return { model: lastUserInputChangeModel, uncertain: false };
+    const dbPath = path.join(home, ".gemini", "antigravity-cli", "conversations", `${sessionId}.db`);
+    const transcriptMtimeMs = tPath ? statMtimeMs(tPath) : null;
+    const mainDbMtime = statMtimeMs(dbPath);
+    const walDbMtime = statMtimeMs(`${dbPath}-wal`);
+    const dbMtimeMs = mainDbMtime !== null && walDbMtime !== null
+        ? Math.max(mainDbMtime, walDbMtime)
+        : (mainDbMtime ?? walDbMtime);
+    const now = Date.now();
+    const cacheKey = `${home}\0${sessionId}`;
+    const cached = agyModelCache.get(cacheKey);
+    if (cached) {
+        const mtimeChanged = cached.dbMtimeMs !== dbMtimeMs || cached.transcriptMtimeMs !== transcriptMtimeMs;
+        if (!mtimeChanged && now - cached.checkedAt < AGY_MODEL_CACHE_THROTTLE_MS) {
+            return cached.value;
+        }
+    }
+    let transcriptChangeModel = null;
+    let lastUserInputChangeModel = null;
+    if (tPath && transcriptMtimeMs !== null) {
+        try {
+            const lines = readJsonlTailLines(tPath, 256 * 1024);
+            let seenLatestUserInput = false;
+            for (let i = lines.length - 1; i >= 0; i--) {
+                const line = lines[i].trim();
+                if (!line.startsWith("{"))
+                    continue;
+                try {
+                    const obj = JSON.parse(line);
+                    if (obj?.type === "USER_INPUT" && typeof obj?.content === "string") {
+                        const m = MODEL_CHANGE_RE.exec(obj.content);
+                        if (m?.[1]?.trim()) {
+                            const candidate = m[1].trim();
+                            if (!transcriptChangeModel)
+                                transcriptChangeModel = candidate;
+                            if (!seenLatestUserInput)
+                                lastUserInputChangeModel = candidate;
+                        }
+                        seenLatestUserInput = true;
+                        if (transcriptChangeModel)
+                            break;
+                    }
+                }
+                catch {
+                    /* ignore */
+                }
+            }
+        }
+        catch {
+            /* ignore */
+        }
+    }
+    if (lastUserInputChangeModel) {
+        const value = { model: lastUserInputChangeModel, uncertain: false };
+        agyModelCache.set(cacheKey, { value, dbMtimeMs, transcriptMtimeMs, checkedAt: now });
+        return value;
+    }
     let dbError = false;
-    try {
-        const dbPath = path.join(home, ".gemini", "antigravity-cli", "conversations", `${sessionId}.db`);
-        if (fs.existsSync(dbPath)) {
-            const db = new DatabaseSync(dbPath, { open: true, readOnly: true, timeout: 1000 });
+    if (mainDbMtime !== null) {
+        try {
+            const db = new DatabaseSync(dbPath, { open: true, readOnly: true, timeout: AGY_MODEL_DB_TIMEOUT_MS });
             try {
                 const row = db.prepare("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1").get();
                 if (row?.data) {
                     const fromDb = extractAgyModelFromGenMetadataBlob(Buffer.from(row.data));
-                    if (fromDb)
-                        return { model: fromDb, uncertain: false };
+                    if (fromDb) {
+                        const value = { model: fromDb, uncertain: false };
+                        agyModelCache.set(cacheKey, { value, dbMtimeMs, transcriptMtimeMs, checkedAt: now });
+                        return value;
+                    }
                 }
             }
             finally {
                 db.close();
             }
         }
+        catch {
+            dbError = true;
+        }
     }
-    catch {
-        dbError = true;
-    }
-    return { model: transcriptChangeModel, uncertain: dbError };
+    const fallbackModel = transcriptChangeModel ?? (dbError ? (cached?.value.model ?? null) : null);
+    const value = { model: fallbackModel, uncertain: dbError };
+    agyModelCache.set(cacheKey, { value, dbMtimeMs, transcriptMtimeMs, checkedAt: now });
+    return value;
 }
 export function readExternalAgentModelWithState(agent, cwd, sessionId, home = os.homedir()) {
     if (agent === "agy") {

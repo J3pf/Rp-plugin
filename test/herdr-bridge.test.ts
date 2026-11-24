@@ -58,6 +58,15 @@ class FakeTransport implements Transport {
   }
 }
 
+let testSockSeq = 0;
+
+function makeTestSocketPath(dir: string, name = "agy-gate.sock"): string {
+  if (process.platform === "win32") {
+    return `\\\\.\\pipe\\rp-test-hb-${process.pid}-${Date.now()}-${++testSockSeq}`;
+  }
+  return path.join(dir, name);
+}
+
 describe("agy-transcript", () => {
   const tmpDirs: string[] = [];
   afterEach(() => {
@@ -1078,7 +1087,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
       cfg,
       herdrSession: null,
       runner,
-      socketPath: path.join(dir, "agy-gate.sock"),
+      socketPath: makeTestSocketPath(dir, "agy-gate.sock"),
       pollIntervalMs: 60_000,
       connectionFactory: (opts) =>
         new Connection({
@@ -1145,7 +1154,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
       cfg,
       herdrSession: null,
       runner,
-      socketPath: path.join(dir, "agy-gate.sock"),
+      socketPath: makeTestSocketPath(dir, "agy-gate.sock"),
       pollIntervalMs: 60_000,
       connectionFactory: (opts) =>
         new Connection({
@@ -1205,7 +1214,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
       cfg,
       herdrSession: null,
       runner,
-      socketPath: path.join(dir, "agy-gate.sock"),
+      socketPath: makeTestSocketPath(dir, "agy-gate.sock"),
       pollIntervalMs: 60_000,
       connectionFactory: (opts) =>
         new Connection({
@@ -1239,7 +1248,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
   it("bridges discovered agy agents, delivers prompts via herdr, and gates dangerous commands via PreToolUse", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-bridge-"));
     tmpDirs.push(dir);
-    const sockPath = path.join(dir, "agy-gate.sock");
+    const sockPath = makeTestSocketPath(dir, "agy-gate.sock");
 
     const transports = new Map<string, FakeTransport>();
     const calls: Array<{ cmd: string; args: string[] }> = [];
@@ -1446,7 +1455,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
   it("fails closed on malformed input, missing command, or broken socket request", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-bridge-failclose-"));
     tmpDirs.push(dir);
-    const sockPath = path.join(dir, "agy-gate.sock");
+    const sockPath = makeTestSocketPath(dir, "agy-gate.sock");
     const cfg: RpConfig = { ...DEFAULT_CONFIG, relayUrl: "https://relay.example.com", machineId: "M1", machineToken: "T1" };
 
     // Malformed JSON stdin to runAgyHook fails closed
@@ -1543,7 +1552,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
   it("captures slash command output via pane fallback and settles without infinite thinking", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-slash-cmd-"));
     tmpDirs.push(dir);
-    const sockPath = path.join(dir, "agy-gate.sock");
+    const sockPath = makeTestSocketPath(dir, "agy-gate.sock");
     const transports = new Map<string, FakeTransport>();
     const calls: Array<{ cmd: string; args: string[] }> = [];
 
@@ -1673,7 +1682,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
   it("avoids fake timestamps on initial terminal snapshot and defers message_end on initial poll", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-no-fake-ts-"));
     tmpDirs.push(dir);
-    const sockPath = path.join(dir, "agy-gate.sock");
+    const sockPath = makeTestSocketPath(dir, "agy-gate.sock");
     const transports = new Map<string, FakeTransport>();
 
     const runner = async (cmd: string, args: string[]) => {
@@ -1882,7 +1891,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
       cfg,
       herdrSession: null,
       runner,
-      socketPath: path.join(dir, "agy-gate.sock"),
+      socketPath: makeTestSocketPath(dir, "agy-gate.sock"),
       stateFile,
       pollIntervalMs: 60_000,
       connectionFactory: (opts) =>
@@ -1940,7 +1949,7 @@ describe("herdr-bridge & PreToolUse gate", () => {
   it("deduplicates user.message by clientMsgId, rejects agent_blocked without send-text, expires optimistic working, rejects unauthenticated gate IPC, and defers promotion while gate prompts are open", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-herdr-hardening-"));
     tmpDirs.push(dir);
-    const sockPath = path.join(dir, "gate.sock");
+    const sockPath = makeTestSocketPath(dir, "gate.sock");
     const calls: Array<{ cmd: string; args: string[] }> = [];
     let pollStep = 0;
 

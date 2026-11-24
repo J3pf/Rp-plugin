@@ -1,7 +1,7 @@
 // Per-session state: created in session_start, destroyed in session_shutdown (PLAN §5).
 import os from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { newId, type AgentEventPayload, type AgentHelloBody, type AgentStatus, type Envelope, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
+import { newId, type AgentEventPayload, type AgentHelloBody, type AgentStatus, type Envelope, type GentleMode, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
 import { parseTodoTasks, redactTodoTasks, replayTodoBranch } from "./todos.ts";
 import { LruSet, errMsg, preview, safeUser } from "../shared/util.ts";
 import { readGitHeadAndDirty } from "../host/git.ts";
@@ -43,7 +43,7 @@ export interface RuntimeDescription {
   openPrompts: number;
   launcher: string;
   herdr: HerdrLocation | null;
-  gentle: { version: string | null; mode: string } | null;
+  gentle: { version: string | null; mode: GentleMode } | null;
   features: string[];
   gateMode: EffectiveGateMode;
   fatal: { code: number; reason: string } | null;
@@ -513,7 +513,7 @@ export class Runtime {
 
   // ---------- hello ----------
 
-  gentleInfo(): { version: string | null; mode: string } | null {
+  gentleInfo(): { version: string | null; mode: GentleMode } | null {
     const present = hasGentleAskTools(this.pi) || this.statuses.sawGentleStatus;
     if (!present) return null;
     return { version: detectGentleVersion(this.pi), mode: this.statuses.gentleMode ?? "unknown" };

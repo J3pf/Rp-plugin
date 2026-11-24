@@ -1,4 +1,5 @@
 // herdr backend (COMPATIBILIDAD H4): workspace / tab / split → `herdr pane run <pane> <launcher>`. Never steals focus.
+import { spawn as nodeSpawn } from "node:child_process";
 import { HostError } from "../validate.js";
 /** First string found at any of the dotted paths. */
 export function pick(obj, paths) {
@@ -40,11 +41,13 @@ export const TAB_PATHS = ["result.tab.tab_id", "result.tab_id", "result.tab.id",
 const HERDR_SERVER_COOLDOWN_MS = 10_000;
 export class HerdrBackend {
     d;
+    opts;
     name = "herdr";
     lastServerStartAt = 0;
     serverStarting = null;
-    constructor(d) {
+    constructor(d, opts = {}) {
         this.d = d;
+        this.opts = opts;
     }
     env(extra = {}) {
         return { ...(this.d.herdrSession ? { HERDR_SESSION: this.d.herdrSession } : {}), ...extra };
@@ -67,35 +70,87 @@ export class HerdrBackend {
         }
         if (this.serverStarting)
             return this.serverStarting;
-        if (this.lastServerStartAt > 0 && Date.now() - this.lastServerStartAt < HERDR_SERVER_COOLDOWN_MS) {
+        const cooldownMs = this.opts.cooldownMs ?? HERDR_SERVER_COOLDOWN_MS;
+        if (this.lastServerStartAt > 0 && Date.now() - this.lastServerStartAt < cooldownMs) {
             throw new HostError("internal", "herdr server is not running");
         }
         this.lastServerStartAt = Date.now();
         const p = (async () => {
+            const spawnServer = this.opts.spawnServer ?? ((cmd, args, opts) => nodeSpawn(cmd, args, opts));
+            const pollIntervalMs = this.opts.pollIntervalMs ?? 250;
+            const pollAttempts = this.opts.pollAttempts ?? 20;
+            const sigkillGraceMs = this.opts.sigkillGraceMs ?? 1_000;
             // supervised background process: detached so it outlives a single request
-            const { spawn } = await import("node:child_process");
-            const child = spawn("herdr", ["server"], { stdio: "ignore", detached: true, windowsHide: true, env: { ...process.env, ...this.env() } });
-            child.on("error", () => {
-                this.lastServerStartAt = 0;
+            const child = spawnServer("herdr", ["server"], {
+                stdio: "ignore",
+                detached: true,
+                windowsHide: true,
+                env: { ...process.env, ...this.env() },
             });
-            child.on("exit", () => {
-                this.lastServerStartAt = 0;
-            });
+            let childDead = false;
+            let wakeOnDead = null;
+            let killTimer = null;
+            const markDead = () => {
+                childDead = true;
+                if (killTimer) {
+                    clearTimeout(killTimer);
+                    killTimer = null;
+                }
+                wakeOnDead?.();
+            };
+            child.on("error", markDead);
+            child.on("exit", markDead);
             child.unref();
-            for (let i = 0; i < 20; i++) {
-                await new Promise((r) => setTimeout(r, 250));
+            let checkedAfterDead = false;
+            for (let i = 0; i < pollAttempts; i++) {
+                if (childDead)
+                    break;
+                await new Promise((resolve) => {
+                    const timer = setTimeout(() => {
+                        wakeOnDead = null;
+                        resolve();
+                    }, pollIntervalMs);
+                    wakeOnDead = () => {
+                        clearTimeout(timer);
+                        wakeOnDead = null;
+                        resolve();
+                    };
+                });
+                const wasDead = childDead;
                 if ((await this.herdr(["status", "server"])).code === 0) {
                     this.lastServerStartAt = 0;
                     return;
                 }
+                if (wasDead || childDead) {
+                    checkedAfterDead = wasDead;
+                    break;
+                }
             }
-            this.lastServerStartAt = 0;
+            if (childDead) {
+                if (!checkedAfterDead && (await this.herdr(["status", "server"])).code === 0) {
+                    this.lastServerStartAt = 0;
+                    return;
+                }
+                throw new HostError("internal", "herdr server did not start");
+            }
             try {
-                child.kill();
+                child.kill("SIGTERM");
             }
             catch {
                 /* ignore */
             }
+            killTimer = setTimeout(() => {
+                killTimer = null;
+                if (!childDead) {
+                    try {
+                        child.kill("SIGKILL");
+                    }
+                    catch {
+                        /* ignore */
+                    }
+                }
+            }, sigkillGraceMs);
+            killTimer.unref?.();
             throw new HostError("internal", "herdr server did not start");
         })();
         this.serverStarting = p;

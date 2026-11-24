@@ -1,3 +1,7 @@
+// gentle-pi 4.1.0 extensions/ask-user-choice.ts
+//   params : { question, options:[{label,description,value}] (2..4), allowCustomResponse? }
+//   result : { value, label, index /* 1-based */ } | { customResponse } | undefined (cancelled)
+import { parseOptionIndex } from "../broker.js";
 export const gentleAskUserChoice = {
     tool: "ask_user_choice",
     extension: "gentle-pi",
@@ -27,9 +31,9 @@ export const gentleAskUserChoice = {
         if (any.cancelled)
             return undefined;
         if (Array.isArray(any.optionIds) && any.optionIds.length) {
-            const idx = Number(any.optionIds[0]);
-            const o = a.options[idx];
-            if (Number.isInteger(idx) && o)
+            const idx = parseOptionIndex(any.optionIds[0]);
+            const o = idx >= 0 ? a.options[idx] : undefined;
+            if (o)
                 return { value: o.value, label: o.label, index: idx + 1 };
             return undefined;
         }

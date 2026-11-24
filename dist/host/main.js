@@ -23,7 +23,8 @@ Usage: rp-host <command>
 
 Requires the PC to be paired first (/rp pair inside Pi). Config: host.json next to RP's config.json.`;
 const INBOX_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
-function cleanupExpiredInboxFiles(inboxDir, now = Date.now()) {
+export const INBOX_CLEANUP_INTERVAL_MS = 12 * 60 * 60 * 1000;
+export function cleanupExpiredInboxFiles(inboxDir, now = Date.now()) {
     let dirs;
     try {
         dirs = fs.readdirSync(inboxDir, { withFileTypes: true });
@@ -68,6 +69,12 @@ function cleanupExpiredInboxFiles(inboxDir, now = Date.now()) {
             }
         }
     }
+}
+export function scheduleInboxCleanup(inboxDir, intervalMs = INBOX_CLEANUP_INTERVAL_MS) {
+    cleanupExpiredInboxFiles(inboxDir);
+    const timer = setInterval(() => cleanupExpiredInboxFiles(inboxDir), intervalMs);
+    timer.unref?.();
+    return timer;
 }
 async function readStdinText(maxBytes = 2 * 1024 * 1024) {
     const chunks = [];
@@ -148,8 +155,10 @@ export async function main(argv) {
                 platform: process.platform,
             };
             const inspection = await inspectService(spec);
+            const { cfg: hostCfg } = loadHostConfig();
+            const hasMissingRoots = missingRoots(hostCfg);
             const healthy = inspection.installed && inspection.enabled !== false && inspection.running && !inspection.stale && inspection.nodePathValid && inspection.scriptPathValid &&
-                (inspection.platform !== "linux" || inspection.details?.linger === true) && !missingRoots(loadHostConfig().cfg);
+                (inspection.platform !== "linux" || inspection.details?.linger === true) && !hasMissingRoots;
             const status = healthy ? "OK" : "PROBLEM";
             if (argv.includes("--json")) {
                 console.log(JSON.stringify({ status, healthy, ...inspection }, null, 2));
@@ -165,8 +174,7 @@ export async function main(argv) {
                 console.log(`Stale: ${inspection.stale ? "yes" : "no"}`);
                 if (inspection.staleReason)
                     console.log(`Stale Reason: ${inspection.staleReason}`);
-                const roots = loadHostConfig().cfg.roots;
-                for (const root of roots)
+                for (const root of hostCfg.roots)
                     console.log(`Roots: ${root} (${fs.existsSync(root) ? "found" : "missing"})`);
                 if (inspection.platform === "linux") {
                     console.log(`Linger: ${inspection.details?.linger === true ? "enabled" : "disabled"}`);
@@ -192,7 +200,7 @@ export async function main(argv) {
                         problems.push("host script path is missing");
                     if (inspection.platform === "linux" && inspection.details?.linger !== true)
                         problems.push("systemd user lingering is disabled");
-                    if (missingRoots(loadHostConfig().cfg))
+                    if (hasMissingRoots)
                         problems.push(NO_ROOTS_HINT);
                     for (const problem of problems)
                         console.log(`Problem: ${problem}`);
@@ -222,7 +230,7 @@ export async function main(argv) {
                     /* ignore */
                 }
             }
-            cleanupExpiredInboxFiles(resolveInboxDir(cfg));
+            const inboxCleanupTimer = scheduleInboxCleanup(resolveInboxDir(cfg));
             let bridge;
             const manager = new HostManager(host, {
                 onLog: (m) => console.error(`[rp-host] ${m}`),
@@ -253,6 +261,7 @@ export async function main(argv) {
                 if (stopping)
                     return;
                 stopping = true;
+                clearInterval(inboxCleanupTimer);
                 bridge?.stop();
                 conn.stop();
                 // Allow a brief flush window for final close/agent.closed frames before exit.

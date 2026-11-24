@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { newId } from "../shared/protocol.js";
-import { splitCommand } from "../shared/util.js";
+import { atomicWriteFileSync, splitCommand } from "../shared/util.js";
 import { configDir } from "../shared/platform.js";
 import { HerdrBackend } from "./backends/herdr.js";
 import { TmuxBackend } from "./backends/tmux.js";
@@ -72,11 +72,7 @@ export class HostManager {
     }
     save() {
         try {
-            const dir = path.dirname(this.storeFile);
-            fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-            const tmpFile = `${this.storeFile}.${process.pid}.tmp`;
-            fs.writeFileSync(tmpFile, JSON.stringify([...this.records.values()], null, 2), { mode: 0o600 });
-            fs.renameSync(tmpFile, this.storeFile);
+            atomicWriteFileSync(this.storeFile, JSON.stringify([...this.records.values()], null, 2), 0o600);
         }
         catch {
             /* best effort */

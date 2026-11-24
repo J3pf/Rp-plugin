@@ -49,10 +49,6 @@ export class StatusTracker {
         this.detail = undefined;
         this.push();
     }
-    error() {
-        this.base = "error";
-        this.push();
-    }
     setCompacting(v) {
         this.compacting = v;
         this.push();

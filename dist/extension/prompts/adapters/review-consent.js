@@ -1,3 +1,4 @@
+import { parseOptionIndex } from "../broker.js";
 // Keep scraping independent of the user's terminal width; the component wraps at this width.
 export const REVIEW_CONSENT_RENDER_WIDTH = 80;
 const MAX_MESSAGE_CHARS = 32_000;
@@ -151,9 +152,12 @@ export const reviewConsent = {
     // Matches gentle-pi/lib/review-consent-ui.ts:84-87: answers must pass through the component's done callback.
     toResult(_args, answer) {
         const value = answer;
+        if (!value || typeof value !== "object")
+            return undefined;
         if ("cancelled" in value && value.cancelled)
             return undefined;
-        const index = "optionIds" in value ? Number(value.optionIds[0]) : -1;
+        const optionIds = "optionIds" in value ? value.optionIds : undefined;
+        const index = Array.isArray(optionIds) && optionIds.length > 0 ? parseOptionIndex(optionIds[0]) : -1;
         if (index === 0)
             return { kind: "provider", answer: "granted" };
         if (index === 1)

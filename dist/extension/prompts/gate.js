@@ -52,9 +52,24 @@ const INTERPRETER_CMDS = new Set([
     "env",
     "xargs",
     "find",
+    "eval",
+    "exec",
+    "command",
+    "source",
+    ".",
+    "timeout",
+    "nohup",
+    "nice",
+    "time",
+    "setsid",
+    "stdbuf",
+    "awk",
+    "ssh",
+    "docker",
 ]);
 const DESTRUCTIVE_VERBS = new Set(["rm", "rmdir", "mv", "chmod", "chown", "kill", "pkill", "dd", "mkfs"]);
 const VERSIONED_INTERPRETER_RE = /^python\d+(?:\.\d+)?$/;
+const ENV_ASSIGN_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 export function summarize(toolName, input) {
     if (SHELL_TOOLS.has(toolName) && typeof input?.command === "string")
         return input.command;
@@ -72,15 +87,18 @@ export function summarize(toolName, input) {
     return truncateBytes(s, 300).text;
 }
 /** Session allow key: tool name, or "bash:<first token>" for shells so one approved `ls` never allows `rm`.
- * When a command contains chaining, redirection, or substitution operators (;, &&, ||, |, <, >, `, $, \n), the whole command is keyed.
+ * When a command contains chaining, redirection, substitution, quotes, backslashes, CR/LF, or leading env assignments, the whole command is keyed.
  */
 export function allowKey(toolName, input) {
     if (SHELL_TOOLS.has(toolName) && typeof input?.command === "string") {
         const cmd = input.command.trim();
-        if (/([;&|<>`$]|\n)/.test(cmd)) {
+        if (/([;&|<>`$'"\\]|\r|\n)/.test(cmd)) {
             return `${toolName}:${cmd}`;
         }
         const first = cmd.split(/\s+/)[0] ?? "";
+        if (ENV_ASSIGN_PREFIX_RE.test(first)) {
+            return `${toolName}:${cmd}`;
+        }
         const base = path.posix.basename(first.replace(/\\/g, "/")).replace(/\.exe$/i, "").toLowerCase();
         if (DESTRUCTIVE_VERBS.has(base)) {
             return `${toolName}:${cmd}`;

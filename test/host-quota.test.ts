@@ -1,3 +1,5 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { mapPiquotaJsonToMachineQuotas, piquotaScriptCandidates, QuotaCollector } from "../src/host/quota.ts";
 import type { Runner } from "../src/host/runner.ts";
@@ -150,6 +152,39 @@ describe("mapPiquotaJsonToMachineQuotas", () => {
     expect(quotas[0]!.windows[2]!.remainingPercent).toBe(100);
     expect(quotas[0]!.windows[2]!.usedPercent).toBe(0);
   });
+
+  it("clamps negative and >100 percentages, parses numeric strings, propagates notConfigured, and applies label/updatedAt fallbacks", () => {
+    const raw = {
+      generatedAt: "2026-11-24T12:00:00.000Z",
+      providers: [
+        {
+          family: "codex",
+          notConfigured: true,
+          windows: [
+            { id: "", usedPercent: 10 }, // invalid id skipped
+            null,
+            { id: "neg-used", usedPercent: -15, remainingPercent: 140 },
+            { id: "over-used", usedPercent: 150, remainingPercent: -20 },
+            { id: "str-used-only", usedPercent: "42.5" },
+            { id: "str-rem-only", remainingPercent: "30" },
+          ],
+        },
+      ],
+    };
+
+    const quotas = mapPiquotaJsonToMachineQuotas(raw);
+    expect(quotas).toHaveLength(1);
+    const codex = quotas[0]!;
+    expect(codex.label).toBe("codex");
+    expect(codex.ok).toBe(true);
+    expect(codex.notConfigured).toBe(true);
+    expect(codex.updatedAt).toBe("2026-11-24T12:00:00.000Z");
+    expect(codex.windows).toHaveLength(4);
+    expect(codex.windows[0]).toMatchObject({ id: "neg-used", usedPercent: 0, remainingPercent: 100 });
+    expect(codex.windows[1]).toMatchObject({ id: "over-used", usedPercent: 100, remainingPercent: 0 });
+    expect(codex.windows[2]).toMatchObject({ id: "str-used-only", usedPercent: 42.5, remainingPercent: 57.5 });
+    expect(codex.windows[3]).toMatchObject({ id: "str-rem-only", usedPercent: 70, remainingPercent: 30 });
+  });
 });
 
 describe("QuotaCollector", () => {
@@ -211,19 +246,50 @@ describe("QuotaCollector", () => {
     expect(collector.getLastQuotas()).toEqual(first);
   });
 
-  it("handles malformed stdout gracefully", async () => {
-    const { runner } = fakeRunner({ code: 0, stdout: "error: unable to connect to daemon" });
+  it("handles malformed stdout gracefully and retains previous lastQuotas on invalid JSON refresh", async () => {
+    let callCount = 0;
+    const runner: Runner = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return { code: 0, stdout: JSON.stringify(SAMPLE_PIQUOTA_OUTPUT), stderr: "" };
+      }
+      return { code: 0, stdout: "error: unable to connect to daemon", stderr: "" };
+    };
     const logs: string[] = [];
     const collector = new QuotaCollector({ runner, onLog: (m: string) => logs.push(m) });
 
-    const quotas = await collector.collect();
-    expect(quotas).toBeNull();
+    const first = await collector.collect();
+    expect(first).toHaveLength(2);
+    const second = await collector.collect();
+    expect(second).toEqual(first);
+    expect(collector.getLastQuotas()).toEqual(first);
     expect(logs.some((l) => l.includes("invalid JSON"))).toBe(true);
+  });
+
+  it("retains lastQuotas when runner throws or quota command is empty", async () => {
+    let shouldThrow = false;
+    const runner: Runner = async () => {
+      if (shouldThrow) throw new Error("spawn EAGAIN");
+      return { code: 0, stdout: JSON.stringify(SAMPLE_PIQUOTA_OUTPUT), stderr: "" };
+    };
+    const logs: string[] = [];
+    const collector = new QuotaCollector({ runner, onLog: (m: string) => logs.push(m) });
+    const first = await collector.collect();
+    expect(first).toHaveLength(2);
+
+    shouldThrow = true;
+    expect(await collector.collect()).toEqual(first);
+    expect(logs.some((l) => l.includes("spawn EAGAIN"))).toBe(true);
+
+    const emptyLogs: string[] = [];
+    const emptyCollector = new QuotaCollector({ runner, command: "   ", onLog: (m) => emptyLogs.push(m) });
+    expect(await emptyCollector.collect()).toBeNull();
+    expect(emptyLogs.some((l) => l.includes("empty quota command"))).toBe(true);
   });
 });
 
 describe("piquota not on PATH (service environment)", () => {
-  const script = new URL(import.meta.url).pathname; // any existing file
+  const script = fileURLToPath(import.meta.url); // any existing file (cross-platform)
   const miss: Awaited<ReturnType<Runner>> = { code: -1, stdout: "", stderr: "spawn piquota ENOENT" };
 
   it("falls back to the Pi-installed script run with the host's node", async () => {
@@ -255,8 +321,8 @@ describe("piquota not on PATH (service environment)", () => {
 
   it("looks in the pi and gentle-shell agent dirs", () => {
     const got = piquotaScriptCandidates({ PI_CODING_AGENT_DIR: "/a" }, "/h");
-    expect(got[0]).toBe("/a/npm/node_modules/@j3pf/piquota/bin/piquota.js");
-    expect(got).toContain("/h/.pi/agent/npm/node_modules/@j3pf/piquota/bin/piquota.js");
-    expect(got).toContain("/h/.gentle-shell/agent/npm/node_modules/@j3pf/piquota/bin/piquota.js");
+    expect(got[0]).toBe(path.join("/a", "npm", "node_modules", "@j3pf", "piquota", "bin", "piquota.js"));
+    expect(got).toContain(path.join("/h", ".pi", "agent", "npm", "node_modules", "@j3pf", "piquota", "bin", "piquota.js"));
+    expect(got).toContain(path.join("/h", ".gentle-shell", "agent", "npm", "node_modules", "@j3pf", "piquota", "bin", "piquota.js"));
   });
 });

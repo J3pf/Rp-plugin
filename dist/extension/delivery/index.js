@@ -37,6 +37,7 @@ export function methodChain(requested, cfgMethod, opts) {
     chain.push("api");
     return chain;
 }
+const ACTIVE_SELECT_WAIT_TIMEOUT_MS = 60_000;
 export class Deliverer {
     d;
     seen = new LruSet(500);
@@ -52,7 +53,7 @@ export class Deliverer {
             .then(() => this.process(msg, (task) => {
             bg = task;
             this.activeSelectPromises.add(task);
-            void task.finally(() => this.activeSelectPromises.delete(task));
+            void task.finally(() => this.activeSelectPromises.delete(task)).catch(() => { });
         }))
             .catch(() => { });
         this.tail = step;
@@ -175,7 +176,17 @@ export class Deliverer {
                 }
                 if (method === "interactive") {
                     if (this.activeSelectPromises.size > 0) {
-                        await Promise.allSettled([...this.activeSelectPromises]);
+                        let timer;
+                        await Promise.race([
+                            Promise.allSettled([...this.activeSelectPromises]),
+                            new Promise((resolve) => {
+                                timer = setTimeout(resolve, ACTIVE_SELECT_WAIT_TIMEOUT_MS);
+                                timer.unref?.();
+                            }),
+                        ]).finally(() => {
+                            if (timer)
+                                clearTimeout(timer);
+                        });
                     }
                     const r = await deliverInteractive(this.d.interactive(), text, msg.delivery ?? "auto");
                     if (r.ok) {

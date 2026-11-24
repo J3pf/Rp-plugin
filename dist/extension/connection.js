@@ -3,6 +3,26 @@ import WebSocket from "ws";
 import { CLOSE, CRITICAL_TYPES, MAX_FRAME_BYTES, envelope, newId, parseEnvelope } from "../shared/protocol.js";
 import { backoffDelay, errMsg } from "../shared/util.js";
 import { WsKeepalive, getProxyAgent, httpRequest, toHttpUrl, toWsUrl } from "../shared/http.js";
+const MAX_LONGPOLL_OUTBOX_MESSAGES = 500;
+const MAX_LONGPOLL_OUTBOX_BYTES = 2 * 1024 * 1024;
+const MAX_LONGPOLL_BATCH_MESSAGES = 50;
+const MAX_LONGPOLL_BATCH_BYTES = 750 * 1024;
+const LONGPOLL_TIMEOUT_MS = 25_000;
+const DEFAULT_STABILITY_WINDOW_MS = 5_000;
+function sleepUnref(ms, signal) {
+    return new Promise((resolve) => {
+        if (signal?.aborted)
+            return resolve();
+        const t = setTimeout(done, ms);
+        t.unref?.();
+        function done() {
+            clearTimeout(t);
+            signal?.removeEventListener("abort", done);
+            resolve();
+        }
+        signal?.addEventListener("abort", done, { once: true });
+    });
+}
 export class WsTransport {
     url;
     token;
@@ -45,6 +65,15 @@ export class WsTransport {
         }
         this.ws = ws;
         ws.on("open", () => {
+            if (this.closed || this.ws !== ws) {
+                try {
+                    ws.terminate();
+                }
+                catch {
+                    /* ignore */
+                }
+                return;
+            }
             this.opened = true;
             // RP must never keep Pi alive: an open socket alone does not hold the event loop
             ws._socket?.unref?.();
@@ -93,7 +122,10 @@ export class WsTransport {
         if (this.ws.bufferedAmount > 1_000_000 && !CRITICAL_TYPES.has(env.t))
             return false;
         try {
-            this.ws.send(JSON.stringify(env));
+            const payload = JSON.stringify(env);
+            if (Buffer.byteLength(payload, "utf8") > MAX_FRAME_BYTES)
+                return false;
+            this.ws.send(payload);
             return true;
         }
         catch {
@@ -118,18 +150,21 @@ export class LongPollTransport {
     token;
     ids;
     h;
+    onLog;
     name = "longpoll";
     closed = false;
     outbox = [];
+    outboxBytes = 0;
     inFlight = [];
     flushing = false;
     flushScheduled = false;
     ac = new AbortController();
-    constructor(base, token, ids, h) {
+    constructor(base, token, ids, h, onLog) {
         this.base = base;
         this.token = token;
         this.ids = ids;
         this.h = h;
+        this.onLog = onLog;
     }
     headers() {
         return {
@@ -150,7 +185,8 @@ export class LongPollTransport {
         });
     }
     drainUnsent() {
-        return [...this.inFlight.splice(0), ...this.outbox.splice(0)];
+        this.outboxBytes = 0;
+        return [...this.inFlight.splice(0), ...this.outbox.splice(0)].map((item) => item.env);
     }
     isSending() {
         return this.flushing;
@@ -167,25 +203,38 @@ export class LongPollTransport {
             code = CLOSE.INCOMPATIBLE;
         else if (res?.status === 409)
             code = CLOSE.REPLACED;
+        else if (res?.status === 410) {
+            code = typeof res.json?.closeCode === "number" ? res.json.closeCode : CLOSE.REPLACED;
+        }
         const unsent = this.drainUnsent();
-        this.h.onClose({ code, reason: res ? `http ${res.status}` : errMsg(err), opened: true, unsent });
+        const reason = err ? errMsg(err) : res ? `http ${res.status}` : "unknown error";
+        this.h.onClose({ code, reason, opened: true, unsent });
         return true;
     }
     async pollLoop() {
+        let fastEmptyPolls = 0;
         while (!this.closed) {
+            const t0 = Date.now();
             try {
-                const q = `?agentId=${encodeURIComponent(this.ids.agentId)}&instance=${encodeURIComponent(this.ids.instance)}&wait=25`;
-                const res = await httpRequest(this.base + "/v1/agent/poll" + q, {
+                const res = await httpRequest(this.base + "/v1/agent/poll", {
                     method: "POST",
                     headers: this.headers(),
-                    body: "{}",
+                    body: {
+                        agentId: this.ids.agentId,
+                        instance: this.ids.instance,
+                        timeout: LONGPOLL_TIMEOUT_MS,
+                    },
                     timeoutMs: 35_000,
                     signal: this.ac.signal,
                 });
                 if (this.closed)
                     return;
-                if (res.status >= 400) {
+                if (res.status < 200 || res.status >= 300) {
                     this.fail(res);
+                    return;
+                }
+                if (res.body.length > 0 && res.json === undefined) {
+                    this.fail(res, new Error("non-JSON response on long-poll"));
                     return;
                 }
                 const list = Array.isArray(res.json) ? res.json : Array.isArray(res.json?.messages) ? res.json.messages : [];
@@ -193,6 +242,14 @@ export class LongPollTransport {
                     const env = parseEnvelope(m);
                     if (env)
                         this.h.onMessage(env);
+                }
+                if (list.length === 0 && Date.now() - t0 < 500) {
+                    fastEmptyPolls++;
+                    const waitMs = Math.min(5_000, 100 * 2 ** Math.min(fastEmptyPolls - 1, 6));
+                    await sleepUnref(waitMs, this.ac.signal);
+                }
+                else {
+                    fastEmptyPolls = 0;
                 }
             }
             catch (e) {
@@ -204,7 +261,14 @@ export class LongPollTransport {
     send(env) {
         if (this.closed)
             return false;
-        this.outbox.push(env);
+        const bytes = Buffer.byteLength(JSON.stringify(env), "utf8");
+        if (bytes > MAX_FRAME_BYTES)
+            return false;
+        if (this.outbox.length >= MAX_LONGPOLL_OUTBOX_MESSAGES || this.outboxBytes + bytes > MAX_LONGPOLL_OUTBOX_BYTES) {
+            return false;
+        }
+        this.outbox.push({ env, bytes });
+        this.outboxBytes += bytes;
         if (!this.flushScheduled && !this.flushing) {
             this.flushScheduled = true;
             setImmediate(() => {
@@ -220,28 +284,53 @@ export class LongPollTransport {
         this.flushing = true;
         try {
             while (this.outbox.length && !this.closed) {
-                const batch = this.outbox.splice(0, 50);
+                const batch = [];
+                let batchBytes = 2; // []
+                while (this.outbox.length && batch.length < MAX_LONGPOLL_BATCH_MESSAGES) {
+                    const next = this.outbox[0];
+                    const extra = next.bytes + (batch.length > 0 ? 1 : 0);
+                    if (batch.length > 0 && batchBytes + extra > MAX_LONGPOLL_BATCH_BYTES)
+                        break;
+                    this.outbox.shift();
+                    this.outboxBytes = Math.max(0, this.outboxBytes - next.bytes);
+                    batch.push(next);
+                    batchBytes += extra;
+                }
                 this.inFlight = [...batch];
                 try {
                     const res = await httpRequest(this.base + "/v1/agent/send", {
                         method: "POST",
                         headers: this.headers(),
-                        body: batch,
+                        body: batch.map((item) => item.env),
                         timeoutMs: 20_000,
                         signal: this.ac.signal,
                     });
-                    if (res.status >= 400) {
+                    if (res.status < 200 || res.status >= 300) {
                         if (!this.closed) {
-                            this.outbox.unshift(...this.inFlight.splice(0));
+                            const restored = this.inFlight.splice(0);
+                            for (const item of restored)
+                                this.outboxBytes += item.bytes;
+                            this.outbox.unshift(...restored);
                             this.fail(res);
                         }
+                        return;
+                    }
+                    if (typeof res.json?.rejected === "number" && res.json.rejected > 0) {
+                        this.inFlight = [];
+                        const msg = `long-poll send rejected ${res.json.rejected} message(s)`;
+                        this.onLog?.(msg);
+                        if (!this.closed)
+                            this.fail(null, new Error(msg));
                         return;
                     }
                     this.inFlight = [];
                 }
                 catch (e) {
                     if (!this.closed) {
-                        this.outbox.unshift(...this.inFlight.splice(0));
+                        const restored = this.inFlight.splice(0);
+                        for (const item of restored)
+                            this.outboxBytes += item.bytes;
+                        this.outbox.unshift(...restored);
                         this.fail(null, e);
                     }
                     return;
@@ -269,9 +358,11 @@ export class Connection {
     stopped = false;
     attempt = 0;
     wsFailures = 0;
+    consecutiveServiceRestarts = 0;
     forceLongPoll = false;
     wsRetryTimer = null;
     reconnectTimer = null;
+    stabilityTimer = null;
     probingWs = false;
     connectedWaiters = [];
     queue = [];
@@ -302,6 +393,7 @@ export class Connection {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        this.clearStabilityTimer();
         const prev = this.t;
         this.t = null;
         this.welcomed = false;
@@ -334,11 +426,20 @@ export class Connection {
             clearTimeout(this.reconnectTimer);
         if (this.wsRetryTimer)
             clearTimeout(this.wsRetryTimer);
+        this.clearStabilityTimer();
         this.reconnectTimer = this.wsRetryTimer = null;
+        this.queue = [];
+        this.queueBytes = 0;
         this.t?.close();
         this.t = null;
         for (const w of this.connectedWaiters.splice(0))
             w(false);
+    }
+    clearStabilityTimer() {
+        if (this.stabilityTimer) {
+            clearTimeout(this.stabilityTimer);
+            this.stabilityTimer = null;
+        }
     }
     log(m) {
         this.o.onLog?.(m);
@@ -352,7 +453,7 @@ export class Connection {
             return this.o.transportFactory(name, h);
         if (name === "ws")
             return new WsTransport(toWsUrl(this.o.relayUrl, "/ws/agent"), this.o.token, h);
-        return new LongPollTransport(toHttpUrl(this.o.relayUrl, ""), this.o.token, { agentId: this.o.agentId, instance: this.o.instance }, h);
+        return new LongPollTransport(toHttpUrl(this.o.relayUrl, ""), this.o.token, { agentId: this.o.agentId, instance: this.o.instance }, h, (m) => this.log(m));
     }
     open() {
         if (this.stopped)
@@ -393,9 +494,25 @@ export class Connection {
     handle(env) {
         if (env.t === "agent.welcome") {
             this.welcomed = true;
-            this.attempt = 0;
-            this.wsFailures = 0;
             this.probingWs = false;
+            this.clearStabilityTimer();
+            const stabilityMs = this.o.stabilityWindowMs ?? DEFAULT_STABILITY_WINDOW_MS;
+            if (stabilityMs <= 0) {
+                this.attempt = 0;
+                this.wsFailures = 0;
+                this.consecutiveServiceRestarts = 0;
+            }
+            else {
+                this.stabilityTimer = setTimeout(() => {
+                    this.stabilityTimer = null;
+                    if (!this.stopped && this.welcomed) {
+                        this.attempt = 0;
+                        this.wsFailures = 0;
+                        this.consecutiveServiceRestarts = 0;
+                    }
+                }, stabilityMs);
+                this.stabilityTimer.unref?.();
+            }
             this.setState("connected");
             if (this.transportName === "longpoll")
                 this.scheduleWsRetry();
@@ -415,6 +532,7 @@ export class Connection {
         }
     }
     onTransportClosed(info, probe, wasWelcomed = false) {
+        this.clearStabilityTimer();
         // keep critical messages that never made it out (in original FIFO order)
         this.rescueUnsent(info.unsent);
         if (this.stopped)
@@ -422,6 +540,15 @@ export class Connection {
         const { code } = info;
         if (code === CLOSE.INVALID_TOKEN || code === CLOSE.INCOMPATIBLE || code === CLOSE.REPLACED) {
             this.stopped = true;
+            if (this.reconnectTimer)
+                clearTimeout(this.reconnectTimer);
+            if (this.wsRetryTimer)
+                clearTimeout(this.wsRetryTimer);
+            this.reconnectTimer = this.wsRetryTimer = null;
+            this.queue = [];
+            this.queueBytes = 0;
+            for (const w of this.connectedWaiters.splice(0))
+                w(false);
             this.setState("stopped", `${code} ${info.reason}`);
             this.o.onFatal?.(code, info.reason);
             return;
@@ -448,10 +575,24 @@ export class Connection {
             this.probingWs = false;
         }
         this.setState("connecting", "reconnecting");
-        const delay = code === CLOSE.SERVICE_RESTART ? 0 : (this.o.backoff ?? backoffDelay)(this.attempt++);
+        let delay;
+        if (code === CLOSE.SERVICE_RESTART) {
+            this.consecutiveServiceRestarts++;
+            if (this.consecutiveServiceRestarts === 1) {
+                delay = 250 + Math.floor(Math.random() * 1251);
+            }
+            else {
+                delay = (this.o.backoff ?? backoffDelay)(this.attempt++);
+            }
+        }
+        else {
+            this.consecutiveServiceRestarts = 0;
+            delay = (this.o.backoff ?? backoffDelay)(this.attempt++);
+        }
         if (this.reconnectTimer)
             clearTimeout(this.reconnectTimer);
         this.reconnectTimer = setTimeout(() => this.open(), delay);
+        this.reconnectTimer.unref?.();
     }
     /** While on long-poll, retry WebSocket periodically (default 15s instead of 10 min). */
     scheduleWsRetry(delayMs = this.o.wsRetryMs ?? 15_000) {
@@ -507,6 +648,13 @@ export class Connection {
     /** Send now if connected, otherwise queue (bounded). */
     send(t, d, opts = {}) {
         const env = envelope(t, d, opts);
+        const bytes = Buffer.byteLength(JSON.stringify(env), "utf8");
+        if (bytes > MAX_FRAME_BYTES) {
+            this.log(`dropping oversized frame ${t} (${bytes} bytes > MAX_FRAME_BYTES ${MAX_FRAME_BYTES})`);
+            if (t === "agent.event")
+                this.needsSnapshot = true;
+            return;
+        }
         const critical = CRITICAL_TYPES.has(t);
         if (this.connected && this.t?.send(env))
             return;
@@ -516,7 +664,15 @@ export class Connection {
     sendDirect(t, d) {
         if (!this.t)
             return false;
-        return this.t.send(envelope(t, d));
+        const env = envelope(t, d);
+        const bytes = Buffer.byteLength(JSON.stringify(env), "utf8");
+        if (bytes > MAX_FRAME_BYTES) {
+            this.log(`dropping oversized direct frame ${t} (${bytes} bytes > MAX_FRAME_BYTES ${MAX_FRAME_BYTES})`);
+            if (t === "agent.event")
+                this.needsSnapshot = true;
+            return false;
+        }
+        return this.t.send(env);
     }
     enqueue(env, critical, front) {
         const bytes = Buffer.byteLength(JSON.stringify(env));

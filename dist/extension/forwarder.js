@@ -21,8 +21,59 @@ export const LIMITS = {
     updateIntervalMs: 500,
     updateMaxBytes: 8 * 1024,
     resultMaxBytes: 32 * 1024,
+    thinkingMaxBytes: 16 * 1024,
+    toolArgsMaxBytes: 16 * 1024,
+    summaryMaxBytes: 16 * 1024,
 };
-/** Replace inline image data with a reference; keep everything else as Pi produced it. */
+/** Bound an arbitrary JSON-serializable value to at most `maxBytes` UTF-8 bytes when serialized. */
+export function truncateJsonValue(value, maxBytes) {
+    if (value === undefined || value === null || typeof value === "boolean" || typeof value === "number") {
+        return { value, truncated: false };
+    }
+    if (typeof value === "string") {
+        const t = truncateBytes(value, maxBytes);
+        return { value: t.text, truncated: t.truncated };
+    }
+    let serialized;
+    try {
+        serialized = JSON.stringify(value);
+    }
+    catch {
+        serialized = String(value);
+    }
+    if (Buffer.byteLength(serialized, "utf8") <= maxBytes) {
+        return { value, truncated: false };
+    }
+    if (typeof value === "object" && !Array.isArray(value)) {
+        const src = value;
+        const keys = Object.keys(src);
+        const perField = Math.max(256, Math.floor((maxBytes - 256) / Math.max(1, keys.length)));
+        const copy = {};
+        for (const k of keys) {
+            const v = src[k];
+            if (typeof v === "string" && Buffer.byteLength(v, "utf8") > perField) {
+                copy[k] = truncateBytes(v, perField).text;
+            }
+            else {
+                copy[k] = v;
+            }
+        }
+        try {
+            if (Buffer.byteLength(JSON.stringify(copy), "utf8") <= maxBytes) {
+                return { value: copy, truncated: true };
+            }
+        }
+        catch {
+            /* fall through to preview */
+        }
+    }
+    const previewBudget = Math.max(64, maxBytes - 64);
+    return {
+        value: { _truncated: true, preview: truncateBytes(serialized, previewBudget).text },
+        truncated: true,
+    };
+}
+/** Replace inline image data with a reference; bound text, thinking, and tool call payloads. */
 export function normalizeContentBlock(block, maxTextBytes) {
     if (!block || typeof block !== "object")
         return block;
@@ -34,18 +85,86 @@ export function normalizeContentBlock(block, maxTextBytes) {
         const { text, truncated } = truncateBytes(block.text, maxTextBytes);
         return truncated ? { ...block, text, truncated: true } : block;
     }
+    if (block.type === "thinking") {
+        const budget = Math.min(maxTextBytes, LIMITS.thinkingMaxBytes);
+        let out = block;
+        let truncated = false;
+        if (typeof block.thinking === "string") {
+            const t = truncateBytes(block.thinking, budget);
+            if (t.truncated) {
+                out = { ...out, thinking: t.text, truncated: true };
+                truncated = true;
+            }
+        }
+        if (typeof block.text === "string") {
+            const t = truncateBytes(block.text, budget);
+            if (t.truncated) {
+                out = { ...out, text: t.text, truncated: true };
+                truncated = true;
+            }
+        }
+        return truncated ? out : block;
+    }
+    if (block.type === "toolCall" || block.type === "tool_use") {
+        const budget = Math.min(maxTextBytes, LIMITS.toolArgsMaxBytes);
+        let out = block;
+        let truncated = false;
+        for (const field of ["arguments", "args", "input"]) {
+            if (block[field] !== undefined) {
+                const res = truncateJsonValue(block[field], budget);
+                if (res.truncated) {
+                    out = { ...out, [field]: res.value, truncated: true };
+                    truncated = true;
+                }
+            }
+        }
+        return truncated ? out : block;
+    }
     return block;
 }
 export function normalizeMessage(msg, maxTextBytes = LIMITS.resultMaxBytes) {
     if (!msg || typeof msg !== "object")
         return msg;
-    if (Array.isArray(msg.content))
-        return { ...msg, content: msg.content.map((b) => normalizeContentBlock(b, maxTextBytes)) };
-    if (typeof msg.content === "string") {
-        const { text, truncated } = truncateBytes(msg.content, maxTextBytes);
-        return truncated ? { ...msg, content: text, truncated: true } : msg;
+    let out = msg;
+    let changed = false;
+    const clone = () => {
+        if (!changed) {
+            out = { ...msg };
+            changed = true;
+        }
+        return out;
+    };
+    if (Array.isArray(msg.content)) {
+        const next = msg.content.map((b) => normalizeContentBlock(b, maxTextBytes));
+        clone().content = next;
     }
-    return msg;
+    else if (typeof msg.content === "string") {
+        const { text, truncated } = truncateBytes(msg.content, maxTextBytes);
+        if (truncated) {
+            const c = clone();
+            c.content = text;
+            c.truncated = true;
+        }
+    }
+    for (const field of ["summary", "output", "command"]) {
+        if (typeof msg[field] === "string") {
+            const { text, truncated } = truncateBytes(msg[field], maxTextBytes);
+            if (truncated) {
+                const c = clone();
+                c[field] = text;
+                c.truncated = true;
+            }
+        }
+    }
+    if (msg.details !== undefined) {
+        const d = truncateJsonValue(msg.details, maxTextBytes);
+        if (d.truncated) {
+            const c = clone();
+            c.details = d.value;
+            c.truncated = true;
+        }
+    }
+    return out;
 }
 export function normalizeToolResult(result, maxBytes) {
     if (!result || typeof result !== "object") {
@@ -64,6 +183,13 @@ export function normalizeToolResult(result, maxBytes) {
                 truncated = true;
             return n;
         });
+    }
+    if (out.details !== undefined) {
+        const d = truncateJsonValue(out.details, maxBytes);
+        if (d.truncated) {
+            out.details = d.value;
+            truncated = true;
+        }
     }
     if (truncated)
         out.truncated = true;
@@ -115,15 +241,17 @@ export class Forwarder {
                     return;
                 this.flushDeltas();
                 return this.d.send({ type: "message_end", message: normalizeMessage(ev?.message) });
-            case "tool_execution_start":
+            case "tool_execution_start": {
                 this.d.onToolStart?.(ev?.toolName, ev?.args, ev?.toolCallId, ev?.parentToolCallId);
+                const boundedArgs = this.d.redact ? undefined : truncateJsonValue(ev?.args, LIMITS.toolArgsMaxBytes).value;
                 return this.d.send({
                     type: "tool_execution_start",
                     toolCallId: ev?.toolCallId,
                     toolName: ev?.toolName,
-                    ...(this.d.redact ? {} : { args: ev?.args }),
+                    ...(this.d.redact ? {} : { args: boundedArgs }),
                     ...(ev?.parentToolCallId ? { parentToolCallId: ev.parentToolCallId } : {}),
                 });
+            }
             case "tool_execution_update":
                 if (this.d.redact)
                     return;
@@ -141,12 +269,15 @@ export class Forwarder {
                 });
             case "thinking_level_select":
                 return this.d.send({ type: "thinking_level_select", level: ev?.level, previousLevel: ev?.previousLevel });
-            case "session_compact":
+            case "session_compact": {
+                const rawSummary = ev?.compactionEntry?.summary;
+                const summary = typeof rawSummary === "string" ? truncateBytes(rawSummary, LIMITS.summaryMaxBytes).text : rawSummary;
                 return this.d.send({
                     type: "session_compact",
                     reason: ev?.reason,
-                    ...(this.d.redact ? {} : { summary: ev?.compactionEntry?.summary }),
+                    ...(this.d.redact ? {} : { summary }),
                 });
+            }
         }
     }
     onMessageUpdate(ev) {
@@ -174,8 +305,20 @@ export class Forwarder {
             return;
         const items = [...this.deltas.values()];
         this.deltas.clear();
-        for (const it of items)
-            this.d.send({ type: "message_delta", contentIndex: it.contentIndex, kind: it.kind, delta: it.delta });
+        for (const it of items) {
+            let rem = it.delta;
+            if (Buffer.byteLength(rem, "utf8") <= LIMITS.resultMaxBytes) {
+                this.d.send({ type: "message_delta", contentIndex: it.contentIndex, kind: it.kind, delta: rem });
+                continue;
+            }
+            while (rem.length > 0) {
+                const chunk = truncateBytes(rem, LIMITS.resultMaxBytes).text;
+                if (!chunk)
+                    break;
+                this.d.send({ type: "message_delta", contentIndex: it.contentIndex, kind: it.kind, delta: chunk });
+                rem = rem.slice(chunk.length);
+            }
+        }
     }
     emitUpdate(ev) {
         const { result, truncated } = normalizeToolResult(ev.partialResult, LIMITS.updateMaxBytes);

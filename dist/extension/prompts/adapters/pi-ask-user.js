@@ -1,3 +1,4 @@
+import { parseOptionIndex } from "../broker.js";
 export const piAskUser = {
     tool: "ask_user",
     extension: "@eko24ive/pi-ask",
@@ -55,13 +56,16 @@ export const piAskUser = {
         }
         const answers = {};
         for (const item of any.answers) {
+            if (!item || typeof item !== "object" || typeof item.questionIndex !== "number" || !Number.isInteger(item.questionIndex))
+                continue;
             const q = a.questions[item.questionIndex];
             if (!q)
                 continue;
-            const picked = (item.optionIds ?? [])
+            const rawIds = Array.isArray(item.optionIds) ? item.optionIds : [];
+            const picked = rawIds
                 .map((id) => {
-                const idx = Number(id);
-                return Number.isInteger(idx) && q.options[idx] ? { opt: q.options[idx], idx } : null;
+                const idx = parseOptionIndex(id);
+                return idx >= 0 && q.options[idx] ? { opt: q.options[idx], idx } : null;
             })
                 .filter((p) => p !== null);
             const text = typeof item.text === "string" && item.text.trim() ? item.text.trim() : undefined;

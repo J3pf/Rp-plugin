@@ -1,5 +1,7 @@
 import path from "node:path";
+import type { GentleMode } from "../shared/protocol.ts";
 
+export type { GentleMode };
 export type Launcher = "pi" | "gentle-shell";
 
 export interface HerdrLocation {
@@ -40,13 +42,11 @@ export function detectStaticEnv(env: NodeJS.ProcessEnv = process.env, platform: 
   };
 }
 
-export type GentleModeName = "normal" | "auto" | "yolo" | "unknown";
-
 /** Parse the footer status gentle-pi publishes: "Permissions: AUTO|NORMAL|YOLO" (COMPATIBILIDAD P5). */
-export function parseGentleMode(text: string | undefined): GentleModeName {
+export function parseGentleMode(text: string | undefined): GentleMode {
   if (!text) return "unknown";
   const m = /permissions:\s*(auto|normal|yolo)/i.exec(text);
-  return m ? (m[1]!.toLowerCase() as GentleModeName) : "unknown";
+  return m ? (m[1]!.toLowerCase() as GentleMode) : "unknown";
 }
 
 export const GENTLE_ASK_TOOLS = ["ask_user_choice", "ask_user_question"] as const;

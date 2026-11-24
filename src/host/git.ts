@@ -1,34 +1,12 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { MAX_FRAME_BYTES } from "../shared/protocol.ts";
+import { MAX_FRAME_BYTES, type GitDiffFile, type GitDiffResult, type GitDiscardResult } from "../shared/protocol.ts";
 import { truncateBytes } from "../shared/util.ts";
 import type { HostConfig } from "./config.ts";
 import { HostError, isInside, resolveWithinRoots } from "./validate.ts";
 
-export interface GitDiffFile {
-  path: string;
-  status: "modified" | "added" | "deleted" | "untracked" | "renamed";
-  additions: number;
-  deletions: number;
-  binary: boolean;
-  patch: string;
-  truncated: boolean;
-}
-
-export interface GitDiffResult {
-  cwd: string;
-  branch: string | null;
-  files: GitDiffFile[];
-  totalAdditions: number;
-  totalDeletions: number;
-}
-
-export interface GitDiscardResult {
-  cwd: string;
-  path: string;
-  ok: boolean;
-}
+export type { GitDiffFile, GitDiffResult, GitDiscardResult };
 
 const MAX_DIFF_FILES = 100;
 const MAX_FILE_PATCH_BYTES = 64 * 1024;

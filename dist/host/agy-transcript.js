@@ -6,16 +6,17 @@ import { fileURLToPath } from "node:url";
 import { SNAPSHOT_LIMIT } from "../extension/snapshot.js";
 import { LIMITS } from "../extension/forwarder.js";
 import { SAFE_CONV_ID_RE, truncateBytes } from "../shared/util.js";
-import { readAgySessionModel } from "./bridge/external-metadata.js";
+import { MODEL_CHANGE_RE, readAgySessionModel } from "./bridge/external-metadata.js";
 import { isInside } from "./validate.js";
 const MAX_SUBAGENTS = 100;
 const MAX_SUBAGENT_TOOLS = 100;
 const MAX_SUBAGENT_THINKING_BYTES = 1024;
 const MAX_SUBAGENT_RESULT_BYTES = 4096;
+const MAX_BG_TASKS = 50;
 const MAX_BG_TASK_LOG_BYTES = 8192;
 const MAX_POLL_DELTA_BYTES = 2 * 1024 * 1024;
 const MAX_REMAINDER_BYTES = 1024 * 1024;
-const MODEL_CHANGE_RE = /changed setting `Model Selection` from [^\n]+? to ([^\n<]+?)\.(?:\s|$)/i;
+export const DEFAULT_BG_TASK_MAX_IDLE_MS = 5 * 60 * 1000;
 /** Default fallback context window for Antigravity CLI (agy) when model is unknown. */
 export const AGY_CONTEXT_WINDOW = 256_000;
 export const AGY_GEMINI_CONTEXT_WINDOW = 1_048_576;
@@ -416,15 +417,20 @@ function readTranscriptChunk(filePath, offset, remainder) {
         return { reset, nextOffset: curOffset, nextRemainder: curRemainder, lines: [] };
     }
     let chunk = "";
-    const fd = fs.openSync(filePath, "r");
     try {
-        const buf = Buffer.allocUnsafe(deltaBytes);
-        const bytesRead = fs.readSync(fd, buf, 0, deltaBytes, curOffset);
-        curOffset += bytesRead;
-        chunk = curRemainder + buf.subarray(0, bytesRead).toString("utf8");
+        const fd = fs.openSync(filePath, "r");
+        try {
+            const buf = Buffer.allocUnsafe(deltaBytes);
+            const bytesRead = fs.readSync(fd, buf, 0, deltaBytes, curOffset);
+            curOffset += bytesRead;
+            chunk = curRemainder + buf.subarray(0, bytesRead).toString("utf8");
+        }
+        finally {
+            fs.closeSync(fd);
+        }
     }
-    finally {
-        fs.closeSync(fd);
+    catch {
+        return null;
     }
     const lines = chunk.split("\n");
     let nextRemainder = lines.pop() ?? "";
@@ -587,12 +593,17 @@ function readLogTail(filePath, maxReadBytes = MAX_BG_TASK_LOG_BYTES) {
     const len = st.size - start;
     const buf = Buffer.allocUnsafe(len);
     let bytesRead = 0;
-    const fd = fs.openSync(filePath, "r");
     try {
-        bytesRead = fs.readSync(fd, buf, 0, len, start);
+        const fd = fs.openSync(filePath, "r");
+        try {
+            bytesRead = fs.readSync(fd, buf, 0, len, start);
+        }
+        finally {
+            fs.closeSync(fd);
+        }
     }
-    finally {
-        fs.closeSync(fd);
+    catch {
+        return null;
     }
     if (bytesRead <= 0)
         return null;
@@ -654,6 +665,54 @@ function subagentChanged(a, b) {
         }
     }
     return false;
+}
+function realpathOrNull(targetPath) {
+    try {
+        return fs.realpathSync(targetPath);
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Resolve a candidate file path for containment verification.
+ * - If the file exists on disk: rejects symlinks and non-regular files, returning its `realpathSync`.
+ * - If the file does not exist yet (`ENOENT`): resolves the nearest existing ancestor via `realpathSync`
+ *   and rejoins the trailing non-existent segments.
+ */
+function resolveSafeFileCandidate(candidate, requireExists = false) {
+    const abs = path.resolve(candidate);
+    try {
+        const st = fs.lstatSync(abs);
+        if (st.isSymbolicLink() || !st.isFile())
+            return null;
+        const realPath = fs.realpathSync(abs);
+        return { realPath, exists: true };
+    }
+    catch (e) {
+        if (requireExists || e?.code !== "ENOENT")
+            return null;
+    }
+    const tail = [];
+    let cur = abs;
+    while (true) {
+        try {
+            const realAncestor = fs.realpathSync(cur);
+            return {
+                realPath: tail.length > 0 ? path.join(realAncestor, ...tail.reverse()) : realAncestor,
+                exists: false,
+            };
+        }
+        catch (e) {
+            if (e?.code !== "ENOENT")
+                return null;
+            const parent = path.dirname(cur);
+            if (parent === cur)
+                return null;
+            tail.push(path.basename(cur));
+            cur = parent;
+        }
+    }
 }
 export const MAX_SNAPSHOT_BYTES = 220 * 1024;
 function compactSnapshotEntry(entry, isRecent) {
@@ -721,6 +780,48 @@ export class AgyTranscriptReader {
         }
         return false;
     }
+    /**
+     * Prune stale background task cursors whose log file disappeared or whose activity/mtime
+     * has been idle for longer than `maxIdleMs` (default 5 minutes).
+     */
+    pruneStaleBackgroundTasks(nowMs = Date.now(), maxIdleMs = DEFAULT_BG_TASK_MAX_IDLE_MS) {
+        if (this.bgTasks.size === 0)
+            return 0;
+        let pruned = 0;
+        for (const [taskSender, bg] of this.bgTasks.entries()) {
+            if (bg.logPath) {
+                let st = null;
+                try {
+                    st = fs.lstatSync(bg.logPath);
+                }
+                catch {
+                    st = null;
+                }
+                if (!st || st.isSymbolicLink() || !st.isFile()) {
+                    if (bg.lastMtimeMs > 0 || bg.hasExplicitLogUri || nowMs - bg.lastActivityAt > maxIdleMs) {
+                        this.bgTasks.delete(taskSender);
+                        pruned++;
+                    }
+                    continue;
+                }
+                if (st.size !== bg.lastSize || st.mtimeMs !== bg.lastMtimeMs) {
+                    bg.lastSize = st.size;
+                    bg.lastMtimeMs = st.mtimeMs;
+                    bg.lastActivityAt = nowMs;
+                    continue;
+                }
+                if (nowMs - st.mtimeMs > maxIdleMs) {
+                    this.bgTasks.delete(taskSender);
+                    pruned++;
+                }
+            }
+            else if (nowMs - bg.lastActivityAt > maxIdleMs) {
+                this.bgTasks.delete(taskSender);
+                pruned++;
+            }
+        }
+        return pruned;
+    }
     hasRunningWork() {
         return this.hasRunningSubagents() || this.hasRunningBackgroundTasks();
     }
@@ -772,10 +873,11 @@ export class AgyTranscriptReader {
             return null;
         return computeContextUsage(this.lastContextUsage.tokens, this.resolveModel() ?? this.lastModel);
     }
-    /** Return a compact description of the currently executing tool call, if any. */
+    /** Current byte offset into the main transcript file. */
     get byteOffset() {
         return this.offset;
     }
+    /** Return a compact description of the currently executing tool call, if any. */
     getActiveTask() {
         if (this.redact())
             return null;
@@ -894,22 +996,48 @@ export class AgyTranscriptReader {
         this.pollActiveBackgroundTasks(liveEvents);
         return liveEvents;
     }
+    isContainedTaskLogPath(candidate, requireExists = false) {
+        if (!path.basename(candidate).endsWith(".log"))
+            return false;
+        const resolved = resolveSafeFileCandidate(candidate, requireExists);
+        if (!resolved)
+            return false;
+        const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
+        const realSiblingRoot = realpathOrNull(siblingRoot);
+        if (realSiblingRoot && isInside(path.join(realSiblingRoot, "tasks"), resolved.realPath)) {
+            return true;
+        }
+        const homeDir = inferAgyHomeFromTranscriptPath(this.transcriptPath);
+        const brainRoot = path.resolve(homeDir, ".gemini", "antigravity-cli", "brain");
+        const realBrainRoot = realpathOrNull(brainRoot);
+        if (realBrainRoot &&
+            isInside(realBrainRoot, resolved.realPath) &&
+            path.basename(path.dirname(resolved.realPath)) === "tasks") {
+            return true;
+        }
+        return false;
+    }
     resolveTaskLogPath(taskSender, logUri) {
         if (!isSafeSystemSender(taskSender))
             return null;
         const parts = taskSender.split("/");
         const taskPart = parts.length === 2 ? parts[1] : parts[0];
         const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
-        const homeDir = inferAgyHomeFromTranscriptPath(this.transcriptPath);
-        const brainRoot = path.resolve(homeDir, ".gemini", "antigravity-cli", "brain");
         if (logUri && typeof logUri === "string") {
             try {
                 const url = new URL(logUri);
                 if (url.protocol === "file:") {
                     const candidate = path.resolve(fileURLToPath(url));
-                    if (path.basename(candidate).endsWith(".log") &&
-                        (isInside(brainRoot, candidate) || isInside(siblingRoot, candidate))) {
+                    if (this.isContainedTaskLogPath(candidate, false)) {
                         return candidate;
+                    }
+                    // Reject explicit symlinks immediately without falling back to the same path
+                    try {
+                        if (fs.lstatSync(candidate).isSymbolicLink())
+                            return null;
+                    }
+                    catch {
+                        /* ignore */
                     }
                 }
             }
@@ -917,32 +1045,45 @@ export class AgyTranscriptReader {
                 /* fall back to canonical tasks directory */
             }
         }
-        return SAFE_CONV_ID_RE.test(taskPart) ? path.join(siblingRoot, "tasks", `${taskPart}.log`) : null;
+        if (!SAFE_CONV_ID_RE.test(taskPart))
+            return null;
+        const fallback = path.join(siblingRoot, "tasks", `${taskPart}.log`);
+        return this.isContainedTaskLogPath(fallback, false) ? fallback : null;
     }
     pollActiveBackgroundTasks(outEvents) {
         if (this.bgTasks.size === 0)
             return;
         const isRedacted = this.redact();
         for (const bg of this.bgTasks.values()) {
-            this.pollBackgroundTaskCursor(bg, outEvents, isRedacted);
+            try {
+                this.pollBackgroundTaskCursor(bg, outEvents, isRedacted);
+            }
+            catch {
+                /* isolate per-cursor errors so one broken task log cannot stall others */
+            }
         }
     }
     pollBackgroundTaskCursor(bg, outEvents, isRedacted) {
         if (!bg.logPath || isRedacted)
             return;
+        if (!this.isContainedTaskLogPath(bg.logPath, true))
+            return;
         let st;
         try {
-            st = fs.statSync(bg.logPath);
+            st = fs.lstatSync(bg.logPath);
         }
         catch {
             return;
         }
-        if (!st.isFile() || (st.size === bg.lastSize && st.mtimeMs === bg.lastMtimeMs))
+        if (st.isSymbolicLink() || !st.isFile() || (st.size === bg.lastSize && st.mtimeMs === bg.lastMtimeMs))
             return;
         const tail = readLogTail(bg.logPath);
-        bg.lastSize = st.size;
-        bg.lastMtimeMs = st.mtimeMs;
-        if (!tail || tail.text === bg.lastTail)
+        if (!tail)
+            return;
+        bg.lastSize = tail.size;
+        bg.lastMtimeMs = tail.mtimeMs;
+        bg.lastActivityAt = Date.now();
+        if (tail.text === bg.lastTail)
             return;
         bg.lastTail = tail.text;
         outEvents.push({
@@ -975,6 +1116,23 @@ export class AgyTranscriptReader {
             ...(isRedacted ? {} : { result: resultObj, ...(truncated ? { truncated: true } : {}) }),
         });
     }
+    isContainedChildTranscriptPath(candidate, requireExists = false) {
+        if (path.basename(candidate) !== "transcript.jsonl")
+            return false;
+        const resolved = resolveSafeFileCandidate(candidate, requireExists);
+        if (!resolved)
+            return false;
+        const homeDir = inferAgyHomeFromTranscriptPath(this.transcriptPath);
+        const brainRoot = path.resolve(homeDir, ".gemini", "antigravity-cli", "brain");
+        const realBrainRoot = realpathOrNull(brainRoot);
+        if (realBrainRoot && isInside(realBrainRoot, resolved.realPath))
+            return true;
+        const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
+        const realSiblingRoot = realpathOrNull(siblingRoot);
+        if (realSiblingRoot && isInside(realSiblingRoot, resolved.realPath))
+            return true;
+        return false;
+    }
     resolveChildTranscriptPath(convId, logAbsoluteUri) {
         if (!SAFE_CONV_ID_RE.test(convId))
             return null;
@@ -983,13 +1141,15 @@ export class AgyTranscriptReader {
                 const url = new URL(logAbsoluteUri);
                 if (url.protocol === "file:") {
                     const candidate = path.resolve(fileURLToPath(url));
-                    if (path.basename(candidate) === "transcript.jsonl") {
-                        const homeDir = inferAgyHomeFromTranscriptPath(this.transcriptPath);
-                        const brainRoot = path.resolve(homeDir, ".gemini", "antigravity-cli", "brain");
-                        const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
-                        if (isInside(brainRoot, candidate) || isInside(siblingRoot, candidate)) {
-                            return candidate;
-                        }
+                    if (this.isContainedChildTranscriptPath(candidate, false)) {
+                        return candidate;
+                    }
+                    try {
+                        if (fs.lstatSync(candidate).isSymbolicLink())
+                            return null;
+                    }
+                    catch {
+                        /* ignore */
                     }
                 }
             }
@@ -998,7 +1158,8 @@ export class AgyTranscriptReader {
             }
         }
         try {
-            return resolveAgyTranscriptPath(convId, inferAgyHomeFromTranscriptPath(this.transcriptPath));
+            const canonical = resolveAgyTranscriptPath(convId, inferAgyHomeFromTranscriptPath(this.transcriptPath));
+            return this.isContainedChildTranscriptPath(canonical, false) ? canonical : null;
         }
         catch {
             return null;
@@ -1008,7 +1169,12 @@ export class AgyTranscriptReader {
         if (this.childCursors.size === 0)
             return;
         for (const convId of this.childCursors.keys()) {
-            this.pollChildCursor(convId, outEvents, true);
+            try {
+                this.pollChildCursor(convId, outEvents, true);
+            }
+            catch {
+                /* isolate per-cursor errors so one broken child transcript cannot stall others */
+            }
         }
     }
     pollChildCursor(convId, outEvents, emitIfChanged) {
@@ -1016,7 +1182,9 @@ export class AgyTranscriptReader {
         if (!cursor)
             return;
         const isRedacted = this.redact();
-        const chunk = readTranscriptChunk(cursor.transcriptPath, cursor.offset, cursor.remainder);
+        const chunk = this.isContainedChildTranscriptPath(cursor.transcriptPath, true)
+            ? readTranscriptChunk(cursor.transcriptPath, cursor.offset, cursor.remainder)
+            : null;
         if (chunk) {
             if (chunk.reset) {
                 cursor.lastStepIndex = -1;
@@ -1163,6 +1331,7 @@ export class AgyTranscriptReader {
                     const snippet = !isRedacted && parsed.content ? truncateBytes(parsed.content, LIMITS.resultMaxBytes).text : "";
                     if (snippet && snippet !== bg.lastTail) {
                         bg.lastTail = snippet;
+                        bg.lastActivityAt = Date.now();
                         outEvents.push({
                             type: "tool_execution_update",
                             toolCallId: bg.toolCallId,
@@ -1317,12 +1486,14 @@ export class AgyTranscriptReader {
                         name: pending.name,
                         args: pending.args,
                         startedAt: pending.at,
+                        lastActivityAt: Date.now(),
                         isDaemon: Boolean(pending.isDaemon),
                         logPath,
+                        hasExplicitLogUri: Boolean(bgAck.logUri),
                         lastSize: 0,
                         lastMtimeMs: 0,
                     };
-                    this.bgTasks.set(bgAck.taskSender, cursor);
+                    this.setBgTask(bgAck.taskSender, cursor);
                     this.pollBackgroundTaskCursor(cursor, outEvents, isRedacted);
                     if (!isRedacted && !cursor.lastTail && bgAck.initialTail) {
                         cursor.lastTail = bgAck.initialTail;
@@ -1392,6 +1563,16 @@ export class AgyTranscriptReader {
                 }
                 return;
             }
+        }
+    }
+    setBgTask(taskSender, cursor) {
+        this.bgTasks.delete(taskSender);
+        this.bgTasks.set(taskSender, cursor);
+        while (this.bgTasks.size > MAX_BG_TASKS) {
+            const oldest = this.bgTasks.keys().next().value;
+            if (!oldest)
+                break;
+            this.bgTasks.delete(oldest);
         }
     }
     setSubagent(taskId, sub) {

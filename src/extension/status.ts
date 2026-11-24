@@ -1,5 +1,5 @@
-import type { AgentStatus } from "../shared/protocol.ts";
-import { parseGentleMode, type GentleModeName } from "./environment.ts";
+import type { AgentStatus, GentleMode } from "../shared/protocol.ts";
+import { parseGentleMode } from "./environment.ts";
 
 /** Derives agent.status and tracks setStatus() texts of every extension (agent.statuses, ≤1/s). */
 export class StatusTracker {
@@ -12,13 +12,13 @@ export class StatusTracker {
   private dirty = false;
   private timer: NodeJS.Timeout | null = null;
   private lastFlush = 0;
-  gentleMode: GentleModeName | null = null;
+  gentleMode: GentleMode | null = null;
   sawGentleStatus = false;
 
   constructor(
     private emitStatus: (status: AgentStatus, detail?: string) => void,
     private emitStatuses: (items: Record<string, string>) => void,
-    private onGentleMode?: (m: GentleModeName) => void,
+    private onGentleMode?: (m: GentleMode) => void,
     private now: () => number = Date.now,
   ) {}
 
@@ -46,10 +46,6 @@ export class StatusTracker {
     this.compacting = false;
     this.base = "idle";
     this.detail = undefined;
-    this.push();
-  }
-  error(): void {
-    this.base = "error";
     this.push();
   }
   setCompacting(v: boolean): void {

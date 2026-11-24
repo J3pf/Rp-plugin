@@ -237,7 +237,7 @@ export const validators: Record<string, (d: any) => string[]> = {
           (f) =>
             isObj(f) &&
             isStr(f.path) &&
-            oneOf("modified", "added", "deleted", "untracked", "renamed")(f.status) &&
+            oneOf("modified", "added", "deleted", "renamed")(f.status) &&
             isNum(f.additions) &&
             isNum(f.deletions) &&
             isBool(f.binary) &&
@@ -263,8 +263,25 @@ export const validators: Record<string, (d: any) => string[]> = {
     check(
       d,
       {
-        available: isBool,
-        workspaces: arrayOf((w) => isObj(w) && isStr(w.id) && typeof w.name === "string" && Array.isArray(w.panes)),
+        workspaces: arrayOf(
+          (w) =>
+            isObj(w) &&
+            isStr(w.id) &&
+            typeof w.label === "string" &&
+            nullable((v) => typeof v === "string")(w.cwd ?? null) &&
+            arrayOf(
+              (t) =>
+                isObj(t) &&
+                isStr(t.id) &&
+                typeof t.label === "string" &&
+                arrayOf(
+                  (p) =>
+                    isObj(p) &&
+                    isStr(p.id) &&
+                    (!("agent" in p) || p.agent === undefined || typeof p.agent === "string"),
+                )(t.panes),
+            )(w.tabs),
+        ),
       },
       "host.herdr_layout.result",
     ),

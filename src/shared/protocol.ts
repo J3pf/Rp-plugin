@@ -189,7 +189,7 @@ export interface UserMessageBody {
   clientMsgId: string;
   deviceId?: string;
   text: string;
-  attachments?: Array<{ blobId: string; name: string; mime: string; size: number }>;
+  attachments?: Array<{ blobId: string; name: string; mime: string; size: number; sha256?: string }>;
   delivery?: "auto" | "steer" | "followUp";
   method?: "auto" | "api" | "interactive" | "herdr";
   asCommand?: boolean;
@@ -244,8 +244,8 @@ export interface AgentHelloBody {
   host: { hostname: string; user: string; pid: number; os: string };
   launcher: string;
   herdr: AgentHerdrLocation | null;
-  gentle: { version: string | null; mode: string } | null;
-  transport: string;
+  gentle: { version: string | null; mode: GentleMode } | null;
+  transport: "ws" | "longpoll";
   redacted: boolean;
   cwd: string;
   spawnId: string | null;
@@ -253,7 +253,7 @@ export interface AgentHelloBody {
   model: { provider: string; id: string } | null;
   thinking: string | null;
   status: AgentStatus;
-  openPrompts: unknown[];
+  openPrompts: PromptOpen[];
   todos?: { tasks: TodoTask[] } | null;
   subagents?: SubagentUpdateEvent[];
 }
@@ -304,6 +304,30 @@ export interface HostHelloBody {
 
 export interface HostQuotasBody {
   quotas: MachineQuota[];
+}
+
+export interface GitDiffFile {
+  path: string;
+  status: "modified" | "added" | "deleted" | "renamed";
+  additions: number;
+  deletions: number;
+  binary: boolean;
+  patch: string;
+  truncated: boolean;
+}
+
+export interface GitDiffResult {
+  cwd: string;
+  branch: string | null;
+  files: GitDiffFile[];
+  totalAdditions: number;
+  totalDeletions: number;
+}
+
+export interface GitDiscardResult {
+  cwd: string;
+  path: string;
+  ok: boolean;
 }
 
 /** Message types the plugin sends that must never be dropped from the outbound queue. */

@@ -1,6 +1,6 @@
 import fs from "node:fs";
-import path from "node:path";
 import { configPath, defaultInboxDir } from "../shared/platform.js";
+import { atomicWriteFileSync } from "../shared/util.js";
 export const DEFAULT_CONFIG = {
     relayUrl: null,
     machineId: null,
@@ -86,16 +86,7 @@ export function loadConfig(env = process.env, platform = process.platform) {
 }
 /** Atomic write with 0600 permissions. Persisted file never contains env overrides applied at load. */
 export function saveConfig(p, cfg) {
-    fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
-    const tmp = `${p}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
-    try {
-        fs.chmodSync(tmp, 0o600);
-    }
-    catch {
-        /* Windows: ACLs inherit from %APPDATA% */
-    }
-    fs.renameSync(tmp, p);
+    atomicWriteFileSync(p, JSON.stringify(cfg, null, 2) + "\n", 0o600);
 }
 /** Read the on-disk config without env overrides, apply a mutation, and write it back. */
 export function updateConfigFile(p, mutate) {
@@ -103,8 +94,13 @@ export function updateConfigFile(p, mutate) {
     try {
         raw = JSON.parse(fs.readFileSync(p, "utf8"));
     }
-    catch {
-        raw = {};
+    catch (err) {
+        if (err?.code === "ENOENT") {
+            raw = {};
+        }
+        else {
+            throw err;
+        }
     }
     const cfg = normalizeConfig(raw);
     mutate(cfg);

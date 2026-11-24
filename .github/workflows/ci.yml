@@ -3,6 +3,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   check:
     name: typecheck + build
@@ -14,6 +17,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
+      - run: git diff --exit-code -- dist
       - run: node bin/rp-host.mjs --help
       - run: npm pack --dry-run
 
@@ -71,4 +75,4 @@ jobs:
         with: { go-version: '1.25.10', cache: false }
       - run: go version
       - run: npm ci
-      - run: npx vitest run test/unit-basic.test.ts test/forwarder.test.ts test/prompts.test.ts test/delivery.test.ts test/connection.test.ts test/commands.test.ts test/host.test.ts test/contract.test.ts
+      - run: npm run test:unit

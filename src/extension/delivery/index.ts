@@ -163,7 +163,7 @@ export class Deliverer {
       if (msg.attachments?.length && cachedFetchBlob) {
         if (inline) {
           if (!resolvedApi) {
-            const r = await resolveAttachments(msg.attachments as any, {
+            const r = await resolveAttachments(msg.attachments, {
               fetchBlob: cachedFetchBlob,
               inboxDir: this.d.inboxDir(),
               sessionId: this.d.sessionId(),
@@ -179,7 +179,7 @@ export class Deliverer {
           images = resolvedApi.images;
         } else {
           if (resolvedTextNonInline === null) {
-            const r = await resolveAttachments(msg.attachments as any, {
+            const r = await resolveAttachments(msg.attachments, {
               fetchBlob: cachedFetchBlob,
               inboxDir: this.d.inboxDir(),
               sessionId: this.d.sessionId(),

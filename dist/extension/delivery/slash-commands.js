@@ -66,9 +66,17 @@ export async function handleModelCommand(pi, ctx, rawArg, opts) {
         return;
     }
     const options = available.map((m) => `${m.provider}/${m.id}`);
-    const selectFn = opts?.askSelect ?? ((title, items) => ctx.ui?.select(title, items));
+    const selectFn = opts?.askSelect ?? ((title, items) => ctx.ui?.select?.(title, items));
     const interactiveFlow = (async () => {
-        const selected = await selectFn("Seleccionar modelo", options);
+        let selected;
+        try {
+            selected = await selectFn("Seleccionar modelo", options);
+        }
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            ctx.ui?.notify?.(`Error al seleccionar modelo: ${message}`, "warning");
+            return;
+        }
         if (!selected)
             return;
         const selectedModel = available.find((m) => `${m.provider}/${m.id}` === selected || m.id === selected);
@@ -114,9 +122,17 @@ export async function handleThinkingCommand(pi, ctx, rawArg, opts) {
         }
         return;
     }
-    const selectFn = opts?.askSelect ?? ((title, items) => ctx.ui?.select(title, items));
+    const selectFn = opts?.askSelect ?? ((title, items) => ctx.ui?.select?.(title, items));
     const interactiveFlow = (async () => {
-        const selected = await selectFn("Nivel de thinking", [...VALID_THINKING_LEVELS]);
+        let selected;
+        try {
+            selected = await selectFn("Nivel de thinking", [...VALID_THINKING_LEVELS]);
+        }
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            ctx.ui?.notify?.(`Error al seleccionar nivel de thinking: ${message}`, "warning");
+            return;
+        }
         if (!selected)
             return;
         const normalized = selected.trim().toLowerCase();

@@ -36,7 +36,7 @@ export function signGatePayload(token, parts) {
 export function verifyGateSignature(token, parts, sig) {
     const expected = signGatePayload(token, parts);
     if (!expected)
-        return true;
+        return false;
     if (typeof sig !== "string" || sig.length !== expected.length)
         return false;
     try {
@@ -73,7 +73,7 @@ export function probeUnixSocketAlive(sockPath, timeoutMs = 150) {
  * MUST write exactly one JSON object to stdout and exit 0.
  */
 export async function runAgyHook(cfg, stdinText, sockPath = gateSocketPath()) {
-    if (!cfg.enabled)
+    if (!cfg.enabled || !cfg.machineToken)
         return { decision: "ask" };
     let payload;
     try {
