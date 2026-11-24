@@ -1,5 +1,5 @@
 import type { Answer } from "../../../shared/protocol.ts";
-import type { AdapterPromptSpec } from "../broker.ts";
+import { parseOptionIndex, type AdapterPromptSpec } from "../broker.ts";
 import type { CustomDialogAdapter } from "./types.ts";
 
 // Keep scraping independent of the user's terminal width; the component wraps at this width.
@@ -154,8 +154,10 @@ export const reviewConsent: CustomDialogAdapter = {
   // Matches gentle-pi/lib/review-consent-ui.ts:84-87: answers must pass through the component's done callback.
   toResult(_args, answer) {
     const value = answer as Answer;
+    if (!value || typeof value !== "object") return undefined;
     if ("cancelled" in value && value.cancelled) return undefined;
-    const index = "optionIds" in value ? Number(value.optionIds[0]) : -1;
+    const optionIds = "optionIds" in value ? (value as { optionIds?: unknown }).optionIds : undefined;
+    const index = Array.isArray(optionIds) && optionIds.length > 0 ? parseOptionIndex(optionIds[0]) : -1;
     if (index === 0) return { kind: "provider", answer: "granted" };
     if (index === 1) return { kind: "provider", answer: "declined" };
     if (index === 2) return { kind: "host-session" };

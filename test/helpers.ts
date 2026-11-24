@@ -93,6 +93,16 @@ export class FakeRelay {
           return void res.end("{}");
         }
         if (url.pathname === "/v1/agent/poll") {
+          if (req.method === "POST") {
+            if (!String(req.headers["content-type"] ?? "").includes("application/json")) {
+              res.writeHead(415, { "content-type": "application/json" });
+              return void res.end(JSON.stringify({ error: "unsupported_media_type" }));
+            }
+            if (!body || typeof body !== "object" || typeof body.agentId !== "string" || !body.agentId) {
+              res.writeHead(400, { "content-type": "application/json" });
+              return void res.end(JSON.stringify({ error: "invalid_poll_body" }));
+            }
+          }
           const done = (msgs: Envelope[]) => {
             if (res.writableEnded) return;
             res.writeHead(200, { "content-type": "application/json" });

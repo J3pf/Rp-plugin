@@ -339,14 +339,19 @@ export function emptyValue(req: DialogRequest): unknown {
   return req.kind === "confirm" ? false : undefined;
 }
 
+/** Strictly parse a non-negative integer option index from a string; rejects empty/non-digit inputs. */
+export function parseOptionIndex(raw: unknown): number {
+  return typeof raw === "string" && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : -1;
+}
+
 /** Phone Answer → value expected by the Pi dialog caller. select returns the exact option label. */
 export function toLocalValue(req: DialogRequest, a: Answer): unknown {
   const any = a as any;
   if (any.cancelled) return emptyValue(req);
   if (req.kind === "select") {
     if (Array.isArray(any.optionIds) && any.optionIds.length) {
-      const idx = Number(any.optionIds[0]);
-      return Number.isInteger(idx) && idx >= 0 && idx < req.options.length ? req.options[idx] : undefined;
+      const idx = parseOptionIndex(any.optionIds[0]);
+      return idx >= 0 && idx < req.options.length ? req.options[idx] : undefined;
     }
     if (typeof any.text === "string") {
       return req.allowFreeText || req.options.includes(any.text) ? any.text : undefined;

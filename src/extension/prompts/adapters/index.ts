@@ -66,7 +66,28 @@ export class AdapterRegistry implements CustomInterceptor {
 
     let doneRef: ((v: unknown) => void) | undefined;
     let doneCalled = false;
+    let settled = false;
+    let answeredRemotely = false;
     let p: OpenPrompt | undefined;
+
+    const attachPrompt = (prompt: OpenPrompt) => {
+      p = prompt;
+      void prompt.remoteAnswer
+        .then((answer) => {
+          if (prompt.closed || prompt.cancelledBySystem || settled) return;
+          answeredRemotely = true;
+          const result = cur.adapter.toResult(cur.args, answer);
+          doneRef?.(result);
+          this.broker.ack(prompt.id, true);
+        })
+        .catch(() => {
+          if (!prompt.closed) {
+            this.broker.resolved(prompt, "cancelled", null);
+            this.broker.close(prompt);
+          }
+        });
+    };
+
     const wrapped = (tui: unknown, theme: unknown, kb: unknown, done: (v: unknown) => void) => {
       const capturedDone = (value: unknown) => {
         doneCalled = true;
@@ -77,47 +98,28 @@ export class AdapterRegistry implements CustomInterceptor {
       if (!component || typeof component !== "object") return component;
       if (this.mirroredComponents.has(component)) return component;
       this.mirroredComponents.add(component);
-      if (doneCalled) return component;
+      if (doneCalled || settled) return component;
       try {
         const spec = fromComponent(component);
-        if (spec) p = this.broker.openSpec(spec);
+        if (spec) attachPrompt(this.broker.openSpec(spec));
       } catch {
         // Shape drift must leave custom() in control without a partial broker prompt.
       }
       return component;
     };
 
-    let localPromise: Promise<T>;
     try {
-      localPromise = Promise.resolve(runOrig(wrapped as any));
-    } catch (error) {
-      if (p) {
-        this.broker.resolved(p, "cancelled", null);
-        this.broker.close(p);
-      }
-      throw error;
-    }
-    if (!p) return await localPromise;
-
-    let answeredRemotely = false;
-    const prompt = p;
-    void prompt.remoteAnswer.then((answer) => {
-      if (prompt.closed || prompt.cancelledBySystem) return;
-      answeredRemotely = true;
-      const result = cur.adapter.toResult(cur.args, answer);
-      doneRef?.(result);
-      this.broker.ack(prompt.id, true);
-    });
-
-    try {
-      const value = await localPromise;
-      if (!prompt.closed && !answeredRemotely) this.broker.resolved(prompt, "local", cur.adapter.fromResult(cur.args, value));
+      const value = await runOrig(wrapped as any);
+      settled = true;
+      if (p && !p.closed && !answeredRemotely) this.broker.resolved(p, "local", cur.adapter.fromResult(cur.args, value));
       return value;
     } catch (error) {
-      if (!prompt.closed) this.broker.resolved(prompt, "cancelled", null);
+      settled = true;
+      if (p && !p.closed) this.broker.resolved(p, "cancelled", null);
       throw error;
     } finally {
-      this.broker.close(prompt);
+      settled = true;
+      if (p) this.broker.close(p);
     }
   }
 
@@ -135,18 +137,25 @@ export class AdapterRegistry implements CustomInterceptor {
     };
     const p: OpenPrompt = this.broker.openSpec(cur.adapter.toPrompt(cur.args));
     let answeredRemotely = false;
-    void p.remoteAnswer.then((a) => {
-      if (p.closed || p.cancelledBySystem) return;
-      answeredRemotely = true;
-      const res = cur.adapter.toResult(cur.args, a);
-      if (doneRef) {
-        doneRef(res);
-      } else {
-        hasPendingResult = true;
-        pendingResult = res;
-      }
-      this.broker.ack(p.id, true);
-    });
+    void p.remoteAnswer
+      .then((a) => {
+        if (p.closed || p.cancelledBySystem) return;
+        answeredRemotely = true;
+        const res = cur.adapter.toResult(cur.args, a);
+        if (doneRef) {
+          doneRef(res);
+        } else {
+          hasPendingResult = true;
+          pendingResult = res;
+        }
+        this.broker.ack(p.id, true);
+      })
+      .catch(() => {
+        if (!p.closed) {
+          this.broker.resolved(p, "cancelled", null);
+          this.broker.close(p);
+        }
+      });
     try {
       const v = await runOrig(wrapped as any);
       if (!p.closed && !answeredRemotely) this.broker.resolved(p, "local", cur.adapter.fromResult(cur.args, v));

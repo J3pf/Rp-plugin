@@ -227,6 +227,7 @@ export class Runtime {
       onMessage: (env) => this.onRelayMessage(env),
       onState: (s, t, d) => this.onConnState(s, t, d),
       onFatal: (code, reason) => this.onFatal(code, reason),
+      onLog: (m) => this.log(m),
     };
     this.conn = opts.connectionFactory ? opts.connectionFactory(connOpts) : new Connection(connOpts);
   }
@@ -662,7 +663,23 @@ export class Runtime {
           };
           this.dialogWaiters.push(w);
         }),
-      waitSettled: () => new Promise<void>((resolve) => (this.safeIdle() ? resolve() : this.settledWaiters.push({ resolve }))),
+      waitSettled: () =>
+        new Promise<void>((resolve) => {
+          if (this.safeIdle()) return resolve();
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            clearTimeout(t);
+            const i = this.settledWaiters.indexOf(w);
+            if (i >= 0) this.settledWaiters.splice(i, 1);
+            resolve();
+          };
+          const w: Waiter<void> = { resolve: finish };
+          const t = setTimeout(finish, 15_000);
+          t.unref?.();
+          this.settledWaiters.push(w);
+        }),
       expectInput: (text, ms) =>
         new Promise<boolean>((resolve) => {
           const norm = normalizeText(text);

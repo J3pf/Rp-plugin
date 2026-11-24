@@ -39,14 +39,18 @@ describe("pairing", () => {
 });
 
 describe("doctor helpers", () => {
-  it("detects the plugin in settings.json (string or {source}), never via git:", () => {
+  it("detects the plugin in settings.json (string or {source}), including git: sources", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rphome-"));
     expect(pluginDeclaredIn(dir)).toMatchObject({ found: false, error: "no existe" });
     fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: ["npm:gentle-pi", `npm:${PLUGIN_PACKAGE}`] }));
     expect(pluginDeclaredIn(dir).found).toBe(true);
     fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [{ source: `npm:${PLUGIN_PACKAGE}@0.1.0` }] }));
     expect(pluginDeclaredIn(dir).found).toBe(true);
-    fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [`git:github.com/j3pf/${PLUGIN_PACKAGE}`] }));
+    fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: ["git:github.com/J3pf/Rp-plugin@v0.4.6"] }));
+    expect(pluginDeclaredIn(dir).found).toBe(true);
+    fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [{ source: "git:github.com/J3pf/Rp-plugin" }] }));
+    expect(pluginDeclaredIn(dir).found).toBe(true);
+    fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: ["git:github.com/other/unrelated"] }));
     expect(pluginDeclaredIn(dir).found).toBe(false);
     fs.writeFileSync(path.join(dir, "settings.json"), "{oops");
     expect(pluginDeclaredIn(dir).found).toBe(false);
@@ -54,7 +58,7 @@ describe("doctor helpers", () => {
   it("checks both Pi and gentle-shell homes and tells which command to run", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "rphome2-"));
     fs.mkdirSync(path.join(home, ".pi", "agent"), { recursive: true });
-    fs.writeFileSync(path.join(home, ".pi", "agent", "settings.json"), JSON.stringify({ packages: [`npm:${PLUGIN_PACKAGE}`] }));
+    fs.writeFileSync(path.join(home, ".pi", "agent", "settings.json"), JSON.stringify({ packages: ["git:github.com/J3pf/Rp-plugin"] }));
     const prev = process.env.HOME;
     const prevU = process.env.USERPROFILE;
     process.env.HOME = home;
@@ -65,7 +69,7 @@ describe("doctor helpers", () => {
       if (process.platform !== "win32") {
         expect(checks[0]).toMatchObject({ level: "ok" });
         expect(checks[1]).toMatchObject({ level: "warn" });
-        expect(checks[1]!.detail).toContain(`gentle-shell install npm:${PLUGIN_PACKAGE}`);
+        expect(checks[1]!.detail).toContain("gentle-shell install git:github.com/J3pf/Rp-plugin");
       }
     } finally {
       process.env.HOME = prev;

@@ -23,6 +23,7 @@ export interface CommandHooks {
 }
 
 export const PLUGIN_PACKAGE = "@j3pf/pi-rp";
+export const PLUGIN_GIT_SOURCE = "git:github.com/J3pf/Rp-plugin";
 const SUBCOMMANDS = ["pair", "status", "doctor", "on", "off", "gate", "test", "unpair"];
 const GATE_MODES: GateMode[] = ["auto-detect", "off", "dangerous", "writes", "all"];
 
@@ -164,7 +165,7 @@ export function pluginDeclaredIn(home: string): { found: boolean; file: string; 
     const pkgs: unknown[] = Array.isArray(json?.packages) ? json.packages : [];
     const found = pkgs.some((p) => {
       const src = typeof p === "string" ? p : (p as any)?.source;
-      return typeof src === "string" && !src.startsWith("git:") && (src.includes(PLUGIN_PACKAGE) || /Rp-plugin/i.test(src));
+      return typeof src === "string" && (src.includes(PLUGIN_PACKAGE) || /Rp-plugin/i.test(src));
     });
     return { found, file };
   } catch (e) {
@@ -176,8 +177,8 @@ export function checkDeclared(env = process.env): Check[] {
   const homes = piHomes(env);
   const out: Check[] = [];
   for (const [label, dir, hint] of [
-    ["Pi", homes.pi, `pi install npm:${PLUGIN_PACKAGE}`],
-    ["gentle-shell", homes.gentleShell, `gentle-shell install npm:${PLUGIN_PACKAGE}`],
+    ["Pi", homes.pi, `pi install ${PLUGIN_GIT_SOURCE}`],
+    ["gentle-shell", homes.gentleShell, `gentle-shell install ${PLUGIN_GIT_SOURCE}`],
   ] as const) {
     const r = pluginDeclaredIn(dir);
     if (r.found) out.push({ level: "ok", label: `Plugin declarado en ${label}`, detail: r.file });

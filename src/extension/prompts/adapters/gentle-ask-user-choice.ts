@@ -1,6 +1,7 @@
 // gentle-pi 4.1.0 extensions/ask-user-choice.ts
 //   params : { question, options:[{label,description,value}] (2..4), allowCustomResponse? }
 //   result : { value, label, index /* 1-based */ } | { customResponse } | undefined (cancelled)
+import { parseOptionIndex } from "../broker.ts";
 import type { CustomDialogAdapter } from "./types.ts";
 
 interface ChoiceOption {
@@ -44,9 +45,9 @@ export const gentleAskUserChoice: CustomDialogAdapter = {
     const any = answer as any;
     if (any.cancelled) return undefined;
     if (Array.isArray(any.optionIds) && any.optionIds.length) {
-      const idx = Number(any.optionIds[0]);
-      const o = a.options[idx];
-      if (Number.isInteger(idx) && o) return { value: o.value, label: o.label, index: idx + 1 };
+      const idx = parseOptionIndex(any.optionIds[0]);
+      const o = idx >= 0 ? a.options[idx] : undefined;
+      if (o) return { value: o.value, label: o.label, index: idx + 1 };
       return undefined;
     }
     if (typeof any.text === "string" && any.text.trim() && a.allowCustomResponse === true) return { customResponse: any.text };

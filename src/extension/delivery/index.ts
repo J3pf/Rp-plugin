@@ -66,6 +66,8 @@ export function methodChain(
   return chain;
 }
 
+const ACTIVE_SELECT_WAIT_TIMEOUT_MS = 60_000;
+
 export class Deliverer {
   private seen = new LruSet(500);
   /** Serialize deliveries: typing into the editor must never interleave. */
@@ -81,7 +83,7 @@ export class Deliverer {
         this.process(msg, (task) => {
           bg = task;
           this.activeSelectPromises.add(task);
-          void task.finally(() => this.activeSelectPromises.delete(task));
+          void task.finally(() => this.activeSelectPromises.delete(task)).catch(() => {});
         }),
       )
       .catch(() => {});
@@ -207,7 +209,16 @@ export class Deliverer {
         }
         if (method === "interactive") {
           if (this.activeSelectPromises.size > 0) {
-            await Promise.allSettled([...this.activeSelectPromises]);
+            let timer: NodeJS.Timeout | undefined;
+            await Promise.race([
+              Promise.allSettled([...this.activeSelectPromises]),
+              new Promise<void>((resolve) => {
+                timer = setTimeout(resolve, ACTIVE_SELECT_WAIT_TIMEOUT_MS);
+                timer.unref?.();
+              }),
+            ]).finally(() => {
+              if (timer) clearTimeout(timer);
+            });
           }
           const r = await deliverInteractive(this.d.interactive(), text, msg.delivery ?? "auto");
           if (r.ok) {

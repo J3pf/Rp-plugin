@@ -1,6 +1,7 @@
 // @eko24ive/pi-ask 1.x ask_user tool adapter
 // Maps pi-ask's ask_user interactive custom() dialog to remote mobile questionnaires and back.
 import type { Answer } from "../../../shared/protocol.ts";
+import { parseOptionIndex } from "../broker.ts";
 import type { CustomDialogAdapter } from "./types.ts";
 
 interface AskOption {
@@ -112,13 +113,15 @@ export const piAskUser: CustomDialogAdapter = {
 
     const answers: Record<string, AskResultAnswer> = {};
     for (const item of any.answers as Array<{ questionIndex: number; optionIds?: string[]; text?: string }>) {
+      if (!item || typeof item !== "object" || typeof item.questionIndex !== "number" || !Number.isInteger(item.questionIndex)) continue;
       const q = a.questions[item.questionIndex];
       if (!q) continue;
 
-      const picked = (item.optionIds ?? [])
+      const rawIds = Array.isArray(item.optionIds) ? item.optionIds : [];
+      const picked = rawIds
         .map((id) => {
-          const idx = Number(id);
-          return Number.isInteger(idx) && q.options[idx] ? { opt: q.options[idx]!, idx } : null;
+          const idx = parseOptionIndex(id);
+          return idx >= 0 && q.options[idx] ? { opt: q.options[idx]!, idx } : null;
         })
         .filter((p): p is { opt: AskOption; idx: number } => p !== null);
 

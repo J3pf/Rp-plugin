@@ -3,16 +3,19 @@ import http from "node:http";
 import https from "node:https";
 import type { Agent } from "node:http";
 
-let sharedAgent: Agent | undefined;
-export async function getProxyAgent(): Promise<Agent | undefined> {
-  if (sharedAgent) return sharedAgent;
-  try {
-    const mod: any = await import("proxy-agent");
-    sharedAgent = new mod.ProxyAgent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 128 } as any) as Agent;
-  } catch {
-    sharedAgent = undefined;
+let sharedAgentPromise: Promise<Agent | undefined> | undefined;
+export function getProxyAgent(): Promise<Agent | undefined> {
+  if (!sharedAgentPromise) {
+    sharedAgentPromise = (async () => {
+      try {
+        const mod: any = await import("proxy-agent");
+        return new mod.ProxyAgent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 128 } as any) as Agent;
+      } catch {
+        return undefined;
+      }
+    })();
   }
-  return sharedAgent;
+  return sharedAgentPromise;
 }
 
 export interface HttpResult<T = any> {
@@ -52,30 +55,50 @@ export async function httpRequest(url: string, opts: HttpOptions = {}): Promise<
     }
     headers["content-length"] = String(payload.length);
   }
+  const timeoutMs = opts.timeoutMs ?? 30_000;
   return new Promise<HttpResult>((resolve, reject) => {
+    let settled = false;
+    let deadlineTimer: NodeJS.Timeout | undefined;
     let onAbort: (() => void) | undefined;
     const cleanup = () => {
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+        deadlineTimer = undefined;
+      }
       if (onAbort && opts.signal) {
         opts.signal.removeEventListener("abort", onAbort);
         onAbort = undefined;
       }
     };
+    const succeed = (result: HttpResult) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const fail = (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
     const req = lib.request(
       u,
-      { method: opts.method ?? (payload ? "POST" : "GET"), headers, agent, timeout: opts.timeoutMs ?? 30_000 },
+      { method: opts.method ?? (payload ? "POST" : "GET"), headers, agent, timeout: timeoutMs },
       (res) => {
         const chunks: Buffer[] = [];
         let size = 0;
         res.on("data", (c: Buffer) => {
           size += c.length;
           if (maxBytes > 0 && size > maxBytes) {
-            req.destroy(new Error("response too large"));
+            const err = new Error("response too large");
+            req.destroy(err);
+            fail(err);
             return;
           }
           chunks.push(c);
         });
         res.on("end", () => {
-          cleanup();
           const body = Buffer.concat(chunks);
           let json: any;
           if ((res.headers["content-type"] ?? "").includes("json") && body.length) {
@@ -85,25 +108,41 @@ export async function httpRequest(url: string, opts: HttpOptions = {}): Promise<
               json = undefined;
             }
           }
-          resolve({ status: res.statusCode ?? 0, headers: res.headers, body, json });
+          succeed({ status: res.statusCode ?? 0, headers: res.headers, body, json });
         });
-        res.on("error", (err) => {
-          cleanup();
-          reject(err);
+        res.on("close", () => {
+          if (!res.complete) fail(new Error("response closed prematurely"));
         });
+        res.on("error", (err) => fail(err));
       },
     );
-    req.on("timeout", () => req.destroy(new Error("request timeout")));
-    req.on("error", (err) => {
-      cleanup();
-      reject(err);
+    if (timeoutMs > 0) {
+      deadlineTimer = setTimeout(() => {
+        const err = new Error("request timeout");
+        req.destroy(err);
+        fail(err);
+      }, timeoutMs);
+      deadlineTimer.unref?.();
+    }
+    req.on("timeout", () => {
+      const err = new Error("request timeout");
+      req.destroy(err);
+      fail(err);
     });
+    req.on("error", (err) => fail(err));
     if (opts.signal) {
-      if (opts.signal.aborted) req.destroy(new Error("aborted"));
-      else {
-        onAbort = () => req.destroy(new Error("aborted"));
-        opts.signal.addEventListener("abort", onAbort, { once: true });
+      if (opts.signal.aborted) {
+        const err = new Error("aborted");
+        req.destroy(err);
+        fail(err);
+        return;
       }
+      onAbort = () => {
+        const err = new Error("aborted");
+        req.destroy(err);
+        fail(err);
+      };
+      opts.signal.addEventListener("abort", onAbort, { once: true });
     }
     if (payload) req.write(payload);
     req.end();

@@ -1,6 +1,6 @@
 import fs from "node:fs";
-import path from "node:path";
 import { configPath, defaultInboxDir } from "../shared/platform.ts";
+import { atomicWriteFileSync } from "../shared/util.ts";
 
 export type GateMode = "auto-detect" | "off" | "dangerous" | "writes" | "all";
 export type DeliveryConfigMethod = "auto" | "api" | "interactive" | "herdr";
@@ -119,15 +119,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, platform: NodeJ
 
 /** Atomic write with 0600 permissions. Persisted file never contains env overrides applied at load. */
 export function saveConfig(p: string, cfg: RpConfig): void {
-  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
-  const tmp = `${p}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
-  try {
-    fs.chmodSync(tmp, 0o600);
-  } catch {
-    /* Windows: ACLs inherit from %APPDATA% */
-  }
-  fs.renameSync(tmp, p);
+  atomicWriteFileSync(p, JSON.stringify(cfg, null, 2) + "\n", 0o600);
 }
 
 /** Read the on-disk config without env overrides, apply a mutation, and write it back. */
@@ -135,8 +127,12 @@ export function updateConfigFile(p: string, mutate: (c: RpConfig) => void): RpCo
   let raw: unknown = {};
   try {
     raw = JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch {
-    raw = {};
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      raw = {};
+    } else {
+      throw err;
+    }
   }
   const cfg = normalizeConfig(raw);
   mutate(cfg);

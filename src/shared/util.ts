@@ -19,13 +19,22 @@ export function atomicWriteFileSync(filePath: string, content: string, mode = 0o
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-  fs.writeFileSync(tmp, content, { mode });
   try {
-    fs.chmodSync(tmp, mode);
-  } catch {
-    /* ignore on platforms without POSIX modes */
+    fs.writeFileSync(tmp, content, { mode });
+    try {
+      fs.chmodSync(tmp, mode);
+    } catch {
+      /* ignore on platforms without POSIX modes */
+    }
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore cleanup error */
+    }
+    throw err;
   }
-  fs.renameSync(tmp, filePath);
 }
 
 export function sha256(buf: Buffer | string): string {
@@ -34,14 +43,24 @@ export function sha256(buf: Buffer | string): string {
 
 /** Truncate a string to at most `max` UTF-8 bytes without splitting a code point. */
 export function truncateBytes(s: string, max: number): { text: string; truncated: boolean } {
+  if (max <= 0) return { text: "", truncated: s.length > 0 };
   if (s.length <= Math.floor(max / 4)) return { text: s, truncated: false };
   if (s.length <= max && Buffer.byteLength(s, "utf8") <= max) return { text: s, truncated: false };
   const head = s.length > max + 1 ? s.slice(0, max + 1) : s;
   let buf = Buffer.from(head, "utf8").subarray(0, max);
-  // drop a possibly split trailing code point
+  // Drop only an incomplete trailing UTF-8 sequence; preserve complete multi-byte code points.
   let end = buf.length;
-  while (end > 0 && (buf[end - 1]! & 0xc0) === 0x80) end--;
-  if (end > 0 && buf[end - 1]! >= 0xc0) end--;
+  if (end > 0) {
+    let start = end - 1;
+    while (start > 0 && (buf[start]! & 0xc0) === 0x80) start--;
+    const lead = buf[start]!;
+    let expected = 1;
+    if ((lead & 0xe0) === 0xc0) expected = 2;
+    else if ((lead & 0xf0) === 0xe0) expected = 3;
+    else if ((lead & 0xf8) === 0xf0) expected = 4;
+    else if ((lead & 0xc0) === 0x80) expected = 0;
+    if (expected === 0 || end - start < expected) end = start;
+  }
   buf = buf.subarray(0, end);
   return { text: buf.toString("utf8"), truncated: true };
 }
