@@ -389,19 +389,24 @@ export function readAgySessionModel(sessionId, home = os.homedir(), options) {
     const cached = agyModelCache.get(cacheKey);
     const hasKnownTranscript = options !== undefined && options.knownTranscriptModel !== undefined;
     const knownModel = hasKnownTranscript ? (options.knownTranscriptModel?.trim() || null) : null;
+    const dbPath = path.join(home, ".gemini", "antigravity-cli", "conversations", `${sessionId}.db`);
     // Fast path: AgyTranscriptReader already parsed a new MODEL_CHANGE_RE in-memory -> avoid disk & SQLite.
     if (hasKnownTranscript && knownModel && knownModel !== cached?.knownTranscriptModel) {
+        const mainDbMtimeFast = statMtimeMs(dbPath);
+        const walDbMtimeFast = statMtimeMs(`${dbPath}-wal`);
+        const fastDbMtimeMs = mainDbMtimeFast !== null && walDbMtimeFast !== null
+            ? Math.max(mainDbMtimeFast, walDbMtimeFast)
+            : (mainDbMtimeFast ?? walDbMtimeFast);
         const value = { model: knownModel, uncertain: false };
         agyModelCache.set(cacheKey, {
             value,
-            dbMtimeMs: cached?.dbMtimeMs ?? null,
+            dbMtimeMs: fastDbMtimeMs,
             transcriptMtimeMs: cached?.transcriptMtimeMs ?? null,
             knownTranscriptModel: knownModel,
             checkedAt: now,
         });
         return value;
     }
-    const dbPath = path.join(home, ".gemini", "antigravity-cli", "conversations", `${sessionId}.db`);
     // Enforce strict wall-clock throttle even when transcript.jsonl or DB mtime changes during streaming.
     // Only allow an immediate read within the throttle window when forced or when a DB appears for the first time.
     if (cached && !options?.force && now - cached.checkedAt < AGY_MODEL_CACHE_THROTTLE_MS) {

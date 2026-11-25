@@ -288,6 +288,9 @@ export async function main(argv: string[]): Promise<void> {
       const manager = new HostManager(host, {
         onLog: (m) => console.error(`[rp-host] ${m}`),
         onPaneClosed: (paneId) => bridge?.notifyPaneClosed(paneId),
+        onSpawn: (rec) => {
+          if (rec.backend === "herdr") void bridge?.triggerPoll();
+        },
       });
       const conn = new HostConnection({
         relayUrl: cfg.relayUrl,

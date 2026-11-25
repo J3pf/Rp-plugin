@@ -36,6 +36,7 @@ export class HostManager {
   private storeFile: string;
   private quotaCollector: QuotaCollector;
   private onPaneClosed?: (paneId: string) => void;
+  private onSpawn?: (rec: SpawnRecord) => void;
 
   constructor(
     private cfg: HostConfig,
@@ -46,6 +47,7 @@ export class HostManager {
       quotaCollector?: QuotaCollector;
       onLog?: (m: string) => void;
       onPaneClosed?: (paneId: string) => void;
+      onSpawn?: (rec: SpawnRecord) => void;
     } = {},
   ) {
     const run = opts.run ?? realRun;
@@ -53,6 +55,7 @@ export class HostManager {
     const deps = { run, platform, herdrSession: cfg.herdrSession };
     this.platform = platform;
     this.onPaneClosed = opts.onPaneClosed;
+    this.onSpawn = opts.onSpawn;
     this.backends = {
       herdr: new HerdrBackend(deps),
       tmux: new TmuxBackend(deps),
@@ -151,6 +154,7 @@ export class HostManager {
     this.records.set(spawnId, rec);
     this.trimRecords();
     this.save();
+    this.onSpawn?.(rec);
     return rec;
   }
 

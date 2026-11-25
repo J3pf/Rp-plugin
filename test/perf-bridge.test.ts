@@ -15,6 +15,7 @@ import {
 } from "../src/host/bridge/external-metadata.ts";
 import { readHerdrPanelSortMode } from "../src/host/bridge/herdr-discovery.ts";
 import { BridgedAgentSession, HerdrAgentBridge } from "../src/host/herdr-bridge.ts";
+import { HostManager } from "../src/host/manager.ts";
 import type { Envelope } from "../src/shared/protocol.ts";
 
 class FakeTransport implements Transport {
@@ -939,6 +940,97 @@ describe("S1 bridge performance & battery optimizations", () => {
       } finally {
         bridge.stop();
       }
+    });
+
+    it("HostManager onSpawn triggers immediate bridge poll wakeup when spawning via herdr", async () => {
+      const dir = mkTmp("on-spawn");
+      const storeFile = path.join(dir, "spawns.json");
+      let pollCalls = 0;
+      const bridge = new HerdrAgentBridge({
+        relayUrl: "ws://127.0.0.1:1",
+        machineId: "m1",
+        token: "tok",
+        cfg: { ...DEFAULT_CONFIG },
+        herdrSession: null,
+        stateFile: path.join(dir, "state.json"),
+        runner: async () => {
+          pollCalls++;
+          return { code: 0, stdout: JSON.stringify({ data: { agents: [] } }), stderr: "" };
+        },
+      });
+      const manager = new HostManager(
+        {
+          roots: [dir],
+          backend: "herdr",
+          herdrSession: "default",
+          launchers: { pi: "pi" },
+          defaultLauncher: "pi",
+          quotaEnabled: false,
+          quotaCommand: "piquota",
+          quotaIntervalSec: 300,
+        },
+        {
+          storeFile,
+          onSpawn: (rec) => {
+            if (rec.backend === "herdr") void bridge.triggerPoll();
+          },
+          run: async (bin, args) => {
+            if (bin === "herdr" && args[0] === "--version") return { code: 0, stdout: "herdr 1.0.0", stderr: "" };
+            if (bin === "herdr") {
+              return {
+                code: 0,
+                stdout: JSON.stringify({
+                  pane_id: "w1:p9",
+                  tab_id: "w1:t1",
+                  workspace_id: "w1",
+                  data: {
+                    workspaces: [{ id: "w1", name: "default" }],
+                    pane_id: "w1:p9",
+                    tab_id: "w1:t1",
+                  },
+                }),
+                stderr: "",
+              };
+            }
+            return { code: 1, stdout: "", stderr: "not found" };
+          },
+        },
+      );
+      try {
+        await manager.spawn({ cwd: dir, launcher: "pi", backend: "herdr" });
+        await new Promise((r) => setTimeout(r, 25));
+        expect(pollCalls).toBe(1);
+      } finally {
+        bridge.stop();
+      }
+    });
+
+    it("readAgySessionModel fast-path captures dbMtimeMs so cold-cache knownTranscriptModel is not reverted by stale DB", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-06-01T00:00:00Z"));
+      const home = mkTmp("agy-fast-db");
+      const convId = "bbbb2222-cccc-4ddd-8eee-ffffffff0001";
+      const convDir = path.join(home, ".gemini", "antigravity-cli", "conversations");
+      fs.mkdirSync(convDir, { recursive: true });
+      const dbPath = path.join(convDir, `${convId}.db`);
+      const db = new DatabaseSync(dbPath);
+      db.exec("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)");
+      db.prepare("INSERT INTO gen_metadata (idx, data) VALUES (1, ?)").run(Buffer.from("stale-old-model-v1"));
+      db.close();
+
+      // Call 1 (cold cache): transcript already observed a newer model
+      const r1 = readAgySessionModel(convId, home, { knownTranscriptModel: "gemini-3-pro" });
+      expect(r1.model).toBe("gemini-3-pro");
+
+      // Call 2 (900 ms later, inside 10 s throttle): must stay throttled and NOT revert to stale DB model
+      vi.advanceTimersByTime(900);
+      const r2 = readAgySessionModel(convId, home, { knownTranscriptModel: "gemini-3-pro" });
+      expect(r2.model).toBe("gemini-3-pro");
+
+      // Call 3 (11 s later, DB unchanged): still preserves knownTranscriptModel without opening SQLite
+      vi.advanceTimersByTime(11_000);
+      const r3 = readAgySessionModel(convId, home, { knownTranscriptModel: "gemini-3-pro" });
+      expect(r3.model).toBe("gemini-3-pro");
     });
   });
 });
