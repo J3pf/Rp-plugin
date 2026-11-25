@@ -2,7 +2,7 @@
 // Discovers non-Pi agents running in Herdr, bridges their transcripts/panes to Rp-relay,
 // delivers prompts/aborts via Herdr CLI, and serves PreToolUse permission gating for agy.
 import fs from "node:fs";
-import net from "node:net";
+import type net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Connection } from "../extension/connection.ts";
@@ -13,11 +13,10 @@ import { Broker } from "../extension/prompts/broker.ts";
 import { Classifier, promptContext } from "../extension/prompts/classify.ts";
 import { ALLOW, ALLOW_SESSION, DENY, DENY_REASON, allowKey, compilePatterns, decide } from "../extension/prompts/gate.ts";
 import { pluginVersion } from "../extension/version.ts";
-import { parseJson, pick } from "./backends/herdr.ts";
+import { parseJson } from "./backends/herdr.ts";
 import { run as realRun, type Runner } from "./runner.ts";
 import { AgyTranscriptReader, resolveAgyTranscriptPath, type ContextUsageInfo } from "./agy-transcript.ts";
 import { readGitHeadAndDirty } from "./git.ts";
-import { validatePaneId } from "./validate.ts";
 import {
   parseTerminalContextUsage,
   readExternalAgentContextUsage,
@@ -25,16 +24,25 @@ import {
   readExternalAgentModelWithState,
 } from "./bridge/external-metadata.ts";
 import {
-  AGY_GATE_SOCKET_TIMEOUT_MS,
-  GATE_MAX_LINE_BYTES,
+  AGY_GATE_PROMPT_TIMEOUT_MS,
   gateSocketPath,
   installAgyHooks,
-  probeUnixSocketAlive,
   runAgyHook,
   sanitizeIdPart,
-  signGatePayload,
-  verifyGateSignature,
+  type GateHookDecision,
 } from "./bridge/agy-hooks.ts";
+import { AgyGateServer, type GateSocketRequest } from "./bridge/gate-server.ts";
+import {
+  extractRecentCommandOutput,
+  herdrPriorityStatusRank,
+  mapHerdrAgentStatus,
+  parseHerdrAgentList,
+  readHerdrPanelSortMode,
+  sortHerdrAgentsForDisplay,
+  type HerdrAgentItem,
+  type HerdrDiscoveredAgent,
+  type HerdrPanelSortMode,
+} from "./bridge/herdr-discovery.ts";
 import { configDir } from "../shared/platform.ts";
 import {
   encodeHerdrTabId,
@@ -47,147 +55,27 @@ import {
   type UserMessageBody,
   type WelcomeBody,
 } from "../shared/protocol.ts";
-import { LruSet, SAFE_CONV_ID_RE, atomicWriteFileSync, errMsg, safeUser, stripAnsi, truncateBytes } from "../shared/util.ts";
+import { LruSet, atomicWriteFileSync, errMsg, safeUser, stripAnsi, truncateBytes } from "../shared/util.ts";
 
 export {
+  extractRecentCommandOutput,
   gateSocketPath,
+  herdrPriorityStatusRank,
   installAgyHooks,
+  mapHerdrAgentStatus,
+  parseHerdrAgentList,
   parseTerminalContextUsage,
   readExternalAgentContextUsage,
   readExternalAgentModel,
+  readHerdrPanelSortMode,
   runAgyHook,
+  sortHerdrAgentsForDisplay,
+  type HerdrAgentItem,
+  type HerdrDiscoveredAgent,
+  type HerdrPanelSortMode,
 };
 
-export type HerdrPanelSortMode = "priority" | "spaces";
-
-export interface HerdrDiscoveredAgent {
-  agent: string;
-  sessionId: string | null;
-  status: AgentStatus;
-  cwd: string;
-  paneId: string;
-  tabId: string | null;
-  workspaceId: string | null;
-  title: string | null;
-  stateChangeSeq: number;
-  orderIndex?: number;
-}
-
-const CONV_RE = /--conversation\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
 const OPTIMISTIC_WORKING_MS = 8_000;
-
-export function mapHerdrAgentStatus(rawStatus: string | null | undefined): AgentStatus {
-  switch (rawStatus) {
-    case "working":
-      return "working";
-    case "done":
-      return "done";
-    case "blocked":
-      return "waiting_input";
-    case "error":
-      return "error";
-    default:
-      return "idle";
-  }
-}
-
-export function herdrPriorityStatusRank(item: Pick<HerdrDiscoveredAgent, "status">): number {
-  switch (item.status) {
-    case "waiting_input":
-      return 4;
-    case "working":
-      return 3;
-    case "idle":
-    case "done":
-      return 2;
-    default:
-      return 1;
-  }
-}
-
-export function readHerdrPanelSortMode(env: NodeJS.ProcessEnv = process.env): HerdrPanelSortMode {
-  const cfgPath = env.HERDR_CONFIG_PATH || path.join(os.homedir(), ".config", "herdr", "config.toml");
-  try {
-    const text = fs.readFileSync(cfgPath, "utf8");
-    const m = /^\s*agent_panel_sort\s*=\s*["']?(priority|spaces|workspaces)["']?/m.exec(text);
-    if (m?.[1] === "spaces" || m?.[1] === "workspaces") return "spaces";
-    if (m?.[1] === "priority") return "priority";
-  } catch {
-    /* ignore missing config */
-  }
-  return "priority";
-}
-
-export function sortHerdrAgentsForDisplay(
-  agents: readonly HerdrDiscoveredAgent[],
-  mode: HerdrPanelSortMode,
-): HerdrDiscoveredAgent[] {
-  if (mode === "spaces") return [...agents];
-  return agents
-    .map((item, index) => ({ item, index }))
-    .sort((a, b) => {
-      const rankDiff = herdrPriorityStatusRank(b.item) - herdrPriorityStatusRank(a.item);
-      if (rankDiff !== 0) return rankDiff;
-      const seqDiff = (b.item.stateChangeSeq ?? 0) - (a.item.stateChangeSeq ?? 0);
-      if (seqDiff !== 0) return seqDiff;
-      return a.index - b.index;
-    })
-    .map((entry) => entry.item);
-}
-
-export function extractRecentCommandOutput(terminalText: string, commandText?: string): string {
-  if (!commandText) return terminalText;
-  const cmd = commandText.trim();
-  const idx = terminalText.lastIndexOf(cmd);
-  if (idx >= 0) {
-    const lineStart = terminalText.lastIndexOf("\n", idx);
-    const sliceStart = lineStart >= 0 ? lineStart + 1 : idx;
-    const snippet = terminalText.slice(sliceStart).trim();
-    if (snippet) return snippet;
-  }
-  return terminalText;
-}
-
-export function parseHerdrAgentList(stdout: string): HerdrDiscoveredAgent[] {
-  const json = parseJson(stdout);
-  const list: any[] = Array.isArray(json?.result?.agents)
-    ? json.result.agents
-    : Array.isArray(json?.agents)
-      ? json.agents
-      : [];
-  const out: HerdrDiscoveredAgent[] = [];
-  for (const item of list) {
-    if (!item || typeof item !== "object") continue;
-    const agent = pick(item, ["agent", "kind"]);
-    // Pi and gentle-shell sessions already connect via their native in-process Rp-plugin extension
-    if (!agent || agent === "pi" || agent === "gentle-shell") continue;
-    const paneId = pick(item, ["pane_id", "paneId"]);
-    if (!paneId || paneId.startsWith("-")) continue;
-    const title = pick(item, ["terminal_title_stripped", "terminal_title", "title"]);
-    let sessionId = pick(item, ["agent_session.value", "session_id"]);
-    if (!sessionId && title) {
-      const m = CONV_RE.exec(title);
-      if (m) sessionId = m[1]!;
-    }
-    if (sessionId && !SAFE_CONV_ID_RE.test(sessionId)) {
-      sessionId = null;
-    }
-    const cwd = pick(item, ["foreground_cwd", "cwd"]) ?? process.cwd();
-    const rawStatus = pick(item, ["agent_status", "status"]);
-    out.push({
-      agent,
-      sessionId,
-      status: mapHerdrAgentStatus(rawStatus),
-      cwd,
-      paneId,
-      tabId: pick(item, ["tab_id", "tabId"]),
-      workspaceId: pick(item, ["workspace_id", "workspaceId"]),
-      title,
-      stateChangeSeq: typeof item.state_change_seq === "number" ? item.state_change_seq : 0,
-    });
-  }
-  return out;
-}
 
 interface BridgedSessionDeps {
   relayUrl: string;
@@ -574,6 +462,54 @@ export class BridgedAgentSession {
     for (const p of pendingAnswers(w)) this.broker.handleAnswer(p.promptId, p.answer);
   }
 
+  private sendSnapshotBody(direct: boolean, body: Record<string, unknown>): void {
+    if (direct) {
+      this.conn.dropQueuedEventsUpTo(this.seq);
+      this.conn.sendDirect("agent.snapshot", { ...body, seq: this.seq });
+    } else {
+      this.conn.send("agent.snapshot", body);
+    }
+  }
+
+  private emitSnapshotFollowupEvents(
+    direct: boolean,
+    events: Record<string, unknown>[],
+    entries: { kind: string; msg?: unknown }[],
+  ): void {
+    if (!this.transcriptReader) return;
+    const snapshotToolIds = collectSnapshotToolCallIds(entries);
+    const emittedUpdateToolIds = new Set<string>();
+
+    if (direct) {
+      for (const sub of this.dedupeSubagentUpdates(events, this.transcriptReader.getSubagents(), snapshotToolIds)) {
+        this.sendEvent(sub);
+      }
+    } else {
+      const emittedSubIds = new Set<string>();
+      for (const ev of events) {
+        if (ev.type === "subagent_update" && typeof ev.taskId === "string") {
+          if (ev.status !== "running" && !snapshotToolIds.has(ev.taskId)) continue;
+          emittedSubIds.add(ev.taskId);
+        } else if (ev.type === "tool_execution_update" && typeof ev.toolCallId === "string") {
+          emittedUpdateToolIds.add(ev.toolCallId);
+        }
+        this.sendEvent(ev);
+      }
+      for (const sub of this.transcriptReader.getSubagents()) {
+        if (emittedSubIds.has(sub.taskId)) continue;
+        if (sub.status === "running" || snapshotToolIds.has(sub.taskId)) {
+          this.sendEvent(sub as unknown as Record<string, unknown>);
+        }
+      }
+    }
+
+    for (const upd of this.transcriptReader.getRunningBackgroundUpdates(snapshotToolIds)) {
+      const toolId = upd.toolCallId;
+      if (typeof toolId === "string" && emittedUpdateToolIds.has(toolId)) continue;
+      this.sendEvent(upd);
+    }
+  }
+
   private sendSnapshot(direct: boolean): void {
     this.initialSnapshotSent = true;
     if (this.transcriptReader) {
@@ -586,58 +522,18 @@ export class BridgedAgentSession {
         lastActivityAt = this.transcriptReader.getLastActivityAt();
       } catch (e) {
         this.d.onLog?.(`sendSnapshot transcript read error: ${errMsg(e)}`);
-        const emptyBody = { epoch: this.epoch, seq: this.seq, entries: [], truncated: false };
-        if (direct) {
-          this.conn.dropQueuedEventsUpTo(this.seq);
-          this.conn.sendDirect("agent.snapshot", { ...emptyBody, seq: this.seq });
-        } else {
-          this.conn.send("agent.snapshot", emptyBody);
-        }
+        this.sendSnapshotBody(direct, { epoch: this.epoch, seq: this.seq, entries: [], truncated: false });
         return;
       }
       const { entries, truncated, events } = snap;
-      const body = {
+      this.sendSnapshotBody(direct, {
         epoch: this.epoch,
         seq: this.seq,
         entries,
         truncated,
         ...(lastActivityAt ? { lastActivityAt } : {}),
-      };
-      const snapshotToolIds = collectSnapshotToolCallIds(entries);
-      const emittedUpdateToolIds = new Set<string>();
-      if (direct) {
-        this.conn.dropQueuedEventsUpTo(this.seq);
-        this.conn.sendDirect("agent.snapshot", { ...body, seq: this.seq });
-        for (const sub of this.dedupeSubagentUpdates(events, this.transcriptReader.getSubagents(), snapshotToolIds)) {
-          this.sendEvent(sub);
-        }
-        for (const upd of this.transcriptReader.getRunningBackgroundUpdates(snapshotToolIds)) {
-          this.sendEvent(upd);
-        }
-      } else {
-        this.conn.send("agent.snapshot", body);
-        const emittedSubIds = new Set<string>();
-        for (const ev of events) {
-          if (ev.type === "subagent_update" && typeof ev.taskId === "string") {
-            if (ev.status !== "running" && !snapshotToolIds.has(ev.taskId)) continue;
-            emittedSubIds.add(ev.taskId);
-          } else if (ev.type === "tool_execution_update" && typeof ev.toolCallId === "string") {
-            emittedUpdateToolIds.add(ev.toolCallId);
-          }
-          this.sendEvent(ev);
-        }
-        for (const sub of this.transcriptReader.getSubagents()) {
-          if (emittedSubIds.has(sub.taskId)) continue;
-          if (sub.status === "running" || snapshotToolIds.has(sub.taskId)) {
-            this.sendEvent(sub as unknown as Record<string, unknown>);
-          }
-        }
-        for (const upd of this.transcriptReader.getRunningBackgroundUpdates(snapshotToolIds)) {
-          const toolId = upd.toolCallId;
-          if (typeof toolId === "string" && emittedUpdateToolIds.has(toolId)) continue;
-          this.sendEvent(upd);
-        }
-      }
+      });
+      this.emitSnapshotFollowupEvents(direct, events, entries);
       if (!hadRunning && this.hasRunningTranscriptWork()) {
         this.scheduleNextPoll();
       }
@@ -645,7 +541,7 @@ export class BridgedAgentSession {
       return;
     }
     const entryAt = this.lastTerminalSnapshotTs || null;
-    const body = {
+    this.sendSnapshotBody(direct, {
       epoch: this.epoch,
       seq: this.seq,
       entries:
@@ -665,13 +561,7 @@ export class BridgedAgentSession {
           : [],
       truncated: false,
       ...(entryAt ? { lastActivityAt: entryAt } : {}),
-    };
-    if (direct) {
-      this.conn.dropQueuedEventsUpTo(this.seq);
-      this.conn.sendDirect("agent.snapshot", { ...body, seq: this.seq });
-    } else {
-      this.conn.send("agent.snapshot", body);
-    }
+    });
   }
 
   private sendEvent(e: Record<string, unknown>): void {
@@ -1038,15 +928,10 @@ export class BridgedAgentSession {
         try {
           if (this.transcriptReader) {
             const prevOffset = this.transcriptReader.byteOffset;
-            const events = this.transcriptReader.pollNewEvents();
-            const offsetAdvanced = this.transcriptReader.byteOffset !== prevOffset;
-            if (events.length > 0) {
-              for (const ev of events) this.sendEvent(ev);
-            }
-            if (offsetAdvanced || events.length > 0) {
-              this.syncSessionNameIfChanged();
-              this.syncContextIfChanged();
-              this.syncModelIfChanged();
+            const prevSeq = this.seq;
+            await this.pollTranscriptNow();
+            if (this.disposed) return;
+            if (this.transcriptReader.byteOffset !== prevOffset || this.seq !== prevSeq) {
               return;
             }
           }
@@ -1086,7 +971,7 @@ export class BridgedAgentSession {
     danger: "low" | "medium" | "high";
     key: string;
     signal: AbortSignal;
-  }): Promise<{ decision: "allow" | "deny" | "ask"; reason?: string }> {
+  }): Promise<GateHookDecision> {
     if (this.disposed) return { decision: "ask", reason: "RP: sesión cerrada; confirmar en terminal" };
     if (this.allowed.has(req.key)) return { decision: "allow" };
     if (!this.conn.connected && !(await this.conn.whenConnected(this.d.cfg.gate.approverWaitMs))) {
@@ -1111,7 +996,7 @@ export class BridgedAgentSession {
               kind: "select",
               title,
               options: [ALLOW, ALLOW_SESSION, DENY, DENY_REASON],
-              opts: { timeout: 270_000, signal: req.signal },
+              opts: { timeout: AGY_GATE_PROMPT_TIMEOUT_MS, signal: req.signal },
             },
             null,
           ),
@@ -1251,19 +1136,21 @@ export class HerdrAgentBridge {
   private pollTimer: NodeJS.Timeout | null = null;
   private pollPromise: Promise<void> | null = null;
   private stopped = false;
-  private gateServer: net.Server | null = null;
-  private ownsGateSocket = false;
-  private gateSocketIno: number | null = null;
   private herdrListFailing = false;
-  private clientSockets = new Set<net.Socket>();
+  private gate: AgyGateServer;
   private runner: Runner;
-  private sockPath: string;
   private stateFile: string | null;
   private lastSavedSessionsJson = "";
 
   constructor(private o: HerdrBridgeOptions) {
     this.runner = o.runner ?? realRun;
-    this.sockPath = o.socketPath ?? gateSocketPath();
+    const sockPath = o.socketPath ?? gateSocketPath();
+    this.gate = new AgyGateServer({
+      sockPath,
+      token: o.token,
+      onRequest: (req, signal) => this.handleGateApprovalRequest(req, signal),
+      onLog: o.onLog,
+    });
     this.stateFile =
       o.stateFile !== undefined
         ? o.stateFile
@@ -1271,6 +1158,14 @@ export class HerdrAgentBridge {
           ? null
           : path.join(configDir(), "herdr-active-sessions.json");
     this.loadPersistedSessions();
+  }
+
+  private get gateServer(): net.Server | null {
+    return this.gate.server;
+  }
+
+  private get ownsGateSocket(): boolean {
+    return this.gate.ownsSocket;
   }
 
   private loadPersistedSessions(): void {
@@ -1342,7 +1237,7 @@ export class HerdrAgentBridge {
   }
 
   start(): void {
-    this.startGateServer();
+    this.gate.start();
     void this.poll().finally(() => this.scheduleNextBridgePoll());
   }
 
@@ -1350,36 +1245,7 @@ export class HerdrAgentBridge {
     this.stopped = true;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = null;
-    if (this.gateServer) {
-      try {
-        this.gateServer.close();
-      } catch {
-        /* ignore */
-      }
-      this.gateServer = null;
-    }
-    for (const socket of this.clientSockets) {
-      try {
-        socket.destroy();
-      } catch {
-        /* ignore */
-      }
-    }
-    this.clientSockets.clear();
-    const shouldUnlink = this.ownsGateSocket && this.gateSocketIno !== null;
-    const expectedIno = this.gateSocketIno;
-    this.ownsGateSocket = false;
-    this.gateSocketIno = null;
-    if (process.platform !== "win32" && shouldUnlink) {
-      try {
-        const st = fs.lstatSync(this.sockPath);
-        if (st.ino === expectedIno) {
-          fs.unlinkSync(this.sockPath);
-        }
-      } catch {
-        /* ignore */
-      }
-    }
+    this.gate.stop();
     for (const s of this.sessionsByKey.values()) s.stop();
     this.sessionsByKey.clear();
     for (const s of this.retiringOrphans) s.stop();
@@ -1546,156 +1412,11 @@ export class HerdrAgentBridge {
     }
   }
 
-  private bindGateServer(): void {
-    if (this.stopped) return;
-    const server = net.createServer((socket) => {
-      this.clientSockets.add(socket);
-      socket.setEncoding("utf8");
-      const ac = new AbortController();
-      socket.setTimeout(AGY_GATE_SOCKET_TIMEOUT_MS, () => socket.destroy());
-      socket.on("close", () => {
-        this.clientSockets.delete(socket);
-        ac.abort();
-      });
-      socket.on("error", () => {
-        this.clientSockets.delete(socket);
-        ac.abort();
-      });
-
-      let buf = "";
-      let handled = false;
-      const sendResponse = (resp: Record<string, unknown>) => {
-        if (socket.destroyed || socket.writableEnded) return;
-        try {
-          socket.end(JSON.stringify(resp) + "\n");
-        } catch {
-          try {
-            socket.destroy();
-          } catch {
-            /* ignore */
-          }
-        }
-      };
-      socket.on("data", (chunk: string) => {
-        if (handled) return;
-        if (buf.length + chunk.length > GATE_MAX_LINE_BYTES) {
-          handled = true;
-          socket.destroy();
-          return;
-        }
-        buf += chunk;
-        const nl = buf.indexOf("\n");
-        if (nl < 0) return;
-        handled = true;
-        const line = buf.slice(0, nl).trim();
-        buf = "";
-        void this.handleGateSocketRequest(line, ac.signal)
-          .then((resp) => sendResponse(resp))
-          .catch((e) => {
-            this.o.onLog?.(`gate request error: ${errMsg(e)}`);
-            sendResponse({ decision: "ask", reason: "RP: error interno en gate; confirmar en terminal" });
-          });
-      });
-    });
-    server.maxConnections = 64;
-    server.on("error", (e) => this.o.onLog?.(`gate socket error: ${errMsg(e)}`));
-    server.listen(this.sockPath, () => {
-      if (this.stopped) {
-        try {
-          server.close();
-        } catch {
-          /* ignore */
-        }
-        return;
-      }
-      this.ownsGateSocket = true;
-      if (process.platform !== "win32") {
-        try {
-          fs.chmodSync(this.sockPath, 0o600);
-        } catch {
-          /* ignore */
-        }
-        try {
-          this.gateSocketIno = fs.lstatSync(this.sockPath).ino;
-        } catch {
-          this.gateSocketIno = null;
-        }
-      }
-    });
-    server.unref?.();
-    this.gateServer = server;
-  }
-
-  private startGateServer(): void {
-    try {
-      if (process.platform !== "win32") {
-        const sockDir = path.dirname(this.sockPath);
-        fs.mkdirSync(sockDir, { recursive: true, mode: 0o700 });
-        try {
-          fs.chmodSync(sockDir, 0o700);
-        } catch {
-          /* ignore */
-        }
-        if (fs.existsSync(this.sockPath)) {
-          void probeUnixSocketAlive(this.sockPath).then((alive) => {
-            if (this.stopped) return;
-            if (alive) {
-              this.o.onLog?.(`gate socket already held by another live process: ${this.sockPath}`);
-              return;
-            }
-            try {
-              fs.rmSync(this.sockPath, { force: true });
-            } catch {
-              /* ignore */
-            }
-            this.bindGateServer();
-          });
-          return;
-        }
-      }
-      this.bindGateServer();
-    } catch (e) {
-      this.o.onLog?.(`failed to start gate socket: ${errMsg(e)}`);
-    }
-  }
-
-  private signGateResponse(
-    resp: { decision: "allow" | "deny" | "ask"; reason?: string },
-    nonce: string,
-  ): { decision: "allow" | "deny" | "ask"; reason?: string; sig?: string } {
-    const sig = signGatePayload(this.o.token, ["res", resp.decision, resp.reason ?? "", nonce]);
-    return sig ? { ...resp, sig } : resp;
-  }
-
-  private async handleGateSocketRequest(
-    rawLine: string,
+  private async handleGateApprovalRequest(
+    req: GateSocketRequest,
     signal: AbortSignal,
-  ): Promise<{ decision: "allow" | "deny" | "ask"; reason?: string; sig?: string }> {
-    let req: any;
-    try {
-      req = JSON.parse(rawLine);
-    } catch {
-      return { decision: "ask", reason: "RP: solicitud de autorización inválida (JSON malformado)" };
-    }
-    const nonce = typeof req?.nonce === "string" ? req.nonce : "";
-    const conversationId = typeof req?.conversationId === "string" ? req.conversationId : "";
-    const command = typeof req?.command === "string" ? req.command : "";
-    const rawPaneId = typeof req?.paneId === "string" ? req.paneId : "";
-    if (!verifyGateSignature(this.o.token, ["req", conversationId, rawPaneId, command, nonce], req?.sig)) {
-      return { decision: "ask", reason: "RP: solicitud de gate no autenticada; confirmar en terminal" };
-    }
-    let paneId = "";
-    if (rawPaneId) {
-      try {
-        paneId = validatePaneId(rawPaneId);
-      } catch {
-        paneId = "";
-      }
-    }
-    if (!conversationId || !SAFE_CONV_ID_RE.test(conversationId) || !command) {
-      return this.signGateResponse({ decision: "ask", reason: "RP: solicitud de autorización incompleta" }, nonce);
-    }
-
+  ): Promise<GateHookDecision> {
+    const { conversationId, paneId, command } = req;
     const key = sanitizeIdPart(conversationId);
     let session = this.sessionsByKey.get(key);
     if (!session && paneId) {
@@ -1707,7 +1428,10 @@ export class HerdrAgentBridge {
       }
     }
     if (!session) {
-      const cwd = Array.isArray(req.workspacePaths) && typeof req.workspacePaths[0] === "string" ? req.workspacePaths[0] : process.cwd();
+      const cwd =
+        Array.isArray(req.workspacePaths) && typeof req.workspacePaths[0] === "string"
+          ? req.workspacePaths[0]
+          : process.cwd();
       session = new BridgedAgentSession(
         {
           agent: "agy",
@@ -1751,21 +1475,13 @@ export class HerdrAgentBridge {
     const serverDanger = dec.danger === "high" || req.danger === "high" ? "high" : req.danger === "medium" || dec.danger === "medium" ? "medium" : "high";
     const serverKey = serverDanger === "high" ? `bash:${command.trim()}` : allowKey("bash", { command });
 
-    try {
-      const decision = await session.requestGateApproval({
-        toolName: "bash",
-        command,
-        danger: serverDanger,
-        key: serverKey,
-        signal,
-      });
-      return this.signGateResponse(decision, nonce);
-    } catch (e) {
-      return this.signGateResponse(
-        { decision: "ask", reason: `RP: error procesando autorización (${errMsg(e)}); confirmar en terminal` },
-        nonce,
-      );
-    }
+    return session.requestGateApproval({
+      toolName: "bash",
+      command,
+      danger: serverDanger,
+      key: serverKey,
+      signal,
+    });
   }
 }
 

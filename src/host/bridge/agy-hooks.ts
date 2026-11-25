@@ -8,10 +8,11 @@ import type { RpConfig } from "../../extension/config.ts";
 import { compilePatterns, decide } from "../../extension/prompts/gate.ts";
 import { configDir } from "../../shared/platform.ts";
 import { atomicWriteFileSync, safeUser } from "../../shared/util.ts";
-import { parseAgyArgs } from "../agy-transcript.ts";
+import { parseAgyArgs } from "./agy-normalize.ts";
 
 export const AGY_GATE_SOCKET_TIMEOUT_MS = 300_000;
 export const AGY_HOOK_CLIENT_TIMEOUT_MS = 280_000;
+export const AGY_GATE_PROMPT_TIMEOUT_MS = AGY_HOOK_CLIENT_TIMEOUT_MS - 10_000;
 export const AGY_HOOK_CONFIG_TIMEOUT_SEC = 300;
 export const GATE_MAX_LINE_BYTES = 256 * 1024;
 
