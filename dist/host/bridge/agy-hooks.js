@@ -7,9 +7,10 @@ import path from "node:path";
 import { compilePatterns, decide } from "../../extension/prompts/gate.js";
 import { configDir } from "../../shared/platform.js";
 import { atomicWriteFileSync, safeUser } from "../../shared/util.js";
-import { parseAgyArgs } from "../agy-transcript.js";
+import { parseAgyArgs } from "./agy-normalize.js";
 export const AGY_GATE_SOCKET_TIMEOUT_MS = 300_000;
 export const AGY_HOOK_CLIENT_TIMEOUT_MS = 280_000;
+export const AGY_GATE_PROMPT_TIMEOUT_MS = AGY_HOOK_CLIENT_TIMEOUT_MS - 10_000;
 export const AGY_HOOK_CONFIG_TIMEOUT_SEC = 300;
 export const GATE_MAX_LINE_BYTES = 256 * 1024;
 export function sanitizeIdPart(raw) {

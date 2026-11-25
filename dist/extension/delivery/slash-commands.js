@@ -1,4 +1,30 @@
 export const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+async function applyModelSelection(pi, ctx, model) {
+    try {
+        const ok = await pi.setModel(model);
+        if (ok) {
+            ctx.ui?.notify?.(`Modelo cambiado a ${model.provider}/${model.id}`, "info");
+        }
+        else {
+            ctx.ui?.notify?.(`No se pudo cambiar al modelo ${model.provider}/${model.id}. Verifique la API key o configuración.`, "warning");
+        }
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.ui?.notify?.(`Error al cambiar de modelo: ${message}`, "warning");
+    }
+}
+function applyThinkingLevel(pi, ctx, level, opts) {
+    try {
+        pi.setThinkingLevel(level);
+        opts?.onThinkingSelected?.(level);
+        ctx.ui?.notify?.(`Nivel de thinking establecido en ${level}`, "info");
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${message}`, "warning");
+    }
+}
 export async function handleModelCommand(pi, ctx, rawArg, opts) {
     const query = rawArg.trim();
     const registry = ctx.modelRegistry;
@@ -31,19 +57,7 @@ export async function handleModelCommand(pi, ctx, rawArg, opts) {
             ctx.ui?.notify?.(`El modelo "${query}" no existe en el catálogo o configuración.`, "warning");
             return;
         }
-        try {
-            const ok = await pi.setModel(model);
-            if (ok) {
-                ctx.ui?.notify?.(`Modelo cambiado a ${model.provider}/${model.id}`, "info");
-            }
-            else {
-                ctx.ui?.notify?.(`No se pudo cambiar al modelo ${model.provider}/${model.id}. Verifique la API key o configuración.`, "warning");
-            }
-        }
-        catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            ctx.ui?.notify?.(`Error al cambiar de modelo: ${message}`, "warning");
-        }
+        await applyModelSelection(pi, ctx, model);
         return;
     }
     let available = [];
@@ -82,19 +96,7 @@ export async function handleModelCommand(pi, ctx, rawArg, opts) {
         const selectedModel = available.find((m) => `${m.provider}/${m.id}` === selected || m.id === selected);
         if (!selectedModel)
             return;
-        try {
-            const ok = await pi.setModel(selectedModel);
-            if (ok) {
-                ctx.ui?.notify?.(`Modelo cambiado a ${selectedModel.provider}/${selectedModel.id}`, "info");
-            }
-            else {
-                ctx.ui?.notify?.(`No se pudo cambiar al modelo ${selectedModel.provider}/${selectedModel.id}. Verifique la API key o configuración.`, "warning");
-            }
-        }
-        catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            ctx.ui?.notify?.(`Error al cambiar de modelo: ${message}`, "warning");
-        }
+        await applyModelSelection(pi, ctx, selectedModel);
     })();
     if (opts?.onBackground) {
         opts.onBackground(interactiveFlow);
@@ -107,15 +109,7 @@ export async function handleThinkingCommand(pi, ctx, rawArg, opts) {
     if (query) {
         const normalized = query.toLowerCase();
         if (VALID_THINKING_LEVELS.includes(normalized)) {
-            try {
-                pi.setThinkingLevel(normalized);
-                opts?.onThinkingSelected?.(normalized);
-                ctx.ui?.notify?.(`Nivel de thinking establecido en ${normalized}`, "info");
-            }
-            catch (err) {
-                const message = err instanceof Error ? err.message : String(err);
-                ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${message}`, "warning");
-            }
+            applyThinkingLevel(pi, ctx, normalized, opts);
         }
         else {
             ctx.ui?.notify?.(`Nivel de thinking inválido: "${query}". Niveles válidos: ${VALID_THINKING_LEVELS.join(", ")}`, "warning");
@@ -137,15 +131,7 @@ export async function handleThinkingCommand(pi, ctx, rawArg, opts) {
             return;
         const normalized = selected.trim().toLowerCase();
         if (VALID_THINKING_LEVELS.includes(normalized)) {
-            try {
-                pi.setThinkingLevel(normalized);
-                opts?.onThinkingSelected?.(normalized);
-                ctx.ui?.notify?.(`Nivel de thinking establecido en ${normalized}`, "info");
-            }
-            catch (err) {
-                const message = err instanceof Error ? err.message : String(err);
-                ctx.ui?.notify?.(`Error al cambiar el nivel de thinking: ${message}`, "warning");
-            }
+            applyThinkingLevel(pi, ctx, normalized, opts);
         }
     })();
     if (opts?.onBackground) {

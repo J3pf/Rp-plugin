@@ -80,6 +80,12 @@ export function listDirs(cfg: HostConfig, requested: string): { path: string; di
   return { path: real, dirs };
 }
 
+/** Returns true when a parsed launcher command targets an external CLI (Claude Code, Codex, or Agy) rather than Pi. */
+export function isExternalCliLauncher(parts: readonly string[]): boolean {
+  const bin = path.basename(parts[0] ?? "").replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
+  return bin === "claude" || bin === "codex" || bin === "agy";
+}
+
 /** The phone sends a launcher *key*, never a command. */
 export function resolveLauncher(cfg: HostConfig, key: string | undefined): { key: string; command: string } {
   const k = key ?? cfg.defaultLauncher;

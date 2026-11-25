@@ -2,13 +2,30 @@
 import WebSocket from "ws";
 import { CLOSE, CRITICAL_TYPES, MAX_FRAME_BYTES, envelope, newId, parseEnvelope } from "../shared/protocol.js";
 import { backoffDelay, errMsg } from "../shared/util.js";
-import { WsKeepalive, getProxyAgent, httpRequest, toHttpUrl, toWsUrl } from "../shared/http.js";
-const MAX_LONGPOLL_OUTBOX_MESSAGES = 500;
-const MAX_LONGPOLL_OUTBOX_BYTES = 2 * 1024 * 1024;
-const MAX_LONGPOLL_BATCH_MESSAGES = 50;
-const MAX_LONGPOLL_BATCH_BYTES = 750 * 1024;
-const LONGPOLL_TIMEOUT_MS = 25_000;
+import { WsKeepalive, createRelayWebSocket, httpRequest, isFatalCloseCode, toHttpUrl, toWsUrl } from "../shared/http.js";
+const WS_KEEPALIVE_WATCHDOG_MS = 45_000;
+const WS_KEEPALIVE_PING_INTERVAL_MS = 20_000;
+const WS_BACKPRESSURE_LIMIT_BYTES = 1_000_000;
+const WS_CRITICAL_BACKPRESSURE_LIMIT_BYTES = 4 * MAX_FRAME_BYTES;
+const WS_CLOSE_TERMINATE_FALLBACK_MS = 500;
+const LONG_POLL_OUTBOX_MAX_MESSAGES = 500;
+const LONG_POLL_OUTBOX_MAX_BYTES = 2 * 1024 * 1024;
+const LONG_POLL_BATCH_SIZE = 50;
+const LONG_POLL_BATCH_BYTES = 750 * 1024;
+const LONG_POLL_TIMEOUT_MS = 25_000;
+const LONG_POLL_HTTP_TIMEOUT_MS = 35_000;
+const LONG_POLL_SEND_TIMEOUT_MS = 20_000;
+const LONG_POLL_FAST_POLL_THRESHOLD_MS = 500;
+const LONG_POLL_FAST_POLL_BASE_BACKOFF_MS = 100;
+const LONG_POLL_FAST_POLL_MAX_BACKOFF_MS = 5_000;
 const DEFAULT_STABILITY_WINDOW_MS = 5_000;
+const DEFAULT_MAX_QUEUE_MESSAGES = 500;
+const DEFAULT_MAX_QUEUE_BYTES = 2 * 1024 * 1024;
+const DEFAULT_WS_FAILURES_BEFORE_LONG_POLL = 3;
+const DEFAULT_WS_RETRY_MS = 15_000;
+const WS_RETRY_BUSY_DEFER_MS = 250;
+const SERVICE_RESTART_MIN_DELAY_MS = 250;
+const SERVICE_RESTART_JITTER_RANGE_MS = 1_251;
 function sleepUnref(ms, signal) {
     return new Promise((resolve) => {
         if (signal?.aborted)
@@ -32,7 +49,7 @@ export class WsTransport {
     opened = false;
     closed = false;
     /** The relay pings every 25 s, client pings every 20 s; silence beyond 45 s means a dead socket. */
-    keepalive = new WsKeepalive(45_000, 20_000);
+    keepalive = new WsKeepalive(WS_KEEPALIVE_WATCHDOG_MS, WS_KEEPALIVE_PING_INTERVAL_MS);
     constructor(url, token, h) {
         this.url = url;
         this.token = token;
@@ -42,27 +59,22 @@ export class WsTransport {
         void this.connect();
     }
     async connect() {
-        const agent = await getProxyAgent();
-        if (this.closed)
-            return;
         let ws;
         try {
-            ws = new WebSocket(this.url, {
-                headers: { Authorization: `Bearer ${this.token}` },
-                agent,
-                maxPayload: MAX_FRAME_BYTES,
-                handshakeTimeout: 10_000,
-                perMessageDeflate: {
-                    threshold: 1024,
-                    clientNoContextTakeover: true,
-                    serverNoContextTakeover: true,
-                },
+            ws = await createRelayWebSocket(this.url, this.token, {
+                keepalive: this.keepalive,
+                isCancelled: () => this.closed,
+                isStale: (sock) => this.ws !== sock,
             });
         }
         catch (e) {
+            if (this.closed)
+                return;
             this.h.onClose({ code: 1006, reason: errMsg(e), opened: false, unsent: [] });
             return;
         }
+        if (!ws)
+            return;
         this.ws = ws;
         ws.on("open", () => {
             if (this.closed || this.ws !== ws) {
@@ -77,13 +89,9 @@ export class WsTransport {
             this.opened = true;
             // RP must never keep Pi alive: an open socket alone does not hold the event loop
             ws._socket?.unref?.();
-            this.keepalive.start(ws, WebSocket.OPEN);
             this.h.onOpen();
         });
-        ws.on("ping", () => this.keepalive.arm(ws));
-        ws.on("pong", () => this.keepalive.arm(ws));
         ws.on("message", (data) => {
-            this.keepalive.arm(ws);
             const env = parseEnvelope(data.toString("utf8"));
             if (env)
                 this.h.onMessage(env);
@@ -117,9 +125,9 @@ export class WsTransport {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN)
             return false;
         // backpressure: drop non-critical frames when the socket buffer is saturated, and cap critical frames at 4x MAX_FRAME_BYTES
-        if (this.ws.bufferedAmount > 4 * MAX_FRAME_BYTES)
+        if (this.ws.bufferedAmount > WS_CRITICAL_BACKPRESSURE_LIMIT_BYTES)
             return false;
-        if (this.ws.bufferedAmount > 1_000_000 && !CRITICAL_TYPES.has(env.t))
+        if (this.ws.bufferedAmount > WS_BACKPRESSURE_LIMIT_BYTES && !CRITICAL_TYPES.has(env.t))
             return false;
         try {
             const payload = JSON.stringify(env);
@@ -138,7 +146,7 @@ export class WsTransport {
         try {
             this.ws?.close(1000);
             const ws = this.ws;
-            setTimeout(() => ws?.terminate(), 500).unref?.();
+            setTimeout(() => ws?.terminate(), WS_CLOSE_TERMINATE_FALLBACK_MS).unref?.();
         }
         catch {
             /* ignore */
@@ -222,9 +230,9 @@ export class LongPollTransport {
                     body: {
                         agentId: this.ids.agentId,
                         instance: this.ids.instance,
-                        timeout: LONGPOLL_TIMEOUT_MS,
+                        timeout: LONG_POLL_TIMEOUT_MS,
                     },
-                    timeoutMs: 35_000,
+                    timeoutMs: LONG_POLL_HTTP_TIMEOUT_MS,
                     signal: this.ac.signal,
                 });
                 if (this.closed)
@@ -243,9 +251,9 @@ export class LongPollTransport {
                     if (env)
                         this.h.onMessage(env);
                 }
-                if (list.length === 0 && Date.now() - t0 < 500) {
+                if (list.length === 0 && Date.now() - t0 < LONG_POLL_FAST_POLL_THRESHOLD_MS) {
                     fastEmptyPolls++;
-                    const waitMs = Math.min(5_000, 100 * 2 ** Math.min(fastEmptyPolls - 1, 6));
+                    const waitMs = Math.min(LONG_POLL_FAST_POLL_MAX_BACKOFF_MS, LONG_POLL_FAST_POLL_BASE_BACKOFF_MS * 2 ** Math.min(fastEmptyPolls - 1, 6));
                     await sleepUnref(waitMs, this.ac.signal);
                 }
                 else {
@@ -264,7 +272,7 @@ export class LongPollTransport {
         const bytes = Buffer.byteLength(JSON.stringify(env), "utf8");
         if (bytes > MAX_FRAME_BYTES)
             return false;
-        if (this.outbox.length >= MAX_LONGPOLL_OUTBOX_MESSAGES || this.outboxBytes + bytes > MAX_LONGPOLL_OUTBOX_BYTES) {
+        if (this.outbox.length >= LONG_POLL_OUTBOX_MAX_MESSAGES || this.outboxBytes + bytes > LONG_POLL_OUTBOX_MAX_BYTES) {
             return false;
         }
         this.outbox.push({ env, bytes });
@@ -286,10 +294,10 @@ export class LongPollTransport {
             while (this.outbox.length && !this.closed) {
                 const batch = [];
                 let batchBytes = 2; // []
-                while (this.outbox.length && batch.length < MAX_LONGPOLL_BATCH_MESSAGES) {
+                while (this.outbox.length && batch.length < LONG_POLL_BATCH_SIZE) {
                     const next = this.outbox[0];
                     const extra = next.bytes + (batch.length > 0 ? 1 : 0);
-                    if (batch.length > 0 && batchBytes + extra > MAX_LONGPOLL_BATCH_BYTES)
+                    if (batch.length > 0 && batchBytes + extra > LONG_POLL_BATCH_BYTES)
                         break;
                     this.outbox.shift();
                     this.outboxBytes = Math.max(0, this.outboxBytes - next.bytes);
@@ -302,7 +310,7 @@ export class LongPollTransport {
                         method: "POST",
                         headers: this.headers(),
                         body: batch.map((item) => item.env),
-                        timeoutMs: 20_000,
+                        timeoutMs: LONG_POLL_SEND_TIMEOUT_MS,
                         signal: this.ac.signal,
                     });
                     if (res.status < 200 || res.status >= 300) {
@@ -371,8 +379,8 @@ export class Connection {
     maxBytes;
     constructor(o) {
         this.o = o;
-        this.maxMsgs = o.maxQueueMessages ?? 500;
-        this.maxBytes = o.maxQueueBytes ?? 2 * 1024 * 1024;
+        this.maxMsgs = o.maxQueueMessages ?? DEFAULT_MAX_QUEUE_MESSAGES;
+        this.maxBytes = o.maxQueueBytes ?? DEFAULT_MAX_QUEUE_BYTES;
     }
     get connected() {
         return this.state === "connected" && this.welcomed;
@@ -538,7 +546,7 @@ export class Connection {
         if (this.stopped)
             return;
         const { code } = info;
-        if (code === CLOSE.INVALID_TOKEN || code === CLOSE.INCOMPATIBLE || code === CLOSE.REPLACED) {
+        if (isFatalCloseCode(code)) {
             this.stopped = true;
             if (this.reconnectTimer)
                 clearTimeout(this.reconnectTimer);
@@ -563,7 +571,7 @@ export class Connection {
                 this.forceLongPoll = true;
                 this.scheduleWsRetry();
             }
-            else if (this.wsFailures >= (this.o.wsFailuresBeforeLongPoll ?? 3)) {
+            else if (this.wsFailures >= (this.o.wsFailuresBeforeLongPoll ?? DEFAULT_WS_FAILURES_BEFORE_LONG_POLL)) {
                 this.forceLongPoll = true;
                 this.log("falling back to long-poll transport");
                 this.scheduleWsRetry();
@@ -579,7 +587,7 @@ export class Connection {
         if (code === CLOSE.SERVICE_RESTART) {
             this.consecutiveServiceRestarts++;
             if (this.consecutiveServiceRestarts === 1) {
-                delay = 250 + Math.floor(Math.random() * 1251);
+                delay = SERVICE_RESTART_MIN_DELAY_MS + Math.floor(Math.random() * SERVICE_RESTART_JITTER_RANGE_MS);
             }
             else {
                 delay = (this.o.backoff ?? backoffDelay)(this.attempt++);
@@ -595,7 +603,7 @@ export class Connection {
         this.reconnectTimer.unref?.();
     }
     /** While on long-poll, retry WebSocket periodically (default 15s instead of 10 min). */
-    scheduleWsRetry(delayMs = this.o.wsRetryMs ?? 15_000) {
+    scheduleWsRetry(delayMs = this.o.wsRetryMs ?? DEFAULT_WS_RETRY_MS) {
         if (this.wsRetryTimer)
             return;
         this.wsRetryTimer = setTimeout(() => {
@@ -603,7 +611,7 @@ export class Connection {
             if (this.stopped || this.transportName !== "longpoll")
                 return;
             if (this.t?.isSending?.()) {
-                this.scheduleWsRetry(250);
+                this.scheduleWsRetry(WS_RETRY_BUSY_DEFER_MS);
                 return;
             }
             this.forceLongPoll = false;

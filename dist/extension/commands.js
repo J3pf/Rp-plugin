@@ -3,18 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import dns from "node:dns/promises";
-import { httpRequest, toHttpUrl, toWsUrl } from "../shared/http.js";
+import { createRelayWebSocket, httpRequest, toHttpUrl, toWsUrl } from "../shared/http.js";
+import { CLOSE } from "../shared/protocol.js";
 import { piHomes } from "../shared/platform.js";
 import { errMsg, splitCommand } from "../shared/util.js";
-import { updateConfigFile } from "./config.js";
+import { GATE_MODES, updateConfigFile } from "./config.js";
 import { GENTLE_RANGE, detectGentleVersion, gentleVersionSupported, hasGentleAskTools } from "./compat.js";
 import { promptContext } from "./prompts/classify.js";
-import WebSocket from "ws";
-import { getProxyAgent } from "../shared/http.js";
 export const PLUGIN_PACKAGE = "@j3pf/pi-rp";
 export const PLUGIN_GIT_SOURCE = "git:github.com/J3pf/Rp-plugin";
 const SUBCOMMANDS = ["pair", "status", "doctor", "on", "off", "gate", "test", "unpair"];
-const GATE_MODES = ["auto-detect", "off", "dangerous", "writes", "all"];
 /** Split a command line honoring single/double quotes. */
 export const tokenize = splitCommand;
 export function parseFlags(tokens) {
@@ -172,7 +170,17 @@ export function checkDeclared(env = process.env) {
     return out;
 }
 async function probeWs(url, token) {
-    const agent = await getProxyAgent();
+    const t0 = Date.now();
+    let ws;
+    try {
+        ws = await createRelayWebSocket(toWsUrl(url, "/ws/agent"), token, {
+            handshakeTimeout: 8_000,
+            perMessageDeflate: false,
+        });
+    }
+    catch (e) {
+        return { ok: false, detail: errMsg(e) };
+    }
     return new Promise((resolve) => {
         let done = false;
         const finish = (ok, detail) => {
@@ -187,22 +195,13 @@ async function probeWs(url, token) {
             }
             resolve({ ok, detail });
         };
-        const t0 = Date.now();
-        let ws;
-        try {
-            ws = new WebSocket(toWsUrl(url, "/ws/agent"), { headers: { Authorization: `Bearer ${token}` }, agent, handshakeTimeout: 8000 });
-        }
-        catch (e) {
-            resolve({ ok: false, detail: errMsg(e) });
-            return;
-        }
         ws.on("open", () => finish(true, `${Date.now() - t0} ms`));
         ws.on("unexpected-response", (_r, res) => {
             res.resume();
             finish(false, res.statusCode === 401 || res.statusCode === 403 ? `token rechazado (http ${res.statusCode})` : `http ${res.statusCode}`);
         });
         ws.on("error", (e) => finish(false, errMsg(e)));
-        ws.on("close", (code) => finish(false, code === 4001 ? "token rechazado (4001)" : `cerrado ${code}`));
+        ws.on("close", (code) => finish(false, code === CLOSE.INVALID_TOKEN ? `token rechazado (${CLOSE.INVALID_TOKEN})` : `cerrado ${code}`));
         setTimeout(() => finish(false, "timeout"), 10_000).unref?.();
     });
 }

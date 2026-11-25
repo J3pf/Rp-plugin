@@ -43,6 +43,69 @@ export class AdapterRegistry {
     active() {
         return this.enabled && this.stack.length > 0;
     }
+    async raceOpenedPrompt(cur, runWithPrompt) {
+        let doneRef;
+        let pendingResult = undefined;
+        let hasPendingResult = false;
+        let settled = false;
+        let answeredRemotely = false;
+        let prompt;
+        const attachPrompt = (p) => {
+            prompt = p;
+            void p.remoteAnswer
+                .then((answer) => {
+                if (p.closed || p.cancelledBySystem || settled)
+                    return;
+                answeredRemotely = true;
+                const result = cur.adapter.toResult(cur.args, answer);
+                if (doneRef) {
+                    doneRef(result);
+                }
+                else {
+                    hasPendingResult = true;
+                    pendingResult = result;
+                }
+                this.broker.ack(p.id, true);
+            })
+                .catch(() => {
+                if (!p.closed) {
+                    this.broker.resolved(p, "cancelled", null);
+                    this.broker.close(p);
+                }
+            });
+        };
+        const deliverDone = (done) => {
+            doneRef = done;
+            if (hasPendingResult) {
+                hasPendingResult = false;
+                done(pendingResult);
+            }
+        };
+        try {
+            const value = await runWithPrompt({
+                attachPrompt,
+                deliverDone,
+                isSettled: () => settled,
+            });
+            settled = true;
+            if (prompt && !prompt.closed && !answeredRemotely) {
+                this.broker.resolved(prompt, "local", cur.adapter.fromResult(cur.args, value));
+            }
+            return value;
+        }
+        catch (error) {
+            settled = true;
+            if (prompt && !prompt.closed) {
+                this.broker.resolved(prompt, "cancelled", null);
+            }
+            throw error;
+        }
+        finally {
+            settled = true;
+            if (prompt)
+                this.broker.close(prompt);
+        }
+    }
     // gentle-pi/lib/review-consent-ui.ts:89-97 passes done to the factory and returns the renderable component.
     async customMirror(factory, options, runOrig) {
         const cur = this.stack[this.stack.length - 1];
@@ -50,120 +113,44 @@ export class AdapterRegistry {
         // The existing args-driven adapters continue through the original race path unchanged.
         if (!fromComponent)
             return this.race(factory, options, runOrig);
-        let doneRef;
-        let doneCalled = false;
-        let settled = false;
-        let answeredRemotely = false;
-        let p;
-        const attachPrompt = (prompt) => {
-            p = prompt;
-            void prompt.remoteAnswer
-                .then((answer) => {
-                if (prompt.closed || prompt.cancelledBySystem || settled)
-                    return;
-                answeredRemotely = true;
-                const result = cur.adapter.toResult(cur.args, answer);
-                doneRef?.(result);
-                this.broker.ack(prompt.id, true);
-            })
-                .catch(() => {
-                if (!prompt.closed) {
-                    this.broker.resolved(prompt, "cancelled", null);
-                    this.broker.close(prompt);
+        return this.raceOpenedPrompt(cur, ({ attachPrompt, deliverDone, isSettled }) => {
+            let doneCalled = false;
+            const wrapped = (tui, theme, kb, done) => {
+                const capturedDone = (value) => {
+                    doneCalled = true;
+                    return done(value);
+                };
+                deliverDone(capturedDone);
+                const component = factory(tui, theme, kb, capturedDone);
+                if (!component || typeof component !== "object")
+                    return component;
+                if (this.mirroredComponents.has(component))
+                    return component;
+                this.mirroredComponents.add(component);
+                if (doneCalled || isSettled())
+                    return component;
+                try {
+                    const spec = fromComponent(component);
+                    if (spec)
+                        attachPrompt(this.broker.openSpec(spec));
                 }
-            });
-        };
-        const wrapped = (tui, theme, kb, done) => {
-            const capturedDone = (value) => {
-                doneCalled = true;
-                return done(value);
+                catch {
+                    // Shape drift must leave custom() in control without a partial broker prompt.
+                }
+                return component;
             };
-            doneRef = capturedDone;
-            const component = factory(tui, theme, kb, capturedDone);
-            if (!component || typeof component !== "object")
-                return component;
-            if (this.mirroredComponents.has(component))
-                return component;
-            this.mirroredComponents.add(component);
-            if (doneCalled || settled)
-                return component;
-            try {
-                const spec = fromComponent(component);
-                if (spec)
-                    attachPrompt(this.broker.openSpec(spec));
-            }
-            catch {
-                // Shape drift must leave custom() in control without a partial broker prompt.
-            }
-            return component;
-        };
-        try {
-            const value = await runOrig(wrapped);
-            settled = true;
-            if (p && !p.closed && !answeredRemotely)
-                this.broker.resolved(p, "local", cur.adapter.fromResult(cur.args, value));
-            return value;
-        }
-        catch (error) {
-            settled = true;
-            if (p && !p.closed)
-                this.broker.resolved(p, "cancelled", null);
-            throw error;
-        }
-        finally {
-            settled = true;
-            if (p)
-                this.broker.close(p);
-        }
+            return runOrig(wrapped);
+        });
     }
     async race(factory, _options, runOrig) {
         const cur = this.stack[this.stack.length - 1];
-        let doneRef;
-        let pendingResult = undefined;
-        let hasPendingResult = false;
-        const wrapped = (tui, theme, kb, done) => {
-            doneRef = done;
-            if (hasPendingResult) {
-                done(pendingResult);
-            }
-            return factory(tui, theme, kb, done);
-        };
-        const p = this.broker.openSpec(cur.adapter.toPrompt(cur.args));
-        let answeredRemotely = false;
-        void p.remoteAnswer
-            .then((a) => {
-            if (p.closed || p.cancelledBySystem)
-                return;
-            answeredRemotely = true;
-            const res = cur.adapter.toResult(cur.args, a);
-            if (doneRef) {
-                doneRef(res);
-            }
-            else {
-                hasPendingResult = true;
-                pendingResult = res;
-            }
-            this.broker.ack(p.id, true);
-        })
-            .catch(() => {
-            if (!p.closed) {
-                this.broker.resolved(p, "cancelled", null);
-                this.broker.close(p);
-            }
+        return this.raceOpenedPrompt(cur, ({ attachPrompt, deliverDone }) => {
+            const wrapped = (tui, theme, kb, done) => {
+                deliverDone(done);
+                return factory(tui, theme, kb, done);
+            };
+            attachPrompt(this.broker.openSpec(cur.adapter.toPrompt(cur.args)));
+            return runOrig(wrapped);
         });
-        try {
-            const v = await runOrig(wrapped);
-            if (!p.closed && !answeredRemotely)
-                this.broker.resolved(p, "local", cur.adapter.fromResult(cur.args, v));
-            return v;
-        }
-        catch (e) {
-            if (!p.closed)
-                this.broker.resolved(p, "cancelled", null);
-            throw e;
-        }
-        finally {
-            this.broker.close(p);
-        }
     }
 }

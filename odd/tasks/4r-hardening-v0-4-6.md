@@ -35,16 +35,32 @@ Mirror: pending (workspace root is ambiguous across sibling repos in Engram)
 - Add `permissions: { contents: read }`, full Windows unit test run, and `git diff --exit-code -- dist` parity check to `.github/workflows/ci.yml`.
 - Rebuild `dist/` (`npm run build`) and verify `npm run typecheck && npm test`.
 
+### S5 — Modularize `herdr-bridge.ts` & `agy-transcript.ts`, break circular import & couple gate timeout constants (`C-12`, `W-17` partial)
+- Create `src/host/bridge/agy-paths.ts` (shared `resolveAgyTranscriptPath`, `inferAgyHomeFromTranscriptPath`, `ContextUsageInfo`, `MODEL_CHANGE_RE`, `readTailBuffer`) to break the circular dependency `agy-transcript.ts` <-> `external-metadata.ts`.
+- Extract pure normalizers/parsers from `agy-transcript.ts` into `src/host/bridge/agy-normalize.ts` and split `AgyTranscriptReader.processStep` into dedicated private handlers (`handleUserInputStep`, `handleSystemMessageStep`, `handlePlannerResponseStep`, `handleGenericStep`).
+- Extract Herdr discovery/sorting into `src/host/bridge/herdr-discovery.ts` and gate socket IPC server into `src/host/bridge/gate-server.ts`; derive `AGY_GATE_PROMPT_TIMEOUT_MS` alongside `AGY_HOOK_CLIENT_TIMEOUT_MS` / `AGY_GATE_SOCKET_TIMEOUT_MS` in `src/host/bridge/agy-hooks.ts`; have `commandTimer` reuse `pollTranscriptNow` cleanly; preserve 100% of existing public exports from `herdr-bridge.ts` and `agy-transcript.ts`.
+
+### S6 — Shared WS helper, OS-split `service.ts`, decompose `delivery/index.ts`, deduplicate helpers & rebuild `dist/` (`W-17` remaining, `S-04` remaining)
+- Extract `createRelayWebSocket` / `isFatalCloseCode` in `src/shared/http.ts` and adopt in `src/extension/connection.ts` & `src/host/connection.ts`; replace raw `4001`/`4002` with `CLOSE.*` constants in `runtime.ts` & `commands.ts`.
+- Split `inspectService` & `installService` in `src/host/service.ts` into per-OS helpers (`inspectLinux`/`inspectDarwin`/`inspectWin32`, `installLinux`/`installDarwin`/`installWin32`).
+- Decompose `Deliverer.process` in `src/extension/delivery/index.ts`, deduplicate `applyModel`/`applyThinking` in `slash-commands.ts`, `raceOpenedPrompt` in `prompts/adapters/index.ts`, `stripAnsi` in `prompts/adapters/review-consent.ts`, `isExternalCliLauncher` in `src/host/validate.ts` (used by `manager.ts` & `backends/windows.ts`), and export `GATE_MODES` from `src/extension/config.ts` (reused in `commands.ts`).
+- Clean minor dead/redundant code (`runtime.ts:314` `&& this.info`, `prompts/classify.ts:36` stale JSDoc, unused `onGentleMode` if unused).
+- Rebuild `dist/` (`npm run build`) and verify `npm run typecheck && npm run build && git diff --exit-code -- dist && npm test`.
+
 ## Tasks
 
 - [x] **T1** (`S1`) — Extension transport, snapshot cap, prompts, delivery & `/rp doctor` | Route: delegated (`odd-writer`, parallel with T2, T3) | Status: done | Commit: `cfee6b5` (493/493 unit tests green)
 - [x] **T2** (`S2`) — Host backends, git confinement/monorepo, validation, `HostConnection` & config/inbox | Route: delegated (`odd-writer`, parallel with T1, T3) | Status: done | Commit: `de3680e` (493/493 unit tests green)
 - [x] **T3** (`S3`) — `herdr-bridge`, `agy-hooks`, `agy-transcript` & `external-metadata` hardening | Route: delegated (`odd-writer`, parallel with T1, T2) | Status: done | Commit: `21be13e` (493/493 unit tests green)
-- [x] **T4** (`S4`) — Protocol/contract alignment, CI security & `dist/` rebuild | Route: delegated (`odd-writer`) | Status: done | Commit: committed-below (25 passed / 516 tests green, `dist/` synced)
+- [x] **T4** (`S4`) — Protocol/contract alignment, CI security & `dist/` rebuild | Route: delegated (`odd-writer`) | Status: done | Commit: `8ad6e4b` (25 passed / 516 tests green, `dist/` synced)
+- [x] **T5** (`S5`) — Modularize `herdr-bridge.ts` & `agy-transcript.ts`, break circular import & couple gate timeouts | Route: delegated (`odd-writer`, parallel with T6) | Status: done | Commit: committed-below (zero cycles, 516/516 tests green)
+- [x] **T6** (`S6`) — Shared WS helper, OS-split `service.ts`, decompose `delivery/index.ts` & helper cleanup | Route: delegated (`odd-writer`, parallel with T5) | Status: done | Commit: committed-below (`dist/` rebuilt, 516/516 tests green)
 
 ## Log
 
 - **L1 (2026-11-24)**: User request verbatim: `"OK si hagamole, hasta suggestion o warnings si son reales"` (Stage 2 of `Rp-relay` -> `Rp-plugin` -> `Rp-app`).
 - **L2 (2026-11-24)**: Created feature branch `fix/4r-hardening` from `main` (`703e6ce`) in `Rp-plugin`. Launching Wave 1 (`T1`, `T2`, `T3` with strictly disjoint edit surfaces) in parallel with `Rp-relay`'s read-only independent verifier.
 - **L3 (2026-11-24)**: `Rp-relay` independent verifier returned PASS on S1–S5 (0 blockers). `Rp-plugin` Wave 1 verified (`npm run typecheck && npm run test:unit`: 22 passed / 493 tests passed). Committed `T1` (`cfee6b5`), `T2` (`de3680e`), and `T3` (`21be13e`). Launching final unit `T4` (protocol/contract alignment, QuotaCollector tests, CI security & `dist/` rebuild).
-- **L4 (2026-11-24)**: `T4` verified (`npm run typecheck && npm run build && npm test`: 25 passed / 516 passed tests, `dist/` synced, `node bin/rp-host.mjs --help` OK). Launching independent feature-end verifier on `703e6ce..HEAD`.
+- **L4 (2026-11-24)**: `T4` verified (`npm run typecheck && npm run build && npm test`: 25 passed / 516 passed tests, `dist/` synced, `node bin/rp-host.mjs --help` OK). Independent verifier returned PASS on S1–S4 (0 blockers).
+- **L5 (2026-11-24)**: User follow-up verbatim: `"Ok si hagamos todo lo demás...."` (excluding `gentle-ai`/`@latest` pinning & CI SHAs). Added `S5`/`T5` and `S6`/`T6` with disjoint edit surfaces. Launching `T5` + `T6` in parallel.
+- **L6 (2026-11-24)**: `T5` + `T6` verified (`npm run typecheck && npm run build && npm test`: 25 passed | 1 skipped, 516 passed tests, `dist/` synced). Committing `T5` and `T6` and launching verifier on `S5`–`S6`.

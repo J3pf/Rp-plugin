@@ -1,719 +1,20 @@
-// Antigravity CLI (agy) transcript.jsonl reader & normalizer for RemotePi.
+// Antigravity CLI (agy) stateful transcript.jsonl reader for RemotePi.
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
-import { fileURLToPath } from "node:url";
 import { SNAPSHOT_LIMIT } from "../extension/snapshot.js";
 import { LIMITS } from "../extension/forwarder.js";
 import { SAFE_CONV_ID_RE, truncateBytes } from "../shared/util.js";
-import { MODEL_CHANGE_RE, readAgySessionModel } from "./bridge/external-metadata.js";
+import { AGY_CLAUDE_CONTEXT_WINDOW, AGY_CONTEXT_WINDOW, AGY_GEMINI_CONTEXT_WINDOW, AGY_GPT_OSS_CONTEXT_WINDOW, computeContextUsage, extractAgyUserText, extractSessionTopic, isBackgroundTaskError, isFinalBackgroundWakeup, isSafeSystemSender, normalizeAgyToolCall, normalizeAgyToolCalls, parseAgyArgs, parseBackgroundTaskAck, parseSpawnedSubagentRefs, parseSystemWakeup, readFullStepsMap, readLogTail, readTranscriptChunk, realpathOrNull, resolveAgyContextWindow, resolveAllowedFileUri, resolveSafeFileCandidate, stepTimestampMs, subagentChanged, summarizeAgyToolTask, toNonNegInt, } from "./bridge/agy-normalize.js";
+import { AGY_TAIL_WINDOW_BYTES, MODEL_CHANGE_RE, inferAgyHomeFromTranscriptPath, readTailBuffer, resolveAgyTranscriptPath, } from "./bridge/agy-paths.js";
+import { readAgySessionModel } from "./bridge/external-metadata.js";
 import { isInside } from "./validate.js";
+export { AGY_CLAUDE_CONTEXT_WINDOW, AGY_CONTEXT_WINDOW, AGY_GEMINI_CONTEXT_WINDOW, AGY_GPT_OSS_CONTEXT_WINDOW, AGY_TAIL_WINDOW_BYTES, MODEL_CHANGE_RE, extractAgyUserText, extractSessionTopic, inferAgyHomeFromTranscriptPath, normalizeAgyToolCall, normalizeAgyToolCalls, parseAgyArgs, readTailBuffer, resolveAgyContextWindow, resolveAgyTranscriptPath, summarizeAgyToolTask, };
 const MAX_SUBAGENTS = 100;
 const MAX_SUBAGENT_TOOLS = 100;
 const MAX_SUBAGENT_THINKING_BYTES = 1024;
 const MAX_SUBAGENT_RESULT_BYTES = 4096;
 const MAX_BG_TASKS = 50;
-const MAX_BG_TASK_LOG_BYTES = 8192;
-const MAX_POLL_DELTA_BYTES = 2 * 1024 * 1024;
-const MAX_REMAINDER_BYTES = 1024 * 1024;
 export const DEFAULT_BG_TASK_MAX_IDLE_MS = 5 * 60 * 1000;
-/** Default fallback context window for Antigravity CLI (agy) when model is unknown. */
-export const AGY_CONTEXT_WINDOW = 256_000;
-export const AGY_GEMINI_CONTEXT_WINDOW = 1_048_576;
-export const AGY_CLAUDE_CONTEXT_WINDOW = 1_000_000;
-export const AGY_GPT_OSS_CONTEXT_WINDOW = 131_072;
-/** Resolve the actual AGY context window in tokens from a model ID or display label. */
-export function resolveAgyContextWindow(model) {
-    const m = (model ?? "").trim().toLowerCase();
-    if (!m)
-        return AGY_CONTEXT_WINDOW;
-    if (m.includes("gemini") || m.includes("orchestrator"))
-        return AGY_GEMINI_CONTEXT_WINDOW;
-    if (m.includes("claude"))
-        return AGY_CLAUDE_CONTEXT_WINDOW;
-    if (m.includes("gpt-oss"))
-        return AGY_GPT_OSS_CONTEXT_WINDOW;
-    return AGY_CONTEXT_WINDOW;
-}
-const USER_REQ_RE = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i;
-const TRIVIAL_TOPIC_WORDS = new Set([
-    "si", "no", "ok", "okay", "okey", "oki", "okis", "k", "kk",
-    "dale", "listo", "bueno", "bien", "vale", "claro", "va", "pues", "aja",
-    "adelante", "perfecto", "genial", "excelente", "super", "gracias",
-    "hola", "holi", "buenas", "hey", "ey", "yap", "sip", "nop", "simon",
-    "obvio", "hagamoslo", "hagamole", "hazlo",
-    "yes", "yep", "yeah", "yup", "nope", "sure", "fine", "good",
-    "great", "nice", "cool", "perfect", "thanks", "thx", "ty",
-    "hi", "hello", "yo", "go", "ahead", "continue", "proceed",
-    "please", "do", "it", "sounds", "lgtm", "ya",
-]);
-function normalizeTopicWord(word) {
-    return word.replace(/(.)\1{2,}/g, "$1").replace(/(.)\1+$/g, "$1");
-}
-function isTrivialTopicLine(line) {
-    if (/^\[Archivo adjunto\b/i.test(line))
-        return true;
-    const cleaned = line
-        .toLowerCase()
-        .normalize("NFD")
-        .replace(/\p{Diacritic}/gu, "")
-        .replace(/[^\p{L}\p{N}\s]/gu, " ")
-        .trim();
-    if (!cleaned || !/\p{L}/u.test(cleaned))
-        return true;
-    const words = cleaned.split(/\s+/).filter(Boolean).map(normalizeTopicWord);
-    if (words.length === 0)
-        return true;
-    return words.length <= 4 && words.every((w) => TRIVIAL_TOPIC_WORDS.has(w) || w.length <= 1);
-}
-/** Pick the first substantive non-trivial line from user prompt text for session naming. */
-export function extractSessionTopic(rawText) {
-    for (const rawLine of rawText.split("\n")) {
-        const line = rawLine.trim();
-        if (!line || isTrivialTopicLine(line))
-            continue;
-        return line.length > 42 ? `${line.slice(0, 41)}…` : line;
-    }
-    return null;
-}
-/** Extract clean user message text from an agy USER_INPUT content payload. */
-export function extractAgyUserText(rawContent) {
-    if (!rawContent || typeof rawContent !== "string")
-        return { kind: "skip", text: "" };
-    const match = USER_REQ_RE.exec(rawContent);
-    if (match) {
-        const clean = match[1].trim();
-        return clean ? { kind: "user", text: clean } : { kind: "skip", text: "" };
-    }
-    const trimmed = rawContent.trim();
-    if (!trimmed)
-        return { kind: "skip", text: "" };
-    if (trimmed.includes("<SYSTEM_MESSAGE>"))
-        return { kind: "skip", text: "" };
-    if (trimmed.includes("<CONTEXT_SUMMARY>")) {
-        return { kind: "compaction", text: "Contexto de conversación compactado" };
-    }
-    return { kind: "user", text: trimmed };
-}
-/** Parse stringified JSON values inside agy's protojson tool_calls.args map. */
-export function parseAgyArgs(raw) {
-    if (!raw)
-        return {};
-    if (typeof raw === "string") {
-        try {
-            const p = JSON.parse(raw);
-            if (p && typeof p === "object" && !Array.isArray(p))
-                return parseAgyArgs(p);
-        }
-        catch {
-            return { value: raw };
-        }
-        return {};
-    }
-    if (typeof raw !== "object" || Array.isArray(raw))
-        return {};
-    const out = {};
-    for (const [k, v] of Object.entries(raw)) {
-        if (typeof v === "string") {
-            const t = v.trim();
-            if ((t.startsWith('"') && t.endsWith('"')) ||
-                (t.startsWith("{") && t.endsWith("}")) ||
-                (t.startsWith("[") && t.endsWith("]")) ||
-                t === "true" ||
-                t === "false" ||
-                /^-?\d+(\.\d+)?$/.test(t)) {
-                try {
-                    out[k] = JSON.parse(t);
-                    continue;
-                }
-                catch {
-                    /* keep raw string */
-                }
-            }
-        }
-        out[k] = v;
-    }
-    return out;
-}
-/** Map agy tool names and arguments to Rp-app's canonical tool card format. */
-export function normalizeAgyToolCall(stepIndex, callIndex, rawCall) {
-    const toolCallId = rawCall.id && String(rawCall.id).trim() ? String(rawCall.id).trim() : `agy:${stepIndex}:${callIndex}`;
-    const rawName = String(rawCall.name ?? "tool");
-    const parsed = parseAgyArgs(rawCall.args ?? rawCall.arguments);
-    switch (rawName) {
-        case "run_command":
-            return {
-                toolCallId,
-                name: "bash",
-                args: {
-                    command: String(parsed.CommandLine ?? parsed.command ?? ""),
-                    ...(parsed.Cwd ? { cwd: parsed.Cwd } : {}),
-                    ...(typeof parsed.toolSummary === "string" && parsed.toolSummary.trim()
-                        ? { toolSummary: parsed.toolSummary.trim() }
-                        : {}),
-                },
-                ...(parsed.IsDaemon === true ? { isDaemon: true } : {}),
-            };
-        case "view_file":
-        case "read_file":
-            return {
-                toolCallId,
-                name: "read",
-                args: {
-                    path: String(parsed.AbsolutePath ?? parsed.Path ?? parsed.path ?? ""),
-                    ...(parsed.StartLine !== undefined ? { startLine: parsed.StartLine } : {}),
-                    ...(parsed.EndLine !== undefined ? { endLine: parsed.EndLine } : {}),
-                },
-            };
-        case "write_to_file":
-        case "write_file":
-            return {
-                toolCallId,
-                name: "write",
-                args: {
-                    path: String(parsed.TargetFile ?? parsed.Path ?? parsed.path ?? ""),
-                    ...(parsed.Description ? { description: parsed.Description } : {}),
-                },
-            };
-        case "replace_file_content":
-        case "edit_file":
-            return {
-                toolCallId,
-                name: "edit",
-                args: {
-                    path: String(parsed.TargetFile ?? parsed.Path ?? parsed.path ?? ""),
-                    oldText: truncateBytes(String(parsed.TargetContent ?? parsed.Target ?? ""), 4096).text,
-                    newText: truncateBytes(String(parsed.ReplacementContent ?? parsed.Replacement ?? ""), 4096).text,
-                    ...(parsed.Instruction ? { instruction: truncateBytes(String(parsed.Instruction), 512).text } : {}),
-                },
-            };
-        case "multi_replace_file_content": {
-            const chunks = Array.isArray(parsed.ReplacementChunks) ? parsed.ReplacementChunks : [];
-            const first = chunks[0] && typeof chunks[0] === "object" ? chunks[0] : null;
-            return {
-                toolCallId,
-                name: "edit",
-                args: {
-                    path: String(parsed.TargetFile ?? parsed.path ?? ""),
-                    ...(first
-                        ? {
-                            oldText: truncateBytes(String(first.TargetContent ?? ""), 4096).text,
-                            newText: truncateBytes(String(first.ReplacementContent ?? ""), 4096).text,
-                        }
-                        : {}),
-                    edits: chunks.slice(0, 10).map((c) => ({
-                        oldText: truncateBytes(String(c?.TargetContent ?? ""), 2048).text,
-                        newText: truncateBytes(String(c?.ReplacementContent ?? ""), 2048).text,
-                    })),
-                },
-            };
-        }
-        case "grep_search":
-            return {
-                toolCallId,
-                name: "grep",
-                args: {
-                    pattern: String(parsed.Query ?? parsed.pattern ?? ""),
-                    ...(parsed.SearchPath ? { path: parsed.SearchPath } : {}),
-                },
-            };
-        case "find_by_name":
-            return {
-                toolCallId,
-                name: "find",
-                args: {
-                    pattern: String(parsed.Pattern ?? parsed.pattern ?? ""),
-                    ...(parsed.SearchDirectory ? { path: parsed.SearchDirectory } : {}),
-                },
-            };
-        case "invoke_subagent":
-            return normalizeInvokeSubagentEntry(rawCall.id && String(rawCall.id).trim() ? String(rawCall.id).trim() : `agy:${stepIndex}:${callIndex}`, {}, parsed, Array.isArray(parsed.Subagents) ? parsed.Subagents : []);
-        case "manage_task": {
-            const safeArgs = {};
-            for (const [k, v] of Object.entries(parsed)) {
-                safeArgs[k] = typeof v === "string" ? truncateBytes(v, 2048).text : v;
-            }
-            const rawTaskId = typeof parsed.TaskId === "string" ? parsed.TaskId.trim() : "";
-            const killTaskSender = parsed.Action === "kill" && isSafeSystemSender(rawTaskId) ? rawTaskId : undefined;
-            return {
-                toolCallId,
-                name: rawName,
-                args: safeArgs,
-                ...(killTaskSender ? { killTaskSender } : {}),
-            };
-        }
-        default: {
-            const safeArgs = {};
-            for (const [k, v] of Object.entries(parsed)) {
-                safeArgs[k] = typeof v === "string" ? truncateBytes(v, 2048).text : v;
-            }
-            return {
-                toolCallId,
-                name: rawName,
-                args: safeArgs,
-            };
-        }
-    }
-}
-function normalizeInvokeSubagentEntry(toolCallId, entry, parsed, subs) {
-    const first = subs[0] && typeof subs[0] === "object" ? subs[0] : {};
-    const src = Object.keys(entry).length > 0 ? entry : first;
-    const role = String(src.Role ?? src.role ?? parsed.Role ?? parsed.role ?? parsed.toolSummary ?? "Subagent");
-    const typeName = String(src.TypeName ?? src.typeName ?? src.type_name ?? parsed.TypeName ?? parsed.typeName ?? "subagent");
-    const prompt = String(src.Prompt ?? src.prompt ?? parsed.Prompt ?? parsed.prompt ?? "");
-    const rawModel = src.Model ?? src.model ?? parsed.Model ?? parsed.model;
-    const requestedModel = typeof rawModel === "string" && rawModel.trim() && rawModel.trim().toLowerCase() !== "inherit"
-        ? rawModel.trim()
-        : undefined;
-    return {
-        toolCallId,
-        name: "subagent_run",
-        args: {
-            agent: typeName,
-            label: role,
-            task: truncateBytes(prompt, 500).text,
-            ...(requestedModel ? { model: requestedModel } : {}),
-        },
-        subagentSpec: { role, typeName, prompt, ...(requestedModel ? { model: requestedModel } : {}) },
-    };
-}
-/** Expand a raw agy tool call into one or more normalized tool calls (e.g. parallel `invoke_subagent` `Subagents`). */
-export function normalizeAgyToolCalls(stepIndex, callIndex, rawCall) {
-    const rawName = String(rawCall.name ?? "tool");
-    if (rawName !== "invoke_subagent") {
-        return [normalizeAgyToolCall(stepIndex, callIndex, rawCall)];
-    }
-    const baseId = rawCall.id && String(rawCall.id).trim() ? String(rawCall.id).trim() : `agy:${stepIndex}:${callIndex}`;
-    const parsed = parseAgyArgs(rawCall.args ?? rawCall.arguments);
-    const subs = Array.isArray(parsed.Subagents) ? parsed.Subagents : [];
-    if (subs.length > 1) {
-        return subs.map((entry, si) => normalizeInvokeSubagentEntry(`${baseId}:sub:${si}`, entry && typeof entry === "object" ? entry : {}, parsed, subs));
-    }
-    return [normalizeInvokeSubagentEntry(baseId, {}, parsed, subs)];
-}
-/** Produce a compact human-readable label for an active tool call. */
-export function summarizeAgyToolTask(name, args) {
-    if (typeof args.toolSummary === "string" && args.toolSummary.trim()) {
-        return args.toolSummary.trim().slice(0, 80);
-    }
-    if (name === "bash" && typeof args.command === "string" && args.command.trim()) {
-        const firstLine = args.command.trim().split(/\r?\n/)[0].trim();
-        return `$ ${firstLine.slice(0, 64)}`;
-    }
-    if ((name === "read" || name === "edit" || name === "write") && typeof args.path === "string" && args.path.trim()) {
-        const base = path.basename(args.path.trim()) || args.path.trim();
-        const label = name === "read" ? "Read" : name === "edit" ? "Edit" : "Write";
-        return `${label}: ${base}`;
-    }
-    if ((name === "grep" || name === "find") && typeof args.pattern === "string" && args.pattern.trim()) {
-        return `Search: ${args.pattern.trim().slice(0, 48)}`;
-    }
-    if (name === "subagent_run") {
-        return `Subagent: ${String(args.label ?? args.agent ?? "subagent").slice(0, 56)}`;
-    }
-    return name;
-}
-function stepTimestampMs(step, stepIndex) {
-    const base = step.created_at ? Date.parse(step.created_at) : NaN;
-    const ms = Number.isFinite(base) ? base : Date.now();
-    // Add stepIndex offset so rapid steps within the same second never collide in ChatReducer.keyOf
-    return ms + stepIndex;
-}
-/** Resolve the default path to an agy conversation's transcript.jsonl. */
-export function resolveAgyTranscriptPath(conversationId, home = os.homedir()) {
-    if (typeof conversationId !== "string" || !SAFE_CONV_ID_RE.test(conversationId)) {
-        throw new Error("invalid conversationId");
-    }
-    const brainRoot = path.resolve(home, ".gemini", "antigravity-cli", "brain");
-    const resolved = path.resolve(brainRoot, conversationId, ".system_generated", "logs", "transcript.jsonl");
-    if (!isInside(brainRoot, resolved)) {
-        throw new Error("transcript path escapes brain directory");
-    }
-    return resolved;
-}
-function inferAgyHomeFromTranscriptPath(transcriptPath) {
-    const resolved = path.resolve(transcriptPath);
-    const logsDir = path.dirname(resolved);
-    const sysDir = path.dirname(logsDir);
-    const convDir = path.dirname(sysDir);
-    const brainDir = path.dirname(convDir);
-    const cliDir = path.dirname(brainDir);
-    const geminiDir = path.dirname(cliDir);
-    if (path.basename(cliDir) === "antigravity-cli" && path.basename(geminiDir) === ".gemini") {
-        return path.dirname(geminiDir);
-    }
-    return os.homedir();
-}
-/** Build a step_index -> AgyStepRaw map from the last 512 KB of transcript_full.jsonl. */
-function readFullStepsMap(transcriptPath) {
-    const fullPath = path.join(path.dirname(transcriptPath), "transcript_full.jsonl");
-    try {
-        const stat = fs.statSync(fullPath);
-        if (!stat.isFile())
-            return null;
-        const tailBytes = Math.min(stat.size, 512 * 1024);
-        const fd = fs.openSync(fullPath, "r");
-        try {
-            const buf = Buffer.allocUnsafe(tailBytes);
-            fs.readSync(fd, buf, 0, tailBytes, stat.size - tailBytes);
-            const lines = buf.toString("utf8").split("\n");
-            const minIdx = tailBytes < stat.size ? 1 : 0;
-            const map = new Map();
-            for (let i = minIdx; i < lines.length; i++) {
-                const line = lines[i].trim();
-                if (!line.startsWith("{"))
-                    continue;
-                try {
-                    const parsed = JSON.parse(line);
-                    if (typeof parsed.step_index === "number") {
-                        map.set(parsed.step_index, parsed);
-                    }
-                }
-                catch {
-                    /* ignore partial line */
-                }
-            }
-            return map;
-        }
-        finally {
-            fs.closeSync(fd);
-        }
-    }
-    catch {
-        return null;
-    }
-}
-function readTranscriptChunk(filePath, offset, remainder) {
-    let stat;
-    try {
-        stat = fs.statSync(filePath);
-    }
-    catch {
-        return null;
-    }
-    if (!stat.isFile())
-        return null;
-    let reset = false;
-    let curOffset = offset;
-    let curRemainder = remainder;
-    if (stat.size < curOffset) {
-        reset = true;
-        curOffset = 0;
-        curRemainder = "";
-    }
-    let midLineSeek = false;
-    if (curOffset === 0 && stat.size > 512 * 1024) {
-        curOffset = stat.size - 512 * 1024;
-        curRemainder = "";
-        midLineSeek = true;
-    }
-    else if (stat.size - curOffset > MAX_POLL_DELTA_BYTES) {
-        curOffset = stat.size - MAX_POLL_DELTA_BYTES;
-        curRemainder = "";
-        midLineSeek = true;
-    }
-    const deltaBytes = stat.size - curOffset;
-    if (deltaBytes <= 0) {
-        return { reset, nextOffset: curOffset, nextRemainder: curRemainder, lines: [] };
-    }
-    let chunk = "";
-    try {
-        const fd = fs.openSync(filePath, "r");
-        try {
-            const buf = Buffer.allocUnsafe(deltaBytes);
-            const bytesRead = fs.readSync(fd, buf, 0, deltaBytes, curOffset);
-            curOffset += bytesRead;
-            chunk = curRemainder + buf.subarray(0, bytesRead).toString("utf8");
-        }
-        finally {
-            fs.closeSync(fd);
-        }
-    }
-    catch {
-        return null;
-    }
-    const lines = chunk.split("\n");
-    let nextRemainder = lines.pop() ?? "";
-    if (Buffer.byteLength(nextRemainder, "utf8") > MAX_REMAINDER_BYTES) {
-        nextRemainder = "";
-    }
-    if (midLineSeek && lines.length > 0) {
-        lines.shift();
-    }
-    return { reset, nextOffset: curOffset, nextRemainder, lines };
-}
-function toNonNegInt(v) {
-    return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.floor(v)) : 0;
-}
-function extractSpawnedRef(obj, out) {
-    if (!obj || typeof obj !== "object")
-        return;
-    if (Array.isArray(obj)) {
-        for (const item of obj)
-            extractSpawnedRef(item, out);
-        return;
-    }
-    const rec = obj;
-    if (typeof rec.conversationId !== "string")
-        return;
-    const conversationId = rec.conversationId.trim();
-    if (!SAFE_CONV_ID_RE.test(conversationId)) {
-        out.push(null);
-        return;
-    }
-    out.push({
-        conversationId,
-        logAbsoluteUri: typeof rec.logAbsoluteUri === "string" ? rec.logAbsoluteUri.trim() : undefined,
-    });
-}
-function parseSpawnedSubagentRefs(rawOut) {
-    if (!rawOut)
-        return [];
-    const refs = [];
-    let inString = false;
-    let escaped = false;
-    let depth = 0;
-    let start = -1;
-    let openChar = "";
-    for (let i = 0; i < rawOut.length; i++) {
-        const ch = rawOut[i];
-        if (inString) {
-            if (escaped)
-                escaped = false;
-            else if (ch === "\\")
-                escaped = true;
-            else if (ch === '"')
-                inString = false;
-            continue;
-        }
-        if (ch === '"') {
-            inString = true;
-            continue;
-        }
-        if (depth === 0 && (ch === "{" || ch === "[")) {
-            depth = 1;
-            start = i;
-            openChar = ch;
-        }
-        else if (depth > 0) {
-            if (ch === openChar)
-                depth++;
-            else if ((openChar === "{" && ch === "}") || (openChar === "[" && ch === "]")) {
-                depth--;
-                if (depth === 0 && start >= 0) {
-                    try {
-                        extractSpawnedRef(JSON.parse(rawOut.slice(start, i + 1)), refs);
-                    }
-                    catch {
-                        /* ignore malformed JSON fragment */
-                    }
-                    start = -1;
-                }
-            }
-        }
-    }
-    if (refs.length > 0)
-        return refs;
-    // Regex fallback for non-JSON or truncated fragments
-    const re = /"conversationId"\s*:\s*"([^"]+)"(?:[\s\S]{0,400}?"logAbsoluteUri"\s*:\s*"([^"]+)")?/g;
-    let m;
-    while ((m = re.exec(rawOut)) !== null) {
-        const conversationId = m[1].trim();
-        if (!SAFE_CONV_ID_RE.test(conversationId)) {
-            refs.push(null);
-        }
-        else {
-            refs.push({ conversationId, logAbsoluteUri: m[2]?.trim() });
-        }
-    }
-    return refs;
-}
-function isSafeSystemSender(sender) {
-    if (!sender)
-        return false;
-    if (SAFE_CONV_ID_RE.test(sender))
-        return true;
-    const parts = sender.split("/");
-    return parts.length === 2 && SAFE_CONV_ID_RE.test(parts[0]) && SAFE_CONV_ID_RE.test(parts[1]);
-}
-function parseSystemWakeup(raw) {
-    if (!raw)
-        return null;
-    const senderMatch = /\bsender=([^\s\]\n<>]+)/.exec(raw);
-    const sender = senderMatch?.[1]?.trim();
-    if (!sender || !isSafeSystemSender(sender))
-        return null;
-    let content = "";
-    const contentIdx = raw.search(/\bcontent=/);
-    if (contentIdx >= 0) {
-        let rest = raw.slice(contentIdx + "content=".length);
-        const closeIdx = rest.lastIndexOf("</SYSTEM_MESSAGE>");
-        if (closeIdx >= 0)
-            rest = rest.slice(0, closeIdx);
-        content = rest.trim();
-    }
-    return { sender, content };
-}
-function parseBackgroundTaskAck(rawOut) {
-    if (!rawOut)
-        return null;
-    const idMatch = /Tool is running as a background task with task id:\s*([^\s\r\n]+)/i.exec(rawOut);
-    const taskSender = idMatch?.[1]?.trim();
-    if (!taskSender || !isSafeSystemSender(taskSender))
-        return null;
-    const logMatch = /Task logs are available at:\s*(file:\/\/[^\s\r\n]+)/i.exec(rawOut);
-    const logMatchUri = logMatch?.[1]?.trim();
-    const outMatch = /(?:^|\r?\n)Log output:\r?\n([\s\S]*)$/.exec(rawOut);
-    const initialTail = outMatch?.[1]?.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
-    return {
-        taskSender,
-        ...(logMatchUri ? { logUri: logMatchUri } : {}),
-        ...(initialTail ? { initialTail: truncateBytes(initialTail, LIMITS.resultMaxBytes).text } : {}),
-    };
-}
-function isFinalBackgroundWakeup(content) {
-    return (/\bfinished with (?:result|error)\b/i.test(content) ||
-        /^(?:The )?[Cc]ommand exited with code \d+\b/m.test(content));
-}
-function isBackgroundTaskError(content) {
-    return (/\bfinished with error\b/i.test(content) ||
-        /^(?:The )?[Cc]ommand exited with code [1-9]\d*\b/m.test(content));
-}
-function readLogTail(filePath, maxReadBytes = MAX_BG_TASK_LOG_BYTES) {
-    let st;
-    try {
-        st = fs.statSync(filePath);
-    }
-    catch {
-        return null;
-    }
-    if (!st.isFile() || st.size <= 0)
-        return null;
-    const start = Math.max(0, st.size - maxReadBytes);
-    const len = st.size - start;
-    const buf = Buffer.allocUnsafe(len);
-    let bytesRead = 0;
-    try {
-        const fd = fs.openSync(filePath, "r");
-        try {
-            bytesRead = fs.readSync(fd, buf, 0, len, start);
-        }
-        finally {
-            fs.closeSync(fd);
-        }
-    }
-    catch {
-        return null;
-    }
-    if (bytesRead <= 0)
-        return null;
-    let view = buf.subarray(0, bytesRead);
-    if (start > 0) {
-        const nl = view.indexOf(0x0a);
-        if (nl >= 0 && nl + 1 < view.length) {
-            view = view.subarray(nl + 1);
-        }
-        else {
-            let idx = 0;
-            while (idx < view.length && (view[idx] & 0xc0) === 0x80)
-                idx++;
-            if (idx > 0)
-                view = view.subarray(idx);
-        }
-    }
-    const normalized = view.toString("utf8").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
-    if (!normalized)
-        return null;
-    return {
-        text: truncateBytes(normalized, LIMITS.resultMaxBytes).text,
-        size: st.size,
-        mtimeMs: st.mtimeMs,
-    };
-}
-function subagentChanged(a, b) {
-    if (a.status !== b.status ||
-        a.label !== b.label ||
-        a.model !== b.model ||
-        a.thinking !== b.thinking ||
-        a.turns !== b.turns ||
-        a.toolCalls !== b.toolCalls ||
-        a.endedAt !== b.endedAt ||
-        a.durationMs !== b.durationMs ||
-        a.result !== b.result ||
-        a.error !== b.error) {
-        return true;
-    }
-    const at = a.tools ?? [];
-    const bt = b.tools ?? [];
-    if (at.length !== bt.length)
-        return true;
-    for (let i = 0; i < at.length; i++) {
-        if (at[i] !== bt[i])
-            return true;
-    }
-    const ak = a.tokens;
-    const bk = b.tokens;
-    if (Boolean(ak) !== Boolean(bk))
-        return true;
-    if (ak && bk) {
-        if (ak.total !== bk.total ||
-            ak.input !== bk.input ||
-            ak.output !== bk.output ||
-            ak.cacheRead !== bk.cacheRead ||
-            ak.cacheWrite !== bk.cacheWrite) {
-            return true;
-        }
-    }
-    return false;
-}
-function realpathOrNull(targetPath) {
-    try {
-        return fs.realpathSync(targetPath);
-    }
-    catch {
-        return null;
-    }
-}
-/**
- * Resolve a candidate file path for containment verification.
- * - If the file exists on disk: rejects symlinks and non-regular files, returning its `realpathSync`.
- * - If the file does not exist yet (`ENOENT`): resolves the nearest existing ancestor via `realpathSync`
- *   and rejoins the trailing non-existent segments.
- */
-function resolveSafeFileCandidate(candidate, requireExists = false) {
-    const abs = path.resolve(candidate);
-    try {
-        const st = fs.lstatSync(abs);
-        if (st.isSymbolicLink() || !st.isFile())
-            return null;
-        const realPath = fs.realpathSync(abs);
-        return { realPath, exists: true };
-    }
-    catch (e) {
-        if (requireExists || e?.code !== "ENOENT")
-            return null;
-    }
-    const tail = [];
-    let cur = abs;
-    while (true) {
-        try {
-            const realAncestor = fs.realpathSync(cur);
-            return {
-                realPath: tail.length > 0 ? path.join(realAncestor, ...tail.reverse()) : realAncestor,
-                exists: false,
-            };
-        }
-        catch (e) {
-            if (e?.code !== "ENOENT")
-                return null;
-            const parent = path.dirname(cur);
-            if (parent === cur)
-                return null;
-            tail.push(path.basename(cur));
-            cur = parent;
-        }
-    }
-}
 export const MAX_SNAPSHOT_BYTES = 220 * 1024;
 function compactSnapshotEntry(entry, isRecent) {
     if (isRecent || entry.kind !== "tool_result" || !entry.msg || typeof entry.msg !== "object")
@@ -732,11 +33,6 @@ function compactSnapshotEntry(entry, isRecent) {
             content: [{ type: "text", text: truncateBytes(first.text, 1024).text }],
         },
     };
-}
-function computeContextUsage(tokens, model) {
-    const contextWindow = resolveAgyContextWindow(model);
-    const percent = Math.min(100, Math.max(0, Math.round((tokens / contextWindow) * 100)));
-    return { tokens, contextWindow, percent };
 }
 /**
  * Stateful incremental reader for an agy `transcript.jsonl` file.
@@ -1023,32 +319,7 @@ export class AgyTranscriptReader {
         const parts = taskSender.split("/");
         const taskPart = parts.length === 2 ? parts[1] : parts[0];
         const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
-        if (logUri && typeof logUri === "string") {
-            try {
-                const url = new URL(logUri);
-                if (url.protocol === "file:") {
-                    const candidate = path.resolve(fileURLToPath(url));
-                    if (this.isContainedTaskLogPath(candidate, false)) {
-                        return candidate;
-                    }
-                    // Reject explicit symlinks immediately without falling back to the same path
-                    try {
-                        if (fs.lstatSync(candidate).isSymbolicLink())
-                            return null;
-                    }
-                    catch {
-                        /* ignore */
-                    }
-                }
-            }
-            catch {
-                /* fall back to canonical tasks directory */
-            }
-        }
-        if (!SAFE_CONV_ID_RE.test(taskPart))
-            return null;
-        const fallback = path.join(siblingRoot, "tasks", `${taskPart}.log`);
-        return this.isContainedTaskLogPath(fallback, false) ? fallback : null;
+        return resolveAllowedFileUri(logUri, (candidate) => this.isContainedTaskLogPath(candidate, false), () => (SAFE_CONV_ID_RE.test(taskPart) ? path.join(siblingRoot, "tasks", `${taskPart}.log`) : null));
     }
     pollActiveBackgroundTasks(outEvents) {
         if (this.bgTasks.size === 0)
@@ -1136,34 +407,14 @@ export class AgyTranscriptReader {
     resolveChildTranscriptPath(convId, logAbsoluteUri) {
         if (!SAFE_CONV_ID_RE.test(convId))
             return null;
-        if (logAbsoluteUri && typeof logAbsoluteUri === "string") {
+        return resolveAllowedFileUri(logAbsoluteUri, (candidate) => this.isContainedChildTranscriptPath(candidate, false), () => {
             try {
-                const url = new URL(logAbsoluteUri);
-                if (url.protocol === "file:") {
-                    const candidate = path.resolve(fileURLToPath(url));
-                    if (this.isContainedChildTranscriptPath(candidate, false)) {
-                        return candidate;
-                    }
-                    try {
-                        if (fs.lstatSync(candidate).isSymbolicLink())
-                            return null;
-                    }
-                    catch {
-                        /* ignore */
-                    }
-                }
+                return resolveAgyTranscriptPath(convId, inferAgyHomeFromTranscriptPath(this.transcriptPath));
             }
             catch {
-                /* fall back to canonical path below */
+                return null;
             }
-        }
-        try {
-            const canonical = resolveAgyTranscriptPath(convId, inferAgyHomeFromTranscriptPath(this.transcriptPath));
-            return this.isContainedChildTranscriptPath(canonical, false) ? canonical : null;
-        }
-        catch {
-            return null;
-        }
+        });
     }
     pollActiveChildren(outEvents) {
         if (this.childCursors.size === 0)
@@ -1286,282 +537,290 @@ export class AgyTranscriptReader {
         const eid = `agy:${stepIndex}`;
         const isRedacted = this.redact();
         if (step.type === "USER_INPUT") {
-            // Flush any unmatched pending tools before a new user turn
-            this.pendingTools = [];
-            if (typeof step.content === "string") {
-                const modelChange = MODEL_CHANGE_RE.exec(step.content);
-                if (modelChange?.[1]?.trim()) {
-                    this.lastModel = modelChange[1].trim();
+            this.handleUserInputStep(step, eid, at, isRedacted, outEvents);
+        }
+        else if (step.type === "SYSTEM_MESSAGE") {
+            this.handleSystemMessageStep(step, eid, at, isRedacted, outEvents);
+        }
+        else if (step.type === "PLANNER_RESPONSE") {
+            this.handlePlannerResponseStep(step, stepIndex, eid, at, isRedacted, outEvents);
+        }
+        else if (step.type === "GENERIC" && this.pendingTools.length > 0) {
+            this.handleGenericStep(step, eid, at, isRedacted, outEvents);
+        }
+    }
+    handleUserInputStep(step, eid, at, isRedacted, outEvents) {
+        // Flush any unmatched pending tools before a new user turn
+        this.pendingTools = [];
+        if (typeof step.content === "string") {
+            const modelChange = MODEL_CHANGE_RE.exec(step.content);
+            if (modelChange?.[1]?.trim()) {
+                this.lastModel = modelChange[1].trim();
+            }
+        }
+        const extracted = extractAgyUserText(step.content);
+        if (extracted.kind === "skip")
+            return;
+        if (extracted.kind === "compaction") {
+            this.entries.push({ eid, kind: "compaction", at, msg: isRedacted ? {} : { summary: extracted.text } });
+            outEvents.push({ type: "session_compact", ...(isRedacted ? {} : { summary: extracted.text }) });
+            return;
+        }
+        if (!this.lastTopic) {
+            this.lastTopic = extractSessionTopic(extracted.text);
+        }
+        const contentBlocks = [{ type: "text", text: truncateBytes(extracted.text, LIMITS.resultMaxBytes).text }];
+        if (Array.isArray(step.media)) {
+            for (const m of step.media) {
+                if (m?.mime_type?.startsWith("image/")) {
+                    contentBlocks.push({ type: "image_ref", mimeType: m.mime_type, bytes: 0 });
                 }
             }
-            const extracted = extractAgyUserText(step.content);
-            if (extracted.kind === "skip")
-                return;
-            if (extracted.kind === "compaction") {
-                this.entries.push({ eid, kind: "compaction", at, msg: isRedacted ? {} : { summary: extracted.text } });
-                outEvents.push({ type: "session_compact", ...(isRedacted ? {} : { summary: extracted.text }) });
-                return;
-            }
-            if (!this.lastTopic) {
-                this.lastTopic = extractSessionTopic(extracted.text);
-            }
-            const contentBlocks = [{ type: "text", text: truncateBytes(extracted.text, LIMITS.resultMaxBytes).text }];
-            if (Array.isArray(step.media)) {
-                for (const m of step.media) {
-                    if (m?.mime_type?.startsWith("image/")) {
-                        contentBlocks.push({ type: "image_ref", mimeType: m.mime_type, bytes: 0 });
-                    }
+        }
+        const msg = isRedacted ? { role: "user", timestamp: at } : { role: "user", timestamp: at, content: contentBlocks };
+        this.entries.push({ eid, kind: "user", at, msg });
+        if (!isRedacted) {
+            outEvents.push({ type: "message_end", message: msg });
+        }
+    }
+    handleSystemMessageStep(step, eid, at, isRedacted, outEvents) {
+        const parsed = parseSystemWakeup(typeof step.content === "string" ? step.content : "");
+        if (!parsed)
+            return;
+        const bg = this.bgTasks.get(parsed.sender);
+        if (bg) {
+            if (!isFinalBackgroundWakeup(parsed.content)) {
+                this.pollBackgroundTaskCursor(bg, outEvents, isRedacted);
+                const snippet = !isRedacted && parsed.content ? truncateBytes(parsed.content, LIMITS.resultMaxBytes).text : "";
+                if (snippet && snippet !== bg.lastTail) {
+                    bg.lastTail = snippet;
+                    bg.lastActivityAt = Date.now();
+                    outEvents.push({
+                        type: "tool_execution_update",
+                        toolCallId: bg.toolCallId,
+                        toolName: bg.name,
+                        partialResult: { content: [{ type: "text", text: snippet }] },
+                    });
                 }
+                return;
             }
-            const msg = isRedacted ? { role: "user", timestamp: at } : { role: "user", timestamp: at, content: contentBlocks };
-            this.entries.push({ eid, kind: "user", at, msg });
+            const bgIsError = isBackgroundTaskError(parsed.content);
+            const finalOut = parsed.content || bg.lastTail || "";
+            this.bgTasks.delete(parsed.sender);
+            this.finalizeToolResult(eid, bg.toolCallId, bg.name, bg.startedAt, at, bgIsError, finalOut, isRedacted, outEvents);
+            return;
+        }
+        const taskId = this.convToTaskId.get(parsed.sender);
+        if (!taskId)
+            return;
+        this.pollChildCursor(parsed.sender, outEvents, false);
+        this.convToTaskId.delete(parsed.sender);
+        this.childCursors.delete(parsed.sender);
+        const sub = this.subagents.get(taskId);
+        if (sub) {
+            const completed = {
+                ...sub,
+                label: isRedacted ? "[redacted]" : sub.label,
+                status: "completed",
+                endedAt: at,
+                durationMs: Math.max(0, at - (sub.startedAt ?? at)),
+                ...(!isRedacted && parsed.content
+                    ? { result: truncateBytes(parsed.content, MAX_SUBAGENT_RESULT_BYTES).text }
+                    : {}),
+            };
+            if (isRedacted) {
+                delete completed.thinking;
+                delete completed.result;
+                delete completed.error;
+            }
+            this.setSubagent(taskId, completed);
+            outEvents.push(this.cloneSubagent(completed, isRedacted));
+        }
+    }
+    handlePlannerResponseStep(step, stepIndex, eid, at, isRedacted, outEvents) {
+        const inTok = toNonNegInt(step.input_tokens);
+        const cacheReadTok = toNonNegInt(step.cache_read_tokens);
+        const cacheWriteTok = toNonNegInt(step.cache_write_tokens);
+        const outTok = toNonNegInt(step.output_tokens);
+        const totalTok = inTok + cacheReadTok + cacheWriteTok + outTok;
+        let stepUsage;
+        if (totalTok > 0) {
+            const usageInfo = computeContextUsage(totalTok, this.lastModel ?? this.resolveModel());
+            this.lastContextUsage = usageInfo;
+            stepUsage = {
+                input: inTok,
+                output: outTok,
+                cacheRead: cacheReadTok,
+                cacheWrite: cacheWriteTok,
+                totalTokens: totalTok,
+                contextWindow: usageInfo.contextWindow,
+                contextPercent: usageInfo.percent,
+            };
+        }
+        const blocks = [];
+        if (!isRedacted && typeof step.thinking === "string" && step.thinking.trim()) {
+            blocks.push({ type: "thinking", thinking: truncateBytes(step.thinking.trim(), LIMITS.resultMaxBytes).text });
+        }
+        if (!isRedacted && typeof step.content === "string" && step.content.trim()) {
+            blocks.push({ type: "text", text: truncateBytes(step.content.trim(), LIMITS.resultMaxBytes).text });
+        }
+        const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+        const expandedPerCall = [];
+        for (let i = 0; i < calls.length; i++) {
+            const norms = normalizeAgyToolCalls(stepIndex, i, calls[i]);
+            expandedPerCall.push(norms);
+            for (const norm of norms) {
+                blocks.push({
+                    type: "toolCall",
+                    id: norm.toolCallId,
+                    name: norm.name,
+                    arguments: isRedacted ? {} : norm.args,
+                });
+            }
+        }
+        if (blocks.length > 0) {
+            const msg = isRedacted
+                ? { role: "assistant", timestamp: at, ...(stepUsage ? { usage: stepUsage } : {}) }
+                : { role: "assistant", timestamp: at, content: blocks, ...(stepUsage ? { usage: stepUsage } : {}) };
+            this.entries.push({ eid, kind: "assistant", at, msg });
             if (!isRedacted) {
                 outEvents.push({ type: "message_end", message: msg });
             }
-            return;
         }
-        if (step.type === "SYSTEM_MESSAGE") {
-            const parsed = parseSystemWakeup(typeof step.content === "string" ? step.content : "");
-            if (!parsed)
-                return;
-            const bg = this.bgTasks.get(parsed.sender);
-            if (bg) {
-                if (!isFinalBackgroundWakeup(parsed.content)) {
-                    this.pollBackgroundTaskCursor(bg, outEvents, isRedacted);
-                    const snippet = !isRedacted && parsed.content ? truncateBytes(parsed.content, LIMITS.resultMaxBytes).text : "";
-                    if (snippet && snippet !== bg.lastTail) {
-                        bg.lastTail = snippet;
-                        bg.lastActivityAt = Date.now();
-                        outEvents.push({
-                            type: "tool_execution_update",
-                            toolCallId: bg.toolCallId,
-                            toolName: bg.name,
-                            partialResult: { content: [{ type: "text", text: snippet }] },
-                        });
-                    }
-                    return;
+        for (const norms of expandedPerCall) {
+            if (norms.length === 0)
+                continue;
+            const first = norms[0];
+            const subagentIds = norms.filter((n) => Boolean(n.subagentSpec)).map((n) => n.toolCallId);
+            this.pendingTools.push({
+                toolCallId: first.toolCallId,
+                name: first.name,
+                args: first.args,
+                at,
+                ...(first.isDaemon ? { isDaemon: true } : {}),
+                ...(first.killTaskSender ? { killTaskSender: first.killTaskSender } : {}),
+                subagentSpec: first.subagentSpec,
+                ...(subagentIds.length > 0 ? { subagentIds } : {}),
+            });
+            for (const norm of norms) {
+                outEvents.push({
+                    type: "tool_execution_start",
+                    toolCallId: norm.toolCallId,
+                    toolName: norm.name,
+                    ...(isRedacted ? {} : { args: norm.args }),
+                });
+                if (norm.subagentSpec) {
+                    const sub = {
+                        type: "subagent_update",
+                        taskId: norm.toolCallId,
+                        agent: norm.subagentSpec.typeName,
+                        label: isRedacted ? "[redacted]" : norm.subagentSpec.role,
+                        status: "running",
+                        startedAt: at,
+                        ...(norm.subagentSpec.model ? { model: norm.subagentSpec.model } : {}),
+                        tools: [],
+                    };
+                    this.setSubagent(norm.toolCallId, sub);
+                    outEvents.push(this.cloneSubagent(sub, isRedacted));
                 }
-                const bgIsError = isBackgroundTaskError(parsed.content);
-                const finalOut = parsed.content || bg.lastTail || "";
-                this.bgTasks.delete(parsed.sender);
-                this.finalizeToolResult(eid, bg.toolCallId, bg.name, bg.startedAt, at, bgIsError, finalOut, isRedacted, outEvents);
+            }
+        }
+    }
+    handleGenericStep(step, eid, at, isRedacted, outEvents) {
+        const pending = this.pendingTools.shift();
+        const isError = step.status === "ERROR";
+        const rawOut = typeof step.content === "string" ? step.content : "";
+        if (pending.killTaskSender && !isError) {
+            const killed = this.bgTasks.get(pending.killTaskSender);
+            if (killed) {
+                this.bgTasks.delete(pending.killTaskSender);
+                this.finalizeToolResult(`${eid}:killed`, killed.toolCallId, killed.name, killed.startedAt, at, false, rawOut || killed.lastTail || "", isRedacted, outEvents);
+            }
+        }
+        if (!pending.subagentIds?.length && !isError && (step.status === "RUNNING" || !step.status)) {
+            const bgAck = parseBackgroundTaskAck(rawOut);
+            if (bgAck) {
+                const logPath = this.resolveTaskLogPath(bgAck.taskSender, bgAck.logUri);
+                const cursor = {
+                    taskSender: bgAck.taskSender,
+                    toolCallId: pending.toolCallId,
+                    name: pending.name,
+                    args: pending.args,
+                    startedAt: pending.at,
+                    lastActivityAt: Date.now(),
+                    isDaemon: Boolean(pending.isDaemon),
+                    logPath,
+                    hasExplicitLogUri: Boolean(bgAck.logUri),
+                    lastSize: 0,
+                    lastMtimeMs: 0,
+                };
+                this.setBgTask(bgAck.taskSender, cursor);
+                this.pollBackgroundTaskCursor(cursor, outEvents, isRedacted);
+                if (!isRedacted && !cursor.lastTail && bgAck.initialTail) {
+                    cursor.lastTail = bgAck.initialTail;
+                    outEvents.push({
+                        type: "tool_execution_update",
+                        toolCallId: cursor.toolCallId,
+                        toolName: cursor.name,
+                        partialResult: { content: [{ type: "text", text: bgAck.initialTail }] },
+                    });
+                }
                 return;
             }
-            const taskId = this.convToTaskId.get(parsed.sender);
-            if (!taskId)
-                return;
-            this.pollChildCursor(parsed.sender, outEvents, false);
-            this.convToTaskId.delete(parsed.sender);
-            this.childCursors.delete(parsed.sender);
-            const sub = this.subagents.get(taskId);
-            if (sub) {
-                const completed = {
+        }
+        const targetIds = pending.subagentIds && pending.subagentIds.length > 0 ? pending.subagentIds : [pending.toolCallId];
+        for (let si = 0; si < targetIds.length; si++) {
+            this.finalizeToolResult(si === 0 ? eid : `${eid}:${si}`, targetIds[si], pending.name, pending.at, at, isError, rawOut, isRedacted, outEvents);
+        }
+        if (pending.subagentIds && pending.subagentIds.length > 0) {
+            const refs = isError ? [] : parseSpawnedSubagentRefs(rawOut);
+            const hasValidAck = !isError && refs.some(Boolean);
+            for (let si = 0; si < pending.subagentIds.length; si++) {
+                const subId = pending.subagentIds[si];
+                const sub = this.subagents.get(subId);
+                if (!sub)
+                    continue;
+                const ref = hasValidAck ? refs[si] ?? null : null;
+                if (ref) {
+                    const childPath = this.resolveChildTranscriptPath(ref.conversationId, ref.logAbsoluteUri);
+                    if (childPath) {
+                        this.convToTaskId.set(ref.conversationId, subId);
+                        this.childCursors.set(ref.conversationId, {
+                            taskId: subId,
+                            convId: ref.conversationId,
+                            transcriptPath: childPath,
+                            offset: 0,
+                            remainder: "",
+                            lastStepIndex: -1,
+                            tools: [],
+                            toolCalls: 0,
+                            turns: 0,
+                            tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                            ...(sub.model ? { model: sub.model } : {}),
+                            modelFromSession: false,
+                        });
+                    }
+                    continue;
+                }
+                const finished = {
                     ...sub,
                     label: isRedacted ? "[redacted]" : sub.label,
-                    status: "completed",
+                    status: isError ? "error" : "done",
                     endedAt: at,
                     durationMs: Math.max(0, at - (sub.startedAt ?? at)),
-                    ...(!isRedacted && parsed.content
-                        ? { result: truncateBytes(parsed.content, MAX_SUBAGENT_RESULT_BYTES).text }
-                        : {}),
+                    ...(isRedacted
+                        ? {}
+                        : isError
+                            ? { error: truncateBytes(rawOut, MAX_SUBAGENT_RESULT_BYTES).text }
+                            : { result: truncateBytes(rawOut, MAX_SUBAGENT_RESULT_BYTES).text }),
                 };
                 if (isRedacted) {
-                    delete completed.thinking;
-                    delete completed.result;
-                    delete completed.error;
+                    delete finished.thinking;
+                    delete finished.result;
+                    delete finished.error;
                 }
-                this.setSubagent(taskId, completed);
-                outEvents.push(this.cloneSubagent(completed, isRedacted));
-            }
-            return;
-        }
-        if (step.type === "PLANNER_RESPONSE") {
-            const inTok = toNonNegInt(step.input_tokens);
-            const cacheReadTok = toNonNegInt(step.cache_read_tokens);
-            const cacheWriteTok = toNonNegInt(step.cache_write_tokens);
-            const outTok = toNonNegInt(step.output_tokens);
-            const totalTok = inTok + cacheReadTok + cacheWriteTok + outTok;
-            let stepUsage;
-            if (totalTok > 0) {
-                const usageInfo = computeContextUsage(totalTok, this.lastModel ?? this.resolveModel());
-                this.lastContextUsage = usageInfo;
-                stepUsage = {
-                    input: inTok,
-                    output: outTok,
-                    cacheRead: cacheReadTok,
-                    cacheWrite: cacheWriteTok,
-                    totalTokens: totalTok,
-                    contextWindow: usageInfo.contextWindow,
-                    contextPercent: usageInfo.percent,
-                };
-            }
-            const blocks = [];
-            if (!isRedacted && typeof step.thinking === "string" && step.thinking.trim()) {
-                blocks.push({ type: "thinking", thinking: truncateBytes(step.thinking.trim(), LIMITS.resultMaxBytes).text });
-            }
-            if (!isRedacted && typeof step.content === "string" && step.content.trim()) {
-                blocks.push({ type: "text", text: truncateBytes(step.content.trim(), LIMITS.resultMaxBytes).text });
-            }
-            const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-            const expandedPerCall = [];
-            for (let i = 0; i < calls.length; i++) {
-                const norms = normalizeAgyToolCalls(stepIndex, i, calls[i]);
-                expandedPerCall.push(norms);
-                for (const norm of norms) {
-                    blocks.push({
-                        type: "toolCall",
-                        id: norm.toolCallId,
-                        name: norm.name,
-                        arguments: isRedacted ? {} : norm.args,
-                    });
-                }
-            }
-            if (blocks.length > 0) {
-                const msg = isRedacted
-                    ? { role: "assistant", timestamp: at, ...(stepUsage ? { usage: stepUsage } : {}) }
-                    : { role: "assistant", timestamp: at, content: blocks, ...(stepUsage ? { usage: stepUsage } : {}) };
-                this.entries.push({ eid, kind: "assistant", at, msg });
-                if (!isRedacted) {
-                    outEvents.push({ type: "message_end", message: msg });
-                }
-            }
-            for (const norms of expandedPerCall) {
-                if (norms.length === 0)
-                    continue;
-                const first = norms[0];
-                const subagentIds = norms.filter((n) => Boolean(n.subagentSpec)).map((n) => n.toolCallId);
-                this.pendingTools.push({
-                    toolCallId: first.toolCallId,
-                    name: first.name,
-                    args: first.args,
-                    at,
-                    ...(first.isDaemon ? { isDaemon: true } : {}),
-                    ...(first.killTaskSender ? { killTaskSender: first.killTaskSender } : {}),
-                    subagentSpec: first.subagentSpec,
-                    ...(subagentIds.length > 0 ? { subagentIds } : {}),
-                });
-                for (const norm of norms) {
-                    outEvents.push({
-                        type: "tool_execution_start",
-                        toolCallId: norm.toolCallId,
-                        toolName: norm.name,
-                        ...(isRedacted ? {} : { args: norm.args }),
-                    });
-                    if (norm.subagentSpec) {
-                        const sub = {
-                            type: "subagent_update",
-                            taskId: norm.toolCallId,
-                            agent: norm.subagentSpec.typeName,
-                            label: isRedacted ? "[redacted]" : norm.subagentSpec.role,
-                            status: "running",
-                            startedAt: at,
-                            ...(norm.subagentSpec.model ? { model: norm.subagentSpec.model } : {}),
-                            tools: [],
-                        };
-                        this.setSubagent(norm.toolCallId, sub);
-                        outEvents.push(this.cloneSubagent(sub, isRedacted));
-                    }
-                }
-            }
-            return;
-        }
-        if (step.type === "GENERIC" && this.pendingTools.length > 0) {
-            const pending = this.pendingTools.shift();
-            const isError = step.status === "ERROR";
-            const rawOut = typeof step.content === "string" ? step.content : "";
-            if (pending.killTaskSender && !isError) {
-                const killed = this.bgTasks.get(pending.killTaskSender);
-                if (killed) {
-                    this.bgTasks.delete(pending.killTaskSender);
-                    this.finalizeToolResult(`${eid}:killed`, killed.toolCallId, killed.name, killed.startedAt, at, false, rawOut || killed.lastTail || "", isRedacted, outEvents);
-                }
-            }
-            if (!pending.subagentIds?.length && !isError && (step.status === "RUNNING" || !step.status)) {
-                const bgAck = parseBackgroundTaskAck(rawOut);
-                if (bgAck) {
-                    const logPath = this.resolveTaskLogPath(bgAck.taskSender, bgAck.logUri);
-                    const cursor = {
-                        taskSender: bgAck.taskSender,
-                        toolCallId: pending.toolCallId,
-                        name: pending.name,
-                        args: pending.args,
-                        startedAt: pending.at,
-                        lastActivityAt: Date.now(),
-                        isDaemon: Boolean(pending.isDaemon),
-                        logPath,
-                        hasExplicitLogUri: Boolean(bgAck.logUri),
-                        lastSize: 0,
-                        lastMtimeMs: 0,
-                    };
-                    this.setBgTask(bgAck.taskSender, cursor);
-                    this.pollBackgroundTaskCursor(cursor, outEvents, isRedacted);
-                    if (!isRedacted && !cursor.lastTail && bgAck.initialTail) {
-                        cursor.lastTail = bgAck.initialTail;
-                        outEvents.push({
-                            type: "tool_execution_update",
-                            toolCallId: cursor.toolCallId,
-                            toolName: cursor.name,
-                            partialResult: { content: [{ type: "text", text: bgAck.initialTail }] },
-                        });
-                    }
-                    return;
-                }
-            }
-            const targetIds = pending.subagentIds && pending.subagentIds.length > 0 ? pending.subagentIds : [pending.toolCallId];
-            for (let si = 0; si < targetIds.length; si++) {
-                this.finalizeToolResult(si === 0 ? eid : `${eid}:${si}`, targetIds[si], pending.name, pending.at, at, isError, rawOut, isRedacted, outEvents);
-            }
-            if (pending.subagentIds && pending.subagentIds.length > 0) {
-                const refs = isError ? [] : parseSpawnedSubagentRefs(rawOut);
-                const hasValidAck = !isError && refs.some(Boolean);
-                for (let si = 0; si < pending.subagentIds.length; si++) {
-                    const subId = pending.subagentIds[si];
-                    const sub = this.subagents.get(subId);
-                    if (!sub)
-                        continue;
-                    const ref = hasValidAck ? refs[si] ?? null : null;
-                    if (ref) {
-                        const childPath = this.resolveChildTranscriptPath(ref.conversationId, ref.logAbsoluteUri);
-                        if (childPath) {
-                            this.convToTaskId.set(ref.conversationId, subId);
-                            this.childCursors.set(ref.conversationId, {
-                                taskId: subId,
-                                convId: ref.conversationId,
-                                transcriptPath: childPath,
-                                offset: 0,
-                                remainder: "",
-                                lastStepIndex: -1,
-                                tools: [],
-                                toolCalls: 0,
-                                turns: 0,
-                                tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-                                ...(sub.model ? { model: sub.model } : {}),
-                                modelFromSession: false,
-                            });
-                        }
-                        continue;
-                    }
-                    const finished = {
-                        ...sub,
-                        label: isRedacted ? "[redacted]" : sub.label,
-                        status: isError ? "error" : "done",
-                        endedAt: at,
-                        durationMs: Math.max(0, at - (sub.startedAt ?? at)),
-                        ...(isRedacted
-                            ? {}
-                            : isError
-                                ? { error: truncateBytes(rawOut, MAX_SUBAGENT_RESULT_BYTES).text }
-                                : { result: truncateBytes(rawOut, MAX_SUBAGENT_RESULT_BYTES).text }),
-                    };
-                    if (isRedacted) {
-                        delete finished.thinking;
-                        delete finished.result;
-                        delete finished.error;
-                    }
-                    this.setSubagent(subId, finished);
-                    outEvents.push(this.cloneSubagent(finished, isRedacted));
-                }
-                return;
+                this.setSubagent(subId, finished);
+                outEvents.push(this.cloneSubagent(finished, isRedacted));
             }
         }
     }

@@ -29,7 +29,7 @@ export const DEFAULT_CONFIG = {
     subagents: "skip",
     inboxDir: null,
 };
-const GATE_MODES = ["auto-detect", "off", "dangerous", "writes", "all"];
+export const GATE_MODES = ["auto-detect", "off", "dangerous", "writes", "all"];
 const DELIVERY = ["auto", "api", "interactive", "herdr"];
 function bool(v, d) {
     return typeof v === "boolean" ? v : d;

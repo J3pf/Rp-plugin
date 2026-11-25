@@ -1,7 +1,7 @@
 // Per-session state: created in session_start, destroyed in session_shutdown (PLAN §5).
 import os from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { newId, type AgentEventPayload, type AgentHelloBody, type AgentStatus, type Envelope, type GentleMode, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
+import { CLOSE, newId, type AgentEventPayload, type AgentHelloBody, type AgentStatus, type Envelope, type GentleMode, type TodoTask, type WelcomeBody } from "../shared/protocol.ts";
 import { parseTodoTasks, redactTodoTasks, replayTodoBranch } from "./todos.ts";
 import { LruSet, errMsg, preview, safeUser } from "../shared/util.ts";
 import { readGitHeadAndDirty } from "../host/git.ts";
@@ -312,7 +312,7 @@ export class Runtime {
 
   forward(name: ForwardedEvent, ev: any, ctx: ExtensionContext): void {
     if (this.disposed) return;
-    if ((name === "message_update" || name === "tool_execution_update") && this.info) {
+    if (name === "message_update" || name === "tool_execution_update") {
       this.lastCtx = ctx;
     } else {
       this.touch(ctx);
@@ -718,7 +718,11 @@ export class Runtime {
   private onFatal(code: number, reason: string): void {
     this.fatal = { code, reason };
     const why =
-      code === 4001 ? "credenciales inválidas o revocadas; vuelve a emparejar con /rp pair" : code === 4002 ? "versión de protocolo incompatible; actualiza @j3pf/pi-rp o el relay" : "otra instancia abrió la misma sesión";
+      code === CLOSE.INVALID_TOKEN
+        ? "credenciales inválidas o revocadas; vuelve a emparejar con /rp pair"
+        : code === CLOSE.INCOMPATIBLE
+          ? "versión de protocolo incompatible; actualiza @j3pf/pi-rp o el relay"
+          : "otra instancia abrió la misma sesión";
     this.notify(`RP desconectado (${code}): ${why}`, "warning");
     try {
       this.lastCtx.ui.setStatus("rp", "RP ✗");

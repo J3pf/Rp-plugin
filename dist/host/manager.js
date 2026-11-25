@@ -8,7 +8,7 @@ import { HerdrBackend } from "./backends/herdr.js";
 import { TmuxBackend } from "./backends/tmux.js";
 import { ConsoleBackend, WindowsTerminalBackend } from "./backends/windows.js";
 import { run as realRun } from "./runner.js";
-import { HostError, resolveLauncher, resolveWithinRoots, sanitizeLabel, validatePaneId, validateSessionId, validateSpawnId } from "./validate.js";
+import { HostError, isExternalCliLauncher, resolveLauncher, resolveWithinRoots, sanitizeLabel, validatePaneId, validateSessionId, validateSpawnId } from "./validate.js";
 import { QuotaCollector } from "./quota.js";
 export class HostManager {
     cfg;
@@ -123,8 +123,7 @@ export class HostManager {
             throw new HostError("bad_request", "herdrTarget requires the herdr backend");
         const spawnId = newId();
         const sessionId = p.sessionId ? validateSessionId(p.sessionId) : undefined;
-        const launcherBin = path.basename(splitCommand(launcher.command)[0] ?? "").replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
-        const isExternalCli = launcherBin === "claude" || launcherBin === "codex" || launcherBin === "agy";
+        const isExternalCli = isExternalCliLauncher(splitCommand(launcher.command));
         const launcherCommand = sessionId && !isExternalCli ? `${launcher.command} --session ${sessionId}` : launcher.command;
         const rec = await this.backends[backendName].spawn({ cwd, name, launcherCommand, spawnId, herdrTarget: p.herdrTarget, sessionId });
         this.records.set(spawnId, rec);

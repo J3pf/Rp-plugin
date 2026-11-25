@@ -33,7 +33,7 @@ interface PermissionRequest {
 
 export class Classifier {
   private pending: PermissionRequest | null = null;
-  /** When set, `adapterTool` identifies the gentle-pi tool whose custom() dialog is being adapted. */
+  /** Tracks recent permission-request events to correlate follow-up confirm dialogs within `sameTickMs`. */
   constructor(private now: () => number = Date.now, private sameTickMs = 150) {}
 
   /** `pi-permission-system:permission-request` (gentle-pi P1): fired right before the confirm dialog. */

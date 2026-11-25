@@ -327,6 +327,164 @@ function isLaunchdJobRunning(status: { code: number; stdout: string }): boolean 
   return true;
 }
 
+async function inspectLinuxService(home: string, inspection: ServiceInspection, run: Runner): Promise<ServiceInspection> {
+  const unitPath = systemdUnitPath(home);
+  const enabled = await run("systemctl", ["--user", "is-enabled", "rp-host"]);
+  const active = await run("systemctl", ["--user", "is-active", "rp-host"]);
+  const linger = await checkLinger(undefined, run);
+  inspection.details = { linger: linger.lingering, ...(linger.error ? { lingerError: linger.error } : {}) };
+  inspection.enabled = enabled.code === 0;
+  if (!fs.existsSync(unitPath)) return inspection;
+
+  inspection.installed = true;
+  const reasons: string[] = [];
+  let unit = "";
+  try {
+    unit = fs.readFileSync(unitPath, "utf8");
+  } catch (error) {
+    reasons.push(`could not read systemd unit: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const execStart = unit.match(/^ExecStart=(.*)$/m)?.[1];
+  const args = execStart ? parseExecStart(execStart) : [];
+  inspection.nodePath = args[0];
+  inspection.scriptPath = args[1];
+  inspection.nodePathValid = validInstalledNode(inspection.nodePath);
+  inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
+  if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
+  if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
+  if (inspection.enabled === false) reasons.push("systemd user service is disabled");
+  if (!unit.split("\n").some((line) => /^StartLimitIntervalSec\s*=\s*0\s*$/.test(line))) reasons.push("systemd unit is missing StartLimitIntervalSec=0");
+  if (!unit.split("\n").some((line) => line.startsWith('Environment="PATH='))) reasons.push('systemd unit is missing Environment="PATH=..."');
+  inspection.running = active.code === 0 || active.stdout === "active\n";
+  inspection.stale = reasons.length > 0;
+  if (inspection.stale) inspection.staleReason = uniqueReasons(reasons).join("; ");
+  return inspection;
+}
+
+async function inspectDarwinService(home: string, inspection: ServiceInspection, run: Runner): Promise<ServiceInspection> {
+  const plistPath = launchdPath(home);
+  if (!fs.existsSync(plistPath)) return inspection;
+  inspection.installed = true;
+  let plist = "";
+  const reasons: string[] = [];
+  try {
+    plist = fs.readFileSync(plistPath, "utf8");
+  } catch (error) {
+    reasons.push(`could not read launchd plist: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const args = xmlArray(plist, "ProgramArguments");
+  inspection.nodePath = args[0];
+  inspection.scriptPath = args[1];
+  inspection.nodePathValid = validInstalledNode(inspection.nodePath);
+  inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
+  if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
+  if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
+  const hasEnvironment = plist.includes("<key>EnvironmentVariables</key>");
+  inspection.details = { environmentVariables: hasEnvironment };
+  if (!hasEnvironment) reasons.push("launchd plist is missing EnvironmentVariables");
+  const status = await run("launchctl", ["list", LAUNCHD_LABEL]);
+  inspection.running = isLaunchdJobRunning(status);
+  inspection.stale = reasons.length > 0;
+  if (inspection.stale) inspection.staleReason = uniqueReasons(reasons).join("; ");
+  return inspection;
+}
+
+async function inspectWin32Service(inspection: ServiceInspection, run: Runner): Promise<ServiceInspection> {
+  const query = await run("schtasks", ["/Query", "/TN", "rp-host", "/XML"]);
+  if (query.code !== 0) return inspection;
+  inspection.installed = true;
+  const rawXml = query.stdout;
+  const xml = normalizeXmlString(rawXml);
+  const command = xmlValue(xml, "Command") ?? "";
+  const argumentsValue = xmlValue(xml, "Arguments") ?? "";
+  const isConhost = /(?:^|[\\/])conhost(?:\.exe)?$/i.test(command);
+  if (isConhost) {
+    const match = argumentsValue.match(/--headless\s+(?:"([^"]+)"|(\S+))\s+(?:"([^"]+)"|(\S+))/i);
+    if (match) {
+      inspection.nodePath = match[1] ?? match[2];
+      inspection.scriptPath = match[3] ?? match[4];
+    }
+  } else {
+    const trimmedArguments = argumentsValue.trim();
+    const firstQuote = trimmedArguments.startsWith('"') ? trimmedArguments.indexOf('"', 1) : -1;
+    inspection.nodePath = command;
+    inspection.scriptPath = firstQuote > 1 ? trimmedArguments.slice(1, firstQuote) : trimmedArguments.split(/\s/, 1)[0];
+  }
+  inspection.nodePathValid = validInstalledNode(inspection.nodePath);
+  inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
+
+  let taskState: string | undefined;
+  const ps = await run("powershell", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "(Get-ScheduledTask -TaskName 'rp-host').State",
+  ]);
+  if (ps.code === 0 && ps.stdout.trim()) {
+    taskState = ps.stdout.trim();
+    inspection.running = /^running$/i.test(taskState);
+    if (/^disabled$/i.test(taskState)) inspection.enabled = false;
+    else if (/^(?:running|ready)$/i.test(taskState)) inspection.enabled = true;
+  } else {
+    const status = await run("schtasks", ["/Query", "/TN", "rp-host", "/V", "/FO", "LIST"]);
+    const lines = status.stdout.split("\n").map((line) => line.trim().replace(/\r$/, ""));
+    const isRunning = lines.some((line) =>
+      /^(?:status|estado|statut)\s*:\s*(?:running|en ejecución|en cours d'exécution|wird ausgeführt)$/i.test(line)
+    );
+    const isStopped = lines.some((line) =>
+      /^(?:status|estado|statut)\s*:\s*(?:ready|listo|prêt|bereit|disabled|deshabilitado|désactivé)$/i.test(line)
+    );
+    if (isRunning) {
+      taskState = "Running";
+      inspection.running = true;
+    } else if (isStopped) {
+      taskState = "Ready";
+      inspection.running = false;
+    } else {
+      taskState = "Unknown";
+      inspection.running = true;
+    }
+  }
+
+  const executionTimeLimit = xmlValue(xml, "ExecutionTimeLimit");
+  const disallowStartIfOnBatteries = xmlValue(xml, "DisallowStartIfOnBatteries");
+  const stopIfGoingOnBatteries = xmlValue(xml, "StopIfGoingOnBatteries");
+  const startWhenAvailable = xmlValue(xml, "StartWhenAvailable");
+  const settings = xml.match(/<Settings>([\s\S]*?)<\/Settings>/i)?.[1] ?? "";
+  const enabled = xmlValue(settings, "Enabled");
+  const multipleInstancesPolicy = xmlValue(xml, "MultipleInstancesPolicy");
+  const restartInterval = xmlValue(xml, "Interval");
+  const restartCount = xmlValue(xml, "Count");
+  inspection.details = {
+    command,
+    arguments: argumentsValue,
+    taskState,
+    executionTimeLimit,
+    disallowStartIfOnBatteries: disallowStartIfOnBatteries === undefined ? undefined : disallowStartIfOnBatteries.toLowerCase() === "true",
+    stopIfGoingOnBatteries: stopIfGoingOnBatteries === undefined ? undefined : stopIfGoingOnBatteries.toLowerCase() === "true",
+    startWhenAvailable: startWhenAvailable === undefined ? undefined : startWhenAvailable.toLowerCase() === "true",
+    enabled: enabled === undefined ? inspection.enabled : enabled.toLowerCase() === "true",
+    multipleInstancesPolicy,
+    restartOnFailure: restartInterval !== undefined && restartCount !== undefined ? { interval: restartInterval, count: Number(restartCount) } : undefined,
+  };
+  if (enabled !== undefined) inspection.enabled = enabled.toLowerCase() === "true";
+  const reasons: string[] = [];
+  if (!isConhost) reasons.push("task does not use windowless conhost launcher (visible console window)");
+  else if (!/--headless/i.test(argumentsValue)) reasons.push("task arguments missing --headless flag");
+  if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
+  if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
+  if (inspection.enabled === false) reasons.push("task is disabled");
+  if (executionTimeLimit !== "PT0S") reasons.push("task is missing ExecutionTimeLimit=PT0S");
+  if (disallowStartIfOnBatteries?.toLowerCase() !== "false") reasons.push("task does not allow starting on battery power");
+  if (stopIfGoingOnBatteries?.toLowerCase() !== "false") reasons.push("task may stop when switching to battery power");
+  if (startWhenAvailable?.toLowerCase() !== "true") reasons.push("task is missing StartWhenAvailable=true");
+  if (multipleInstancesPolicy !== "IgnoreNew") reasons.push("task is missing MultipleInstancesPolicy=IgnoreNew");
+  if (restartInterval !== "PT1M" || restartCount !== "999") reasons.push("task is missing its restart-on-failure policy");
+  inspection.stale = reasons.length > 0;
+  if (inspection.stale) inspection.staleReason = uniqueReasons(reasons).join("; ");
+  return inspection;
+}
+
 export async function inspectService(spec: ServiceSpec, run: Runner = realRun): Promise<ServiceInspection> {
   const home = spec.home ?? os.homedir();
   const inspection: ServiceInspection = {
@@ -338,164 +496,9 @@ export async function inspectService(spec: ServiceSpec, run: Runner = realRun): 
     stale: false,
   };
 
-  if (spec.platform === "linux") {
-    const unitPath = systemdUnitPath(home);
-    const enabled = await run("systemctl", ["--user", "is-enabled", "rp-host"]);
-    const active = await run("systemctl", ["--user", "is-active", "rp-host"]);
-    const linger = await checkLinger(undefined, run);
-    inspection.details = { linger: linger.lingering, ...(linger.error ? { lingerError: linger.error } : {}) };
-    inspection.enabled = enabled.code === 0;
-    if (!fs.existsSync(unitPath)) return inspection;
-
-    inspection.installed = true;
-    const reasons: string[] = [];
-    let unit = "";
-    try {
-      unit = fs.readFileSync(unitPath, "utf8");
-    } catch (error) {
-      reasons.push(`could not read systemd unit: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    const execStart = unit.match(/^ExecStart=(.*)$/m)?.[1];
-    const args = execStart ? parseExecStart(execStart) : [];
-    inspection.nodePath = args[0];
-    inspection.scriptPath = args[1];
-    inspection.nodePathValid = validInstalledNode(inspection.nodePath);
-    inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
-    if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
-    if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
-    if (inspection.enabled === false) reasons.push("systemd user service is disabled");
-    if (!unit.split("\n").some((line) => /^StartLimitIntervalSec\s*=\s*0\s*$/.test(line))) reasons.push("systemd unit is missing StartLimitIntervalSec=0");
-    if (!unit.split("\n").some((line) => line.startsWith('Environment="PATH='))) reasons.push('systemd unit is missing Environment="PATH=..."');
-    inspection.running = active.code === 0 || active.stdout === "active\n";
-    inspection.stale = reasons.length > 0;
-    if (inspection.stale) inspection.staleReason = uniqueReasons(reasons).join("; ");
-    return inspection;
-  }
-
-  if (spec.platform === "darwin") {
-    const plistPath = launchdPath(home);
-    if (!fs.existsSync(plistPath)) return inspection;
-    inspection.installed = true;
-    let plist = "";
-    const reasons: string[] = [];
-    try {
-      plist = fs.readFileSync(plistPath, "utf8");
-    } catch (error) {
-      reasons.push(`could not read launchd plist: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    const args = xmlArray(plist, "ProgramArguments");
-    inspection.nodePath = args[0];
-    inspection.scriptPath = args[1];
-    inspection.nodePathValid = validInstalledNode(inspection.nodePath);
-    inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
-    if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
-    if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
-    const hasEnvironment = plist.includes("<key>EnvironmentVariables</key>");
-    inspection.details = { environmentVariables: hasEnvironment };
-    if (!hasEnvironment) reasons.push("launchd plist is missing EnvironmentVariables");
-    const status = await run("launchctl", ["list", LAUNCHD_LABEL]);
-    inspection.running = isLaunchdJobRunning(status);
-    inspection.stale = reasons.length > 0;
-    if (inspection.stale) inspection.staleReason = uniqueReasons(reasons).join("; ");
-    return inspection;
-  }
-
-  if (spec.platform === "win32") {
-    const query = await run("schtasks", ["/Query", "/TN", "rp-host", "/XML"]);
-    if (query.code !== 0) return inspection;
-    inspection.installed = true;
-    const rawXml = query.stdout;
-    const xml = normalizeXmlString(rawXml);
-    const command = xmlValue(xml, "Command") ?? "";
-    const argumentsValue = xmlValue(xml, "Arguments") ?? "";
-    const isConhost = /(?:^|[\\/])conhost(?:\.exe)?$/i.test(command);
-    if (isConhost) {
-      const match = argumentsValue.match(/--headless\s+(?:"([^"]+)"|(\S+))\s+(?:"([^"]+)"|(\S+))/i);
-      if (match) {
-        inspection.nodePath = match[1] ?? match[2];
-        inspection.scriptPath = match[3] ?? match[4];
-      }
-    } else {
-      const trimmedArguments = argumentsValue.trim();
-      const firstQuote = trimmedArguments.startsWith('"') ? trimmedArguments.indexOf('"', 1) : -1;
-      inspection.nodePath = command;
-      inspection.scriptPath = firstQuote > 1 ? trimmedArguments.slice(1, firstQuote) : trimmedArguments.split(/\s/, 1)[0];
-    }
-    inspection.nodePathValid = validInstalledNode(inspection.nodePath);
-    inspection.scriptPathValid = validInstalledScript(inspection.scriptPath);
-
-    let taskState: string | undefined;
-    const ps = await run("powershell", [
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      "(Get-ScheduledTask -TaskName 'rp-host').State",
-    ]);
-    if (ps.code === 0 && ps.stdout.trim()) {
-      taskState = ps.stdout.trim();
-      inspection.running = /^running$/i.test(taskState);
-      if (/^disabled$/i.test(taskState)) inspection.enabled = false;
-      else if (/^(?:running|ready)$/i.test(taskState)) inspection.enabled = true;
-    } else {
-      const status = await run("schtasks", ["/Query", "/TN", "rp-host", "/V", "/FO", "LIST"]);
-      const lines = status.stdout.split("\n").map((line) => line.trim().replace(/\r$/, ""));
-      const isRunning = lines.some((line) =>
-        /^(?:status|estado|statut)\s*:\s*(?:running|en ejecución|en cours d'exécution|wird ausgeführt)$/i.test(line)
-      );
-      const isStopped = lines.some((line) =>
-        /^(?:status|estado|statut)\s*:\s*(?:ready|listo|prêt|bereit|disabled|deshabilitado|désactivé)$/i.test(line)
-      );
-      if (isRunning) {
-        taskState = "Running";
-        inspection.running = true;
-      } else if (isStopped) {
-        taskState = "Ready";
-        inspection.running = false;
-      } else {
-        taskState = "Unknown";
-        inspection.running = true;
-      }
-    }
-
-    const executionTimeLimit = xmlValue(xml, "ExecutionTimeLimit");
-    const disallowStartIfOnBatteries = xmlValue(xml, "DisallowStartIfOnBatteries");
-    const stopIfGoingOnBatteries = xmlValue(xml, "StopIfGoingOnBatteries");
-    const startWhenAvailable = xmlValue(xml, "StartWhenAvailable");
-    const settings = xml.match(/<Settings>([\s\S]*?)<\/Settings>/i)?.[1] ?? "";
-    const enabled = xmlValue(settings, "Enabled");
-    const multipleInstancesPolicy = xmlValue(xml, "MultipleInstancesPolicy");
-    const restartInterval = xmlValue(xml, "Interval");
-    const restartCount = xmlValue(xml, "Count");
-    inspection.details = {
-      command,
-      arguments: argumentsValue,
-      taskState,
-      executionTimeLimit,
-      disallowStartIfOnBatteries: disallowStartIfOnBatteries === undefined ? undefined : disallowStartIfOnBatteries.toLowerCase() === "true",
-      stopIfGoingOnBatteries: stopIfGoingOnBatteries === undefined ? undefined : stopIfGoingOnBatteries.toLowerCase() === "true",
-      startWhenAvailable: startWhenAvailable === undefined ? undefined : startWhenAvailable.toLowerCase() === "true",
-      enabled: enabled === undefined ? inspection.enabled : enabled.toLowerCase() === "true",
-      multipleInstancesPolicy,
-      restartOnFailure: restartInterval !== undefined && restartCount !== undefined ? { interval: restartInterval, count: Number(restartCount) } : undefined,
-    };
-    if (enabled !== undefined) inspection.enabled = enabled.toLowerCase() === "true";
-    const reasons: string[] = [];
-    if (!isConhost) reasons.push("task does not use windowless conhost launcher (visible console window)");
-    else if (!/--headless/i.test(argumentsValue)) reasons.push("task arguments missing --headless flag");
-    if (!inspection.nodePathValid) reasons.push("installed node path is missing or stale");
-    if (!inspection.scriptPathValid) reasons.push("installed host script path is missing");
-    if (inspection.enabled === false) reasons.push("task is disabled");
-    if (executionTimeLimit !== "PT0S") reasons.push("task is missing ExecutionTimeLimit=PT0S");
-    if (disallowStartIfOnBatteries?.toLowerCase() !== "false") reasons.push("task does not allow starting on battery power");
-    if (stopIfGoingOnBatteries?.toLowerCase() !== "false") reasons.push("task may stop when switching to battery power");
-    if (startWhenAvailable?.toLowerCase() !== "true") reasons.push("task is missing StartWhenAvailable=true");
-    if (multipleInstancesPolicy !== "IgnoreNew") reasons.push("task is missing MultipleInstancesPolicy=IgnoreNew");
-    if (restartInterval !== "PT1M" || restartCount !== "999") reasons.push("task is missing its restart-on-failure policy");
-    inspection.stale = reasons.length > 0;
-    if (inspection.stale) inspection.staleReason = uniqueReasons(reasons).join("; ");
-    return inspection;
-  }
-
+  if (spec.platform === "linux") return inspectLinuxService(home, inspection, run);
+  if (spec.platform === "darwin") return inspectDarwinService(home, inspection, run);
+  if (spec.platform === "win32") return inspectWin32Service(inspection, run);
   throw new Error(`unsupported platform ${spec.platform}`);
 }
 
@@ -534,82 +537,88 @@ export async function ensureHostService(spec: ServiceSpec, run: Runner = realRun
   return { action: "none", inspection };
 }
 
+async function installLinuxService(spec: ServiceSpec, home: string, searchEnv: NodeJS.ProcessEnv, run: Runner): Promise<string> {
+  const installedSpec = {
+    ...spec,
+    nodePath: resolveStableNodePath(searchEnv, spec.platform, spec.nodePath),
+    envPath: spec.envPath ?? process.env.PATH,
+  };
+  const f = systemdUnitPath(home);
+  const hadUnit = fs.existsSync(f);
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, systemdUnit(installedSpec));
+  let warning = "";
+  const linger = await checkLinger(undefined, run);
+  if (!linger.lingering) {
+    const enabled = await enableLinger(undefined, run);
+    if (!enabled.ok) warning = `; warning: ${enabled.message}`;
+  }
+  await run("systemctl", ["--user", "daemon-reload"]);
+  const r = await run("systemctl", ["--user", "enable", "--now", "rp-host"]);
+  if (r.code !== 0) throw new Error(`systemctl enable failed: ${r.stderr.trim()}`);
+  if (hadUnit) {
+    await run("systemctl", ["--user", "restart", "rp-host"]);
+  }
+  return `systemd user service installed (${f})${warning}`;
+}
+
+async function installWin32Service(spec: ServiceSpec, searchEnv: NodeJS.ProcessEnv, run: Runner): Promise<string> {
+  const installedSpec = {
+    ...spec,
+    nodePath: resolveStableNodePath(searchEnv, spec.platform, spec.nodePath),
+  };
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-host-task-"));
+  const xmlPath = path.join(tempDir, "task.xml");
+  try {
+    const xml = schtasksXml(installedSpec);
+    const bom = Buffer.from([0xff, 0xfe]);
+    const body = Buffer.from(xml, "utf16le");
+    fs.writeFileSync(xmlPath, Buffer.concat([bom, body]));
+    const r = await run("schtasks", schtasksCreateArgs(installedSpec, xmlPath));
+    if (r.code !== 0) throw new Error(`schtasks failed: ${r.stderr.trim() || r.stdout.trim()}`);
+    await run("schtasks", ["/Run", "/TN", "rp-host"]);
+    return "scheduled task rp-host created (runs at logon)";
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function installDarwinService(spec: ServiceSpec, home: string, searchEnv: NodeJS.ProcessEnv, run: Runner): Promise<string> {
+  const installedSpec = {
+    ...spec,
+    nodePath: resolveStableNodePath(searchEnv, spec.platform, spec.nodePath),
+    envPath: spec.envPath ?? process.env.PATH,
+  };
+  const f = launchdPath(home);
+  const hadPlist = fs.existsSync(f);
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.mkdirSync(path.join(home, "Library", "Logs"), { recursive: true });
+  fs.writeFileSync(f, launchdPlist(installedSpec));
+  const domain = launchdDomain();
+  if (hadPlist) {
+    const bootout = await run("launchctl", ["bootout", `${domain}/${LAUNCHD_LABEL}`]);
+    if (bootout.code !== 0) await run("launchctl", ["unload", "-w", f]);
+  }
+  const bootstrap = await run("launchctl", ["bootstrap", domain, f]);
+  if (bootstrap.code !== 0) {
+    const fallback = await run("launchctl", ["load", "-w", f]);
+    if (fallback.code !== 0) {
+      throw new Error(`launchctl bootstrap failed: ${bootstrap.stderr.trim()}; load fallback failed: ${fallback.stderr.trim()}`);
+    }
+  }
+  const kickstart = await run("launchctl", ["kickstart", "-k", `${domain}/${LAUNCHD_LABEL}`]);
+  if (kickstart.code !== 0) throw new Error(`launchctl kickstart failed: ${kickstart.stderr.trim()}`);
+  return `launchd agent installed (${f})`;
+}
+
 export async function installService(spec: ServiceSpec, run: Runner = realRun): Promise<string> {
   const home = spec.home ?? os.homedir();
   const searchEnv = spec.envPath !== undefined
     ? { ...process.env, PATH: spec.envPath, Path: spec.envPath }
     : process.env;
-  if (spec.platform === "linux") {
-    const installedSpec = {
-      ...spec,
-      nodePath: resolveStableNodePath(searchEnv, spec.platform, spec.nodePath),
-      envPath: spec.envPath ?? process.env.PATH,
-    };
-    const f = systemdUnitPath(home);
-    const hadUnit = fs.existsSync(f);
-    fs.mkdirSync(path.dirname(f), { recursive: true });
-    fs.writeFileSync(f, systemdUnit(installedSpec));
-    let warning = "";
-    const linger = await checkLinger(undefined, run);
-    if (!linger.lingering) {
-      const enabled = await enableLinger(undefined, run);
-      if (!enabled.ok) warning = `; warning: ${enabled.message}`;
-    }
-    await run("systemctl", ["--user", "daemon-reload"]);
-    const r = await run("systemctl", ["--user", "enable", "--now", "rp-host"]);
-    if (r.code !== 0) throw new Error(`systemctl enable failed: ${r.stderr.trim()}`);
-    if (hadUnit) {
-      await run("systemctl", ["--user", "restart", "rp-host"]);
-    }
-    return `systemd user service installed (${f})${warning}`;
-  }
-  if (spec.platform === "win32") {
-    const installedSpec = {
-      ...spec,
-      nodePath: resolveStableNodePath(searchEnv, spec.platform, spec.nodePath),
-    };
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rp-host-task-"));
-    const xmlPath = path.join(tempDir, "task.xml");
-    try {
-      const xml = schtasksXml(installedSpec);
-      const bom = Buffer.from([0xff, 0xfe]);
-      const body = Buffer.from(xml, "utf16le");
-      fs.writeFileSync(xmlPath, Buffer.concat([bom, body]));
-      const r = await run("schtasks", schtasksCreateArgs(installedSpec, xmlPath));
-      if (r.code !== 0) throw new Error(`schtasks failed: ${r.stderr.trim() || r.stdout.trim()}`);
-      await run("schtasks", ["/Run", "/TN", "rp-host"]);
-      return "scheduled task rp-host created (runs at logon)";
-    } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    }
-  }
-  if (spec.platform === "darwin") {
-    const installedSpec = {
-      ...spec,
-      nodePath: resolveStableNodePath(searchEnv, spec.platform, spec.nodePath),
-      envPath: spec.envPath ?? process.env.PATH,
-    };
-    const f = launchdPath(home);
-    const hadPlist = fs.existsSync(f);
-    fs.mkdirSync(path.dirname(f), { recursive: true });
-    fs.mkdirSync(path.join(home, "Library", "Logs"), { recursive: true });
-    fs.writeFileSync(f, launchdPlist(installedSpec));
-    const domain = launchdDomain();
-    if (hadPlist) {
-      const bootout = await run("launchctl", ["bootout", `${domain}/${LAUNCHD_LABEL}`]);
-      if (bootout.code !== 0) await run("launchctl", ["unload", "-w", f]);
-    }
-    const bootstrap = await run("launchctl", ["bootstrap", domain, f]);
-    if (bootstrap.code !== 0) {
-      const fallback = await run("launchctl", ["load", "-w", f]);
-      if (fallback.code !== 0) {
-        throw new Error(`launchctl bootstrap failed: ${bootstrap.stderr.trim()}; load fallback failed: ${fallback.stderr.trim()}`);
-      }
-    }
-    const kickstart = await run("launchctl", ["kickstart", "-k", `${domain}/${LAUNCHD_LABEL}`]);
-    if (kickstart.code !== 0) throw new Error(`launchctl kickstart failed: ${kickstart.stderr.trim()}`);
-    return `launchd agent installed (${f})`;
-  }
+  if (spec.platform === "linux") return installLinuxService(spec, home, searchEnv, run);
+  if (spec.platform === "win32") return installWin32Service(spec, searchEnv, run);
+  if (spec.platform === "darwin") return installDarwinService(spec, home, searchEnv, run);
   throw new Error(`unsupported platform ${spec.platform}`);
 }
 

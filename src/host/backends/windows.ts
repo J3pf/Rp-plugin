@@ -1,8 +1,7 @@
 // Windows backends: Windows Terminal (`wt.exe`) and direct detached console spawn.
 // Neither passes environment variables, so the id travels as the `--rp-spawn-id` flag registered by the plugin for Pi launchers.
 import { spawn } from "node:child_process";
-import path from "node:path";
-import { HostError, splitCommand, validateSessionId, validateSpawnId } from "../validate.ts";
+import { HostError, isExternalCliLauncher, splitCommand, validateSessionId, validateSpawnId } from "../validate.ts";
 import type { Backend, BackendDeps, SpawnRecord, SpawnRequest } from "./types.ts";
 
 const CMD_META_RE = /[&|<>^%\r\n\0"!]/;
@@ -32,11 +31,6 @@ function defaultSpawnDetached(cmd: string, args: string[], opts: ConsoleSpawnOpt
       resolve();
     });
   });
-}
-
-function isExternalCliLauncher(parts: string[]): boolean {
-  const bin = path.basename(parts[0] ?? "").replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
-  return bin === "claude" || bin === "codex" || bin === "agy";
 }
 
 export function wtArgs(req: SpawnRequest): string[] {

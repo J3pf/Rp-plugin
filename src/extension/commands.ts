@@ -4,15 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import dns from "node:dns/promises";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { httpRequest, toHttpUrl, toWsUrl } from "../shared/http.ts";
+import { createRelayWebSocket, httpRequest, toHttpUrl, toWsUrl } from "../shared/http.ts";
+import { CLOSE } from "../shared/protocol.ts";
 import { piHomes } from "../shared/platform.ts";
 import { errMsg, splitCommand } from "../shared/util.ts";
-import { updateConfigFile, type GateMode, type RpConfig } from "./config.ts";
+import { GATE_MODES, updateConfigFile, type GateMode, type RpConfig } from "./config.ts";
 import { GENTLE_RANGE, detectGentleVersion, gentleVersionSupported, hasGentleAskTools } from "./compat.ts";
 import type { Runtime } from "./runtime.ts";
 import { promptContext } from "./prompts/classify.ts";
-import WebSocket from "ws";
-import { getProxyAgent } from "../shared/http.ts";
+import type WebSocket from "ws";
 
 export interface CommandHooks {
   cfg: RpConfig;
@@ -25,7 +25,6 @@ export interface CommandHooks {
 export const PLUGIN_PACKAGE = "@j3pf/pi-rp";
 export const PLUGIN_GIT_SOURCE = "git:github.com/J3pf/Rp-plugin";
 const SUBCOMMANDS = ["pair", "status", "doctor", "on", "off", "gate", "test", "unpair"];
-const GATE_MODES: GateMode[] = ["auto-detect", "off", "dangerous", "writes", "all"];
 
 /** Split a command line honoring single/double quotes. */
 export const tokenize = splitCommand;
@@ -188,7 +187,16 @@ export function checkDeclared(env = process.env): Check[] {
 }
 
 async function probeWs(url: string, token: string): Promise<{ ok: boolean; detail: string }> {
-  const agent = await getProxyAgent();
+  const t0 = Date.now();
+  let ws: WebSocket;
+  try {
+    ws = await createRelayWebSocket(toWsUrl(url, "/ws/agent"), token, {
+      handshakeTimeout: 8_000,
+      perMessageDeflate: false,
+    });
+  } catch (e) {
+    return { ok: false, detail: errMsg(e) };
+  }
   return new Promise((resolve) => {
     let done = false;
     const finish = (ok: boolean, detail: string) => {
@@ -201,21 +209,13 @@ async function probeWs(url: string, token: string): Promise<{ ok: boolean; detai
       }
       resolve({ ok, detail });
     };
-    const t0 = Date.now();
-    let ws: WebSocket;
-    try {
-      ws = new WebSocket(toWsUrl(url, "/ws/agent"), { headers: { Authorization: `Bearer ${token}` }, agent, handshakeTimeout: 8000 });
-    } catch (e) {
-      resolve({ ok: false, detail: errMsg(e) });
-      return;
-    }
     ws.on("open", () => finish(true, `${Date.now() - t0} ms`));
     ws.on("unexpected-response", (_r, res) => {
       res.resume();
       finish(false, res.statusCode === 401 || res.statusCode === 403 ? `token rechazado (http ${res.statusCode})` : `http ${res.statusCode}`);
     });
     ws.on("error", (e) => finish(false, errMsg(e)));
-    ws.on("close", (code) => finish(false, code === 4001 ? "token rechazado (4001)" : `cerrado ${code}`));
+    ws.on("close", (code) => finish(false, code === CLOSE.INVALID_TOKEN ? `token rechazado (${CLOSE.INVALID_TOKEN})` : `cerrado ${code}`));
     setTimeout(() => finish(false, "timeout"), 10_000).unref?.();
   });
 }

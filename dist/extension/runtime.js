@@ -1,6 +1,6 @@
 // Per-session state: created in session_start, destroyed in session_shutdown (PLAN §5).
 import os from "node:os";
-import { newId } from "../shared/protocol.js";
+import { CLOSE, newId } from "../shared/protocol.js";
 import { parseTodoTasks, redactTodoTasks, replayTodoBranch } from "./todos.js";
 import { errMsg, preview, safeUser } from "../shared/util.js";
 import { readGitHeadAndDirty } from "../host/git.js";
@@ -272,7 +272,7 @@ export class Runtime {
     forward(name, ev, ctx) {
         if (this.disposed)
             return;
-        if ((name === "message_update" || name === "tool_execution_update") && this.info) {
+        if (name === "message_update" || name === "tool_execution_update") {
             this.lastCtx = ctx;
         }
         else {
@@ -690,7 +690,11 @@ export class Runtime {
     }
     onFatal(code, reason) {
         this.fatal = { code, reason };
-        const why = code === 4001 ? "credenciales inválidas o revocadas; vuelve a emparejar con /rp pair" : code === 4002 ? "versión de protocolo incompatible; actualiza @j3pf/pi-rp o el relay" : "otra instancia abrió la misma sesión";
+        const why = code === CLOSE.INVALID_TOKEN
+            ? "credenciales inválidas o revocadas; vuelve a emparejar con /rp pair"
+            : code === CLOSE.INCOMPATIBLE
+                ? "versión de protocolo incompatible; actualiza @j3pf/pi-rp o el relay"
+                : "otra instancia abrió la misma sesión";
         this.notify(`RP desconectado (${code}): ${why}`, "warning");
         try {
             this.lastCtx.ui.setStatus("rp", "RP ✗");

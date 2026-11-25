@@ -1,3 +1,4 @@
+import { stripAnsi } from "../../../shared/util.js";
 import { parseOptionIndex } from "../broker.js";
 // Keep scraping independent of the user's terminal width; the component wraps at this width.
 export const REVIEW_CONSENT_RENDER_WIDTH = 80;
@@ -7,12 +8,11 @@ const DETAILS_FOOTER = "PgUp/PgDn · D return · Esc";
 // review-consent-component.ts routes this terminal PageDown sequence to matchesKey(..., "pageDown").
 const PAGE_DOWN_KEY = "\u001b[6~";
 const MAX_DETAILS_PAGES = 512;
-const ANSI = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\)|[@-_])/g;
 function renderedLines(component) {
     const value = component.render(REVIEW_CONSENT_RENDER_WIDTH);
     if (!Array.isArray(value) || !value.every((line) => typeof line === "string"))
         return null;
-    return value.map((line) => line.replace(ANSI, ""));
+    return value.map((line) => stripAnsi(line));
 }
 function sameLines(a, b) {
     return a.length === b.length && a.every((line, i) => line === b[i]);

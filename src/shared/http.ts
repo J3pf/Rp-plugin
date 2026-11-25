@@ -2,6 +2,8 @@
 import http from "node:http";
 import https from "node:https";
 import type { Agent } from "node:http";
+import WebSocket from "ws";
+import { CLOSE, MAX_FRAME_BYTES } from "./protocol.ts";
 
 let sharedAgentPromise: Promise<Agent | undefined> | undefined;
 export function getProxyAgent(): Promise<Agent | undefined> {
@@ -229,4 +231,78 @@ export class WsKeepalive {
     if (this.watchdog) clearTimeout(this.watchdog);
     this.watchdog = null;
   }
+}
+
+export const DEFAULT_WS_HANDSHAKE_TIMEOUT_MS = 10_000;
+
+const DEFAULT_WS_PER_MESSAGE_DEFLATE = {
+  threshold: 1024,
+  clientNoContextTakeover: true,
+  serverNoContextTakeover: true,
+} as const;
+
+/** Returns true for relay close codes that must permanently stop reconnection. */
+export function isFatalCloseCode(code: number | undefined): boolean {
+  return code === CLOSE.INVALID_TOKEN || code === CLOSE.INCOMPATIBLE || code === CLOSE.REPLACED;
+}
+
+export interface RelayWebSocketOptions {
+  handshakeTimeout?: number;
+  maxPayload?: number;
+  perMessageDeflate?: WebSocket.ClientOptions["perMessageDeflate"];
+  keepalive?: WsKeepalive;
+  agent?: Agent;
+  /** Checked after awaiting proxy agent; when true, skips opening the socket and returns null. */
+  isCancelled?: () => boolean;
+  /** Checked on keepalive events so a superseded socket does not arm or stop the active keepalive. */
+  isStale?: (ws: WebSocket) => boolean;
+}
+
+export function createRelayWebSocket(
+  url: string,
+  token: string,
+  opts?: RelayWebSocketOptions & { isCancelled?: undefined },
+): Promise<WebSocket>;
+export function createRelayWebSocket(
+  url: string,
+  token: string,
+  opts: RelayWebSocketOptions & { isCancelled: () => boolean },
+): Promise<WebSocket | null>;
+export async function createRelayWebSocket(
+  url: string,
+  token: string,
+  opts: RelayWebSocketOptions = {},
+): Promise<WebSocket | null> {
+  const agent = opts.agent !== undefined ? opts.agent : await getProxyAgent();
+  if (opts.isCancelled?.()) return null;
+  const ws = new WebSocket(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    agent,
+    maxPayload: opts.maxPayload ?? MAX_FRAME_BYTES,
+    handshakeTimeout: opts.handshakeTimeout ?? DEFAULT_WS_HANDSHAKE_TIMEOUT_MS,
+    perMessageDeflate: opts.perMessageDeflate ?? { ...DEFAULT_WS_PER_MESSAGE_DEFLATE },
+  });
+  const keepalive = opts.keepalive;
+  if (keepalive) {
+    ws.on("open", () => {
+      if (opts.isCancelled?.() || opts.isStale?.(ws)) return;
+      keepalive.start(ws, WebSocket.OPEN);
+    });
+    ws.on("ping", () => {
+      if (opts.isCancelled?.() || opts.isStale?.(ws)) return;
+      keepalive.arm(ws);
+    });
+    ws.on("pong", () => {
+      if (opts.isCancelled?.() || opts.isStale?.(ws)) return;
+      keepalive.arm(ws);
+    });
+    ws.on("message", () => {
+      if (opts.isCancelled?.() || opts.isStale?.(ws)) return;
+      keepalive.arm(ws);
+    });
+    ws.on("close", () => {
+      if (!opts.isStale?.(ws)) keepalive.stop();
+    });
+  }
+  return ws;
 }

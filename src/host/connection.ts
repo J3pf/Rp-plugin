@@ -1,8 +1,8 @@
 // rp-host ⇄ relay: wss://<relay>/ws/host (PROTOCOLO §9).
 import os from "node:os";
 import WebSocket from "ws";
-import { MAX_FRAME_BYTES, CLOSE, envelope, parseEnvelope, type Envelope, type HostHelloBody, type HostQuotasBody } from "../shared/protocol.ts";
-import { WsKeepalive, getProxyAgent, toWsUrl } from "../shared/http.ts";
+import { CLOSE, envelope, parseEnvelope, type Envelope, type HostHelloBody, type HostQuotasBody } from "../shared/protocol.ts";
+import { WsKeepalive, createRelayWebSocket, isFatalCloseCode, toWsUrl } from "../shared/http.ts";
 import { backoffDelay, errMsg } from "../shared/util.ts";
 import type { HostConfig } from "./config.ts";
 import type { HostManager } from "./manager.ts";
@@ -93,7 +93,7 @@ export class HostConnection {
 
   private scheduleReconnect(code?: number): void {
     if (this.stopped) return;
-    if (code === CLOSE.INVALID_TOKEN || code === CLOSE.INCOMPATIBLE || code === CLOSE.REPLACED) {
+    if (isFatalCloseCode(code)) {
       this.log(`relay closed the connection with ${code}; not reconnecting`);
       this.stopped = true;
       return;
@@ -113,26 +113,20 @@ export class HostConnection {
 
   private async connect(): Promise<void> {
     if (this.stopped) return;
-    const agent = await getProxyAgent();
-    if (this.stopped) return;
-    let ws: WebSocket;
+    let ws: WebSocket | null;
     try {
-      ws = new WebSocket(toWsUrl(this.o.relayUrl, "/ws/host"), {
-        headers: { Authorization: `Bearer ${this.o.token}` },
-        agent,
-        maxPayload: MAX_FRAME_BYTES,
-        handshakeTimeout: 10_000,
-        perMessageDeflate: {
-          threshold: 1024,
-          clientNoContextTakeover: true,
-          serverNoContextTakeover: true,
-        },
+      ws = await createRelayWebSocket(toWsUrl(this.o.relayUrl, "/ws/host"), this.o.token, {
+        keepalive: this.keepalive,
+        isCancelled: () => this.stopped,
+        isStale: (sock) => this.ws !== sock,
       });
     } catch (e) {
+      if (this.stopped) return;
       this.log(`ws connect failed: ${errMsg(e)}`);
       this.scheduleReconnect();
       return;
     }
+    if (!ws) return;
     this.ws = ws;
     let lastWsError: string | null = null;
     ws.on("open", () => {
@@ -146,15 +140,11 @@ export class HostConnection {
       }
       lastWsError = null;
       this.armStabilityTimer();
-      this.keepalive.start(ws, WebSocket.OPEN);
       this.startQuotaTimer();
       void this.hello(ws).catch((e) => this.log(`hello failed: ${errMsg(e)}`));
     });
-    ws.on("ping", () => this.keepalive.arm(ws));
-    ws.on("pong", () => this.keepalive.arm(ws));
     ws.on("message", (data) => {
       if (this.stopped || this.ws !== ws) return;
-      this.keepalive.arm(ws);
       const env = parseEnvelope(data.toString("utf8"));
       if (env) void this.handle(env);
     });

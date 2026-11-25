@@ -3,13 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
-import { resolveAgyTranscriptPath } from "../agy-transcript.js";
+import { MODEL_CHANGE_RE, readTailBuffer, resolveAgyTranscriptPath } from "./agy-paths.js";
 import { LruMap, SAFE_CONV_ID_RE } from "../../shared/util.js";
+export { MODEL_CHANGE_RE };
 const CLAUDE_DEFAULT_WINDOW = 200_000;
 const CODEX_DEFAULT_WINDOW = 258_400;
 const AGY_MODEL_CACHE_THROTTLE_MS = 10_000;
 const AGY_MODEL_DB_TIMEOUT_MS = 25;
-export const MODEL_CHANGE_RE = /changed setting `Model Selection` from [^\n]+? to ([^\n<]+?)\.(?:\s|$)/i;
 const agyModelCache = new LruMap(256);
 function statMtimeMs(filePath) {
     try {
@@ -46,27 +46,13 @@ export function readJsonlHeadLine(filePath, maxBytes = 8192) {
     }
 }
 export function readJsonlTailLines(filePath, maxBytes = 64 * 1024) {
-    try {
-        const stat = fs.statSync(filePath);
-        if (!stat.isFile() || stat.size <= 0)
-            return [];
-        const readSize = Math.min(stat.size, maxBytes);
-        const fd = fs.openSync(filePath, "r");
-        try {
-            const buf = Buffer.allocUnsafe(readSize);
-            fs.readSync(fd, buf, 0, readSize, stat.size - readSize);
-            const lines = buf.toString("utf8").split("\n");
-            if (readSize < stat.size && lines.length > 0)
-                lines.shift();
-            return lines;
-        }
-        finally {
-            fs.closeSync(fd);
-        }
-    }
-    catch {
+    const tail = readTailBuffer(filePath, maxBytes);
+    if (!tail)
         return [];
-    }
+    const lines = tail.buf.toString("utf8").split("\n");
+    if (tail.start > 0 && lines.length > 0)
+        lines.shift();
+    return lines;
 }
 export function findClaudeProjectJsonl(cwd, sessionId, home) {
     try {

@@ -1,6 +1,8 @@
 // Minimal HTTP(S) client honoring HTTPS_PROXY / NO_PROXY / NODE_EXTRA_CA_CERTS via proxy-agent.
 import http from "node:http";
 import https from "node:https";
+import WebSocket from "ws";
+import { CLOSE, MAX_FRAME_BYTES } from "./protocol.js";
 let sharedAgentPromise;
 export function getProxyAgent() {
     if (!sharedAgentPromise) {
@@ -213,4 +215,54 @@ export class WsKeepalive {
             clearTimeout(this.watchdog);
         this.watchdog = null;
     }
+}
+export const DEFAULT_WS_HANDSHAKE_TIMEOUT_MS = 10_000;
+const DEFAULT_WS_PER_MESSAGE_DEFLATE = {
+    threshold: 1024,
+    clientNoContextTakeover: true,
+    serverNoContextTakeover: true,
+};
+/** Returns true for relay close codes that must permanently stop reconnection. */
+export function isFatalCloseCode(code) {
+    return code === CLOSE.INVALID_TOKEN || code === CLOSE.INCOMPATIBLE || code === CLOSE.REPLACED;
+}
+export async function createRelayWebSocket(url, token, opts = {}) {
+    const agent = opts.agent !== undefined ? opts.agent : await getProxyAgent();
+    if (opts.isCancelled?.())
+        return null;
+    const ws = new WebSocket(url, {
+        headers: { Authorization: `Bearer ${token}` },
+        agent,
+        maxPayload: opts.maxPayload ?? MAX_FRAME_BYTES,
+        handshakeTimeout: opts.handshakeTimeout ?? DEFAULT_WS_HANDSHAKE_TIMEOUT_MS,
+        perMessageDeflate: opts.perMessageDeflate ?? { ...DEFAULT_WS_PER_MESSAGE_DEFLATE },
+    });
+    const keepalive = opts.keepalive;
+    if (keepalive) {
+        ws.on("open", () => {
+            if (opts.isCancelled?.() || opts.isStale?.(ws))
+                return;
+            keepalive.start(ws, WebSocket.OPEN);
+        });
+        ws.on("ping", () => {
+            if (opts.isCancelled?.() || opts.isStale?.(ws))
+                return;
+            keepalive.arm(ws);
+        });
+        ws.on("pong", () => {
+            if (opts.isCancelled?.() || opts.isStale?.(ws))
+                return;
+            keepalive.arm(ws);
+        });
+        ws.on("message", () => {
+            if (opts.isCancelled?.() || opts.isStale?.(ws))
+                return;
+            keepalive.arm(ws);
+        });
+        ws.on("close", () => {
+            if (!opts.isStale?.(ws))
+                keepalive.stop();
+        });
+    }
+    return ws;
 }

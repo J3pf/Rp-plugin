@@ -38,6 +38,61 @@ export function methodChain(requested, cfgMethod, opts) {
     return chain;
 }
 const ACTIVE_SELECT_WAIT_TIMEOUT_MS = 60_000;
+function appendAttachmentLines(baseText, lines) {
+    if (lines.length === 0)
+        return baseText;
+    return baseText ? `${baseText}\n\n${lines.join("\n")}` : lines.join("\n");
+}
+function createAttachmentCache(msg, deps) {
+    const blobCache = new Map();
+    const cachedFetchBlob = deps.fetchBlob
+        ? (blobId) => {
+            let p = blobCache.get(blobId);
+            if (!p) {
+                p = deps.fetchBlob(blobId);
+                blobCache.set(blobId, p);
+            }
+            return p;
+        }
+        : null;
+    const writtenFiles = new Map();
+    let resolvedApi = null;
+    let resolvedTextNonInline = null;
+    return {
+        async resolveFor(method) {
+            if (!msg.attachments?.length || !cachedFetchBlob) {
+                return { text: msg.text, images: [] };
+            }
+            if (method === "api") {
+                if (!resolvedApi) {
+                    const r = await resolveAttachments(msg.attachments, {
+                        fetchBlob: cachedFetchBlob,
+                        inboxDir: deps.inboxDir(),
+                        sessionId: deps.sessionId(),
+                        inlineImages: true,
+                        writtenFiles,
+                    });
+                    resolvedApi = {
+                        text: appendAttachmentLines(msg.text, r.lines),
+                        images: r.images,
+                    };
+                }
+                return resolvedApi;
+            }
+            if (resolvedTextNonInline === null) {
+                const r = await resolveAttachments(msg.attachments, {
+                    fetchBlob: cachedFetchBlob,
+                    inboxDir: deps.inboxDir(),
+                    sessionId: deps.sessionId(),
+                    inlineImages: false,
+                    writtenFiles,
+                });
+                resolvedTextNonInline = appendAttachmentLines(msg.text, r.lines);
+            }
+            return { text: resolvedTextNonInline, images: [] };
+        },
+    };
+}
 export class Deliverer {
     d;
     seen = new LruSet(500);
@@ -59,22 +114,15 @@ export class Deliverer {
         this.tail = step;
         return step.then(() => bg ?? undefined).catch(() => { });
     }
-    async process(msg, onBackground) {
+    async tryHandleSlashCommand(msg, ctx, textTrimmed, onBackground) {
         const id = msg.clientMsgId;
-        if (this.seen.has(id)) {
-            this.d.sendAck({ clientMsgId: id, disposition: "duplicate", method: "api", error: null });
-            return;
-        }
-        this.seen.add(id);
-        const ctx = this.d.ctx();
-        const textTrimmed = msg.text.trim();
         if (textTrimmed === "/quit" || textTrimmed === "/exit") {
             this.record(msg, "api");
             this.d.sendAck({ clientMsgId: id, disposition: "command", method: "api", error: null });
             const shutdown = ctx.shutdown;
             if (typeof shutdown === "function")
                 shutdown();
-            return;
+            return true;
         }
         const lower = textTrimmed.toLowerCase();
         if (lower === "/model" || /^\/model\s+/i.test(textTrimmed)) {
@@ -82,7 +130,7 @@ export class Deliverer {
             this.d.sendAck({ clientMsgId: id, disposition: "command", method: "api", error: null });
             const arg = textTrimmed.replace(/^\/model\s*/i, "").trim();
             await handleModelCommand(this.d.pi, ctx, arg, { askSelect: this.d.askSelect, onBackground });
-            return;
+            return true;
         }
         if (lower === "/thinking" || /^\/thinking\s+/i.test(textTrimmed)) {
             this.record(msg, "api");
@@ -93,6 +141,35 @@ export class Deliverer {
                 onBackground,
                 onThinkingSelected: this.d.onThinkingSelected,
             });
+            return true;
+        }
+        return false;
+    }
+    async waitForActiveSelects() {
+        if (this.activeSelectPromises.size === 0)
+            return;
+        let timer;
+        await Promise.race([
+            Promise.allSettled([...this.activeSelectPromises]),
+            new Promise((resolve) => {
+                timer = setTimeout(resolve, ACTIVE_SELECT_WAIT_TIMEOUT_MS);
+                timer.unref?.();
+            }),
+        ]).finally(() => {
+            if (timer)
+                clearTimeout(timer);
+        });
+    }
+    async process(msg, onBackground) {
+        const id = msg.clientMsgId;
+        if (this.seen.has(id)) {
+            this.d.sendAck({ clientMsgId: id, disposition: "duplicate", method: "api", error: null });
+            return;
+        }
+        this.seen.add(id);
+        const ctx = this.d.ctx();
+        const textTrimmed = msg.text.trim();
+        if (await this.tryHandleSlashCommand(msg, ctx, textTrimmed, onBackground)) {
             return;
         }
         const cfg = this.d.cfg();
@@ -108,56 +185,9 @@ export class Deliverer {
             asCommand,
         });
         let lastError = null;
-        const blobCache = new Map();
-        const cachedFetchBlob = this.d.fetchBlob
-            ? (id) => {
-                let p = blobCache.get(id);
-                if (!p) {
-                    p = this.d.fetchBlob(id);
-                    blobCache.set(id, p);
-                }
-                return p;
-            }
-            : null;
-        let resolvedTextNonInline = null;
-        let resolvedApi = null;
-        const writtenFiles = new Map();
+        const attachments = createAttachmentCache(msg, this.d);
         for (const method of chain) {
-            const inline = method === "api";
-            let text = msg.text;
-            let images = [];
-            if (msg.attachments?.length && cachedFetchBlob) {
-                if (inline) {
-                    if (!resolvedApi) {
-                        const r = await resolveAttachments(msg.attachments, {
-                            fetchBlob: cachedFetchBlob,
-                            inboxDir: this.d.inboxDir(),
-                            sessionId: this.d.sessionId(),
-                            inlineImages: true,
-                            writtenFiles,
-                        });
-                        resolvedApi = {
-                            text: r.lines.length ? (text ? `${text}\n\n${r.lines.join("\n")}` : r.lines.join("\n")) : text,
-                            images: r.images,
-                        };
-                    }
-                    text = resolvedApi.text;
-                    images = resolvedApi.images;
-                }
-                else {
-                    if (resolvedTextNonInline === null) {
-                        const r = await resolveAttachments(msg.attachments, {
-                            fetchBlob: cachedFetchBlob,
-                            inboxDir: this.d.inboxDir(),
-                            sessionId: this.d.sessionId(),
-                            inlineImages: false,
-                            writtenFiles,
-                        });
-                        resolvedTextNonInline = r.lines.length ? (text ? `${text}\n\n${r.lines.join("\n")}` : r.lines.join("\n")) : text;
-                    }
-                    text = resolvedTextNonInline;
-                }
-            }
+            const { text, images } = await attachments.resolveFor(method);
             try {
                 if (method === "api") {
                     const res = deliverApi(this.d.pi, {
@@ -175,19 +205,7 @@ export class Deliverer {
                     return;
                 }
                 if (method === "interactive") {
-                    if (this.activeSelectPromises.size > 0) {
-                        let timer;
-                        await Promise.race([
-                            Promise.allSettled([...this.activeSelectPromises]),
-                            new Promise((resolve) => {
-                                timer = setTimeout(resolve, ACTIVE_SELECT_WAIT_TIMEOUT_MS);
-                                timer.unref?.();
-                            }),
-                        ]).finally(() => {
-                            if (timer)
-                                clearTimeout(timer);
-                        });
-                    }
+                    await this.waitForActiveSelects();
                     const r = await deliverInteractive(this.d.interactive(), text, msg.delivery ?? "auto");
                     if (r.ok) {
                         this.record(msg, "interactive");

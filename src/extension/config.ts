@@ -56,7 +56,7 @@ export const DEFAULT_CONFIG: RpConfig = {
   inboxDir: null,
 };
 
-const GATE_MODES: GateMode[] = ["auto-detect", "off", "dangerous", "writes", "all"];
+export const GATE_MODES: readonly GateMode[] = ["auto-detect", "off", "dangerous", "writes", "all"];
 const DELIVERY: DeliveryConfigMethod[] = ["auto", "api", "interactive", "herdr"];
 
 function bool(v: unknown, d: boolean): boolean {

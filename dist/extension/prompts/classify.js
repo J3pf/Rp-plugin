@@ -7,7 +7,7 @@ export class Classifier {
     now;
     sameTickMs;
     pending = null;
-    /** When set, `adapterTool` identifies the gentle-pi tool whose custom() dialog is being adapted. */
+    /** Tracks recent permission-request events to correlate follow-up confirm dialogs within `sameTickMs`. */
     constructor(now = Date.now, sameTickMs = 150) {
         this.now = now;
         this.sameTickMs = sameTickMs;
