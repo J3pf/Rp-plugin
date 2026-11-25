@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { SubagentTracker } from "../src/extension/subagents.ts";
 import type { SubagentUpdateEvent } from "../src/shared/protocol.ts";
 import { makeCtx, makePi, baseConfig, FakeRelay, waitUntil } from "./helpers.ts";
@@ -7,61 +7,67 @@ import { detectStaticEnv } from "../src/extension/environment.ts";
 
 describe("SubagentTracker", () => {
   it("tracks subagent_run start and end lifecycle", () => {
-    const emitted: SubagentUpdateEvent[] = [];
-    let currentTime = 1000;
-    const tracker = new SubagentTracker({
-      emit: (ev) => emitted.push(ev),
-      now: () => currentTime,
-    });
+    vi.useFakeTimers();
+    try {
+      const emitted: SubagentUpdateEvent[] = [];
+      let currentTime = 1000;
+      const tracker = new SubagentTracker({
+        emit: (ev) => emitted.push(ev),
+        now: () => currentTime,
+      });
 
-    // Subagent start
-    tracker.onToolStart("subagent_run", { agent: "sdd-explore", task: "explore auth", label: "explore auth module" }, "call_1");
-    expect(emitted).toHaveLength(1);
-    expect(emitted[0]).toEqual({
-      type: "subagent_update",
-      taskId: "call_1",
-      agent: "sdd-explore",
-      label: "explore auth module",
-      status: "running",
-      startedAt: 1000,
-      tools: [],
-    });
+      // Subagent start
+      tracker.onToolStart("subagent_run", { agent: "sdd-explore", task: "explore auth", label: "explore auth module" }, "call_1");
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]).toEqual({
+        type: "subagent_update",
+        taskId: "call_1",
+        agent: "sdd-explore",
+        label: "explore auth module",
+        status: "running",
+        startedAt: 1000,
+        tools: [],
+      });
 
-    // Child tool run
-    tracker.onToolStart("read", { path: "src/auth.ts" }, "child_tool_1", "call_1");
-    expect(emitted).toHaveLength(2);
-    expect(emitted[1].tools).toEqual(["read"]);
-    expect(emitted[1].toolCalls).toBe(1);
-    expect(tracker.getTaskToolCalls("call_1")).toEqual([
-      { toolCallId: "child_tool_1", name: "read", status: "running" },
-    ]);
+      // Child tool run (coalesced over trailing 250ms window)
+      tracker.onToolStart("read", { path: "src/auth.ts" }, "child_tool_1", "call_1");
+      vi.advanceTimersByTime(300);
+      expect(emitted).toHaveLength(2);
+      expect(emitted[1].tools).toEqual(["read"]);
+      expect(emitted[1].toolCalls).toBe(1);
+      expect(tracker.getTaskToolCalls("call_1")).toEqual([
+        { toolCallId: "child_tool_1", name: "read", status: "running" },
+      ]);
 
-    // Child tool end
-    tracker.onToolEnd("read", "file contents", false, "child_tool_1", 50, "call_1");
-    expect(emitted).toHaveLength(3);
-    expect(emitted[2].tools).toEqual(["read"]);
-    expect(tracker.getTaskToolCalls("call_1")[0]).toEqual({
-      toolCallId: "child_tool_1",
-      name: "read",
-      status: "completed",
-      durationMs: 50,
-    });
+      // Child tool end updates local tool state without redundant identical wire emit
+      tracker.onToolEnd("read", "file contents", false, "child_tool_1", 50, "call_1");
+      vi.advanceTimersByTime(300);
+      expect(emitted).toHaveLength(2);
+      expect(tracker.getTaskToolCalls("call_1")[0]).toEqual({
+        toolCallId: "child_tool_1",
+        name: "read",
+        status: "completed",
+        durationMs: 50,
+      });
 
-    // Subagent completion
-    currentTime = 1500;
-    tracker.onToolEnd("subagent_run", "explored successfully", false, "call_1", 500);
-    expect(emitted).toHaveLength(4);
-    expect(emitted[3]).toMatchObject({
-      type: "subagent_update",
-      taskId: "call_1",
-      status: "completed",
-      endedAt: 1500,
-      durationMs: 500,
-      result: "explored successfully",
-    });
+      // Subagent completion
+      currentTime = 1500;
+      tracker.onToolEnd("subagent_run", "explored successfully", false, "call_1", 500);
+      expect(emitted).toHaveLength(3);
+      expect(emitted[2]).toMatchObject({
+        type: "subagent_update",
+        taskId: "call_1",
+        status: "completed",
+        endedAt: 1500,
+        durationMs: 500,
+        result: "explored successfully",
+      });
 
-    expect(tracker.getSnapshot()).toHaveLength(1);
-    expect(tracker.getSnapshot()[0].taskId).toBe("call_1");
+      expect(tracker.getSnapshot()).toHaveLength(1);
+      expect(tracker.getSnapshot()[0].taskId).toBe("call_1");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("handles subagent failure", () => {
@@ -357,27 +363,33 @@ describe("Runtime Subagent integration", () => {
   });
 
   it("bounds child tool calls history to MAX_SUBAGENT_TOOLS (100) while incrementing toolCalls accurately", () => {
-    const emitted: SubagentUpdateEvent[] = [];
-    const tracker = new SubagentTracker({
-      emit: (ev) => emitted.push(ev),
-      now: () => 1000,
-    });
+    vi.useFakeTimers();
+    try {
+      const emitted: SubagentUpdateEvent[] = [];
+      const tracker = new SubagentTracker({
+        emit: (ev) => emitted.push(ev),
+        now: () => 1000,
+      });
 
-    tracker.onToolStart("subagent_run", { agent: "worker", label: "many tools task" }, "parent_call");
+      tracker.onToolStart("subagent_run", { agent: "worker", label: "many tools task" }, "parent_call");
 
-    for (let i = 0; i < 120; i++) {
-      tracker.onToolStart(`read_${i}`, { path: `file_${i}.ts` }, `child_${i}`, "parent_call");
-      tracker.onToolEnd(`read_${i}`, "ok", false, `child_${i}`, 10, "parent_call");
+      for (let i = 0; i < 120; i++) {
+        tracker.onToolStart(`read_${i}`, { path: `file_${i}.ts` }, `child_${i}`, "parent_call");
+        tracker.onToolEnd(`read_${i}`, "ok", false, `child_${i}`, 10, "parent_call");
+      }
+      vi.advanceTimersByTime(300);
+
+      const last = emitted.at(-1)!;
+      expect(last.tools).toHaveLength(100);
+      expect(last.toolCalls).toBe(120);
+      // Oldest tool calls (child_0 .. child_19) were shifted out
+      expect(last.tools![0]).toBe("read_20");
+      expect(last.tools![99]).toBe("read_119");
+      const toolCalls = tracker.getTaskToolCalls("parent_call");
+      expect(toolCalls[0]?.toolCallId).toBe("child_20");
+      expect(toolCalls[99]?.toolCallId).toBe("child_119");
+    } finally {
+      vi.useRealTimers();
     }
-
-    const last = emitted.at(-1)!;
-    expect(last.tools).toHaveLength(100);
-    expect(last.toolCalls).toBe(120);
-    // Oldest tool calls (child_0 .. child_19) were shifted out
-    expect(last.tools![0]).toBe("read_20");
-    expect(last.tools![99]).toBe("read_119");
-    const toolCalls = tracker.getTaskToolCalls("parent_call");
-    expect(toolCalls[0]?.toolCallId).toBe("child_20");
-    expect(toolCalls[99]?.toolCallId).toBe("child_119");
   });
 });

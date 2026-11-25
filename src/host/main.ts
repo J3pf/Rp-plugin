@@ -1,14 +1,10 @@
 // rp-host CLI: run | install | uninstall | status | doctor | roots | init | agy-hook
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, resolveInboxDir } from "../extension/config.ts";
 import { expandHome } from "../shared/platform.ts";
-import { addRoot, loadHostConfig, missingRoots, NO_ROOTS_HINT, removeRoot, writeDefaultHostConfig } from "./config.ts";
-import { HostConnection } from "./connection.ts";
-import { HerdrAgentBridge, installAgyHooks, runAgyHook } from "./herdr-bridge.ts";
-import { HostManager } from "./manager.ts";
-import { inspectService, installService, resolveStableNodePath, uninstallService } from "./service.ts";
 
 const HELP = `rp-host — create Pi agents from the RP phone app
 
@@ -68,6 +64,47 @@ export function cleanupExpiredInboxFiles(inboxDir: string, now = Date.now()): vo
   }
 }
 
+export async function cleanupExpiredInboxFilesAsync(inboxDir: string, now = Date.now()): Promise<void> {
+  let dirs: fs.Dirent[];
+  try {
+    dirs = await fsp.readdir(inboxDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const cutoff = now - INBOX_RETENTION_MS;
+  for (const d of dirs) {
+    if (!d.isDirectory()) continue;
+    const convPath = path.join(inboxDir, d.name);
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(convPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    let remaining = entries.length;
+    for (const f of entries) {
+      if (!f.isFile()) continue;
+      const fp = path.join(convPath, f.name);
+      try {
+        const st = await fsp.stat(fp);
+        if (st.mtimeMs < cutoff) {
+          await fsp.unlink(fp);
+          remaining--;
+        }
+      } catch {
+        /* best effort */
+      }
+    }
+    if (remaining <= 0) {
+      try {
+        await fsp.rmdir(convPath);
+      } catch {
+        /* ignore non-empty */
+      }
+    }
+  }
+}
+
 export function scheduleInboxCleanup(inboxDir: string, intervalMs = INBOX_CLEANUP_INTERVAL_MS): NodeJS.Timeout {
   cleanupExpiredInboxFiles(inboxDir);
   const timer = setInterval(() => cleanupExpiredInboxFiles(inboxDir), intervalMs);
@@ -97,13 +134,17 @@ export async function main(argv: string[]): Promise<void> {
       console.log(HELP);
       return;
     case "agy-hook": {
-      const stdinText = await readStdinText();
+      const [{ runAgyHook }, stdinText] = await Promise.all([
+        import("./bridge/agy-hooks.ts"),
+        readStdinText(),
+      ]);
       const { cfg } = loadConfig();
       const decision = await runAgyHook(cfg, stdinText);
       process.stdout.write(JSON.stringify(decision) + "\n");
       return;
     }
     case "init": {
+      const { loadHostConfig, writeDefaultHostConfig } = await import("./config.ts");
       const { path: p, exists } = loadHostConfig();
       if (exists) console.log(`already exists: ${p}`);
       else {
@@ -113,6 +154,7 @@ export async function main(argv: string[]): Promise<void> {
       return;
     }
     case "roots": {
+      const { addRoot, loadHostConfig, missingRoots, NO_ROOTS_HINT, removeRoot } = await import("./config.ts");
       const { cfg, path: hp } = loadHostConfig();
       const [sub, target] = [argv[1] ?? "list", argv[2]];
       if (sub === "list") {
@@ -131,6 +173,10 @@ export async function main(argv: string[]): Promise<void> {
       throw new Error("usage: rp-host roots [list | add <path> | remove <path>]");
     }
     case "install": {
+      const [{ installService, resolveStableNodePath }, { installAgyHooks }] = await Promise.all([
+        import("./service.ts"),
+        import("./bridge/agy-hooks.ts"),
+      ]);
       const stableNode = resolveStableNodePath(process.env, process.platform);
       try {
         installAgyHooks(stableNode, scriptPath);
@@ -140,10 +186,16 @@ export async function main(argv: string[]): Promise<void> {
       console.log(await installService({ nodePath: process.execPath, scriptPath, platform: process.platform }));
       return;
     }
-    case "uninstall":
+    case "uninstall": {
+      const { uninstallService } = await import("./service.ts");
       console.log(await uninstallService(process.platform));
       return;
+    }
     case "doctor": {
+      const [{ inspectService, resolveStableNodePath }, { loadHostConfig, missingRoots, NO_ROOTS_HINT }] = await Promise.all([
+        import("./service.ts"),
+        import("./config.ts"),
+      ]);
       const spec = {
         nodePath: resolveStableNodePath(process.env, process.platform),
         scriptPath,
@@ -190,6 +242,10 @@ export async function main(argv: string[]): Promise<void> {
       return;
     }
     case "status": {
+      const [{ loadHostConfig }, { HostManager }] = await Promise.all([
+        import("./config.ts"),
+        import("./manager.ts"),
+      ]);
       const { cfg: host, path: hp, exists } = loadHostConfig();
       const mgr = new HostManager(host);
       const rep = await mgr.detect(true);
@@ -199,6 +255,17 @@ export async function main(argv: string[]): Promise<void> {
     case "run": {
       const { cfg } = loadConfig();
       if (!cfg.relayUrl || !cfg.machineId || !cfg.machineToken) throw new Error("this PC is not paired: run `/rp pair <url> <code>` inside Pi first");
+      const [
+        { loadHostConfig, writeDefaultHostConfig },
+        { HostConnection },
+        { HerdrAgentBridge },
+        { HostManager },
+      ] = await Promise.all([
+        import("./config.ts"),
+        import("./connection.ts"),
+        import("./herdr-bridge.ts"),
+        import("./manager.ts"),
+      ]);
       const { cfg: host, path: hp, exists } = loadHostConfig();
       if (!exists) {
         try {
@@ -208,8 +275,16 @@ export async function main(argv: string[]): Promise<void> {
           /* ignore */
         }
       }
-      const inboxCleanupTimer = scheduleInboxCleanup(resolveInboxDir(cfg));
-      let bridge: HerdrAgentBridge | undefined;
+      const inboxDir = resolveInboxDir(cfg);
+      const inboxInitialTimer = setTimeout(() => {
+        void cleanupExpiredInboxFilesAsync(inboxDir);
+      }, 5_000);
+      inboxInitialTimer.unref?.();
+      const inboxCleanupTimer = setInterval(() => {
+        void cleanupExpiredInboxFilesAsync(inboxDir);
+      }, INBOX_CLEANUP_INTERVAL_MS);
+      inboxCleanupTimer.unref?.();
+      let bridge: InstanceType<typeof HerdrAgentBridge> | undefined;
       const manager = new HostManager(host, {
         onLog: (m) => console.error(`[rp-host] ${m}`),
         onPaneClosed: (paneId) => bridge?.notifyPaneClosed(paneId),
@@ -238,6 +313,7 @@ export async function main(argv: string[]): Promise<void> {
       const stop = () => {
         if (stopping) return;
         stopping = true;
+        clearTimeout(inboxInitialTimer);
         clearInterval(inboxCleanupTimer);
         bridge?.stop();
         conn.stop();

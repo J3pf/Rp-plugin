@@ -10,11 +10,39 @@ const CLAUDE_DEFAULT_WINDOW = 200_000;
 const CODEX_DEFAULT_WINDOW = 258_400;
 const AGY_MODEL_CACHE_THROTTLE_MS = 10_000;
 const AGY_MODEL_DB_TIMEOUT_MS = 25;
+const EXTERNAL_DIR_SCAN_TTL_MS = 12_000;
 const agyModelCache = new LruMap(256);
-function statMtimeMs(filePath) {
+const claudeDirCache = new LruMap(128);
+const claudeFileMetaCache = new LruMap(128);
+const codexDirCache = new LruMap(128);
+const codexFileMetaCache = new LruMap(128);
+const textFileCache = new LruMap(64);
+function statFileMeta(filePath) {
     try {
         const st = fs.statSync(filePath);
-        return st.isFile() ? st.mtimeMs : null;
+        return st.isFile() ? { mtimeMs: st.mtimeMs, size: st.size } : null;
+    }
+    catch {
+        return null;
+    }
+}
+function statMtimeMs(filePath) {
+    return statFileMeta(filePath)?.mtimeMs ?? null;
+}
+function readCachedTextFile(filePath) {
+    const st = statFileMeta(filePath);
+    if (!st) {
+        textFileCache.delete(filePath);
+        return null;
+    }
+    const cached = textFileCache.get(filePath);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+        return cached.text;
+    }
+    try {
+        const text = fs.readFileSync(filePath, "utf8");
+        textFileCache.set(filePath, { mtimeMs: st.mtimeMs, size: st.size, text });
+        return text;
     }
     catch {
         return null;
@@ -56,14 +84,35 @@ export function readJsonlTailLines(filePath, maxBytes = 64 * 1024) {
 }
 export function findClaudeProjectJsonl(cwd, sessionId, home) {
     try {
-        const slug = path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
+        const resolvedCwd = path.resolve(cwd);
+        const cacheKey = `${home}\0${resolvedCwd}\0${sessionId ?? ""}`;
+        const now = Date.now();
+        const slug = resolvedCwd.replace(/[^a-zA-Z0-9]/g, "-");
         const projDir = path.join(home, ".claude", "projects", slug);
-        if (!fs.existsSync(projDir))
+        const cached = claudeDirCache.get(cacheKey);
+        if (cached && now - cached.checkedAt < EXTERNAL_DIR_SCAN_TTL_MS) {
+            if (cached.filePath !== null) {
+                if (statFileMeta(cached.filePath))
+                    return cached.filePath;
+            }
+            else {
+                const dirSt = fs.statSync(projDir, { throwIfNoEntry: false });
+                const curDirMtime = dirSt?.isDirectory() ? dirSt.mtimeMs : null;
+                if (curDirMtime === cached.dirMtimeMs)
+                    return null;
+            }
+        }
+        const dirSt = fs.statSync(projDir, { throwIfNoEntry: false });
+        if (!dirSt?.isDirectory()) {
+            claudeDirCache.set(cacheKey, { filePath: null, dirMtimeMs: null, checkedAt: now });
             return null;
+        }
         if (sessionId && SAFE_CONV_ID_RE.test(sessionId)) {
             const candidate = path.join(projDir, `${sessionId}.jsonl`);
-            if (fs.existsSync(candidate))
+            if (statFileMeta(candidate)) {
+                claudeDirCache.set(cacheKey, { filePath: candidate, dirMtimeMs: dirSt.mtimeMs, checkedAt: now });
                 return candidate;
+            }
         }
         const files = fs
             .readdirSync(projDir)
@@ -79,41 +128,73 @@ export function findClaudeProjectJsonl(cwd, sessionId, home) {
         })
             .filter((f) => f.mtimeMs > 0)
             .sort((a, b) => b.mtimeMs - a.mtimeMs);
-        return files[0]?.full ?? null;
+        const found = files[0]?.full ?? null;
+        claudeDirCache.set(cacheKey, { filePath: found, dirMtimeMs: dirSt.mtimeMs, checkedAt: now });
+        return found;
     }
     catch {
         return null;
     }
 }
-function readClaudeContextUsage(cwd, sessionId, home) {
+function readClaudeJsonlMetadata(cwd, sessionId, home) {
     const targetFile = findClaudeProjectJsonl(cwd, sessionId, home);
     if (!targetFile)
-        return null;
+        return { usage: null, model: null };
+    const st = statFileMeta(targetFile);
+    if (!st) {
+        claudeFileMetaCache.delete(targetFile);
+        return { usage: null, model: null };
+    }
+    const cached = claudeFileMetaCache.get(targetFile);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+        return { usage: cached.usage, model: cached.model };
+    }
     const lines = readJsonlTailLines(targetFile);
+    let usageInfo = null;
+    let modelId = null;
     for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i].trim();
         if (!line.startsWith("{"))
             continue;
         try {
             const obj = JSON.parse(line);
-            const usage = obj?.message?.usage ?? obj?.usage;
-            if (!usage || typeof usage !== "object")
-                continue;
-            const inTok = Number(usage.input_tokens ?? 0) || 0;
-            const cacheCreate = Number(usage.cache_creation_input_tokens ?? 0) || 0;
-            const cacheRead = Number(usage.cache_read_input_tokens ?? 0) || 0;
-            const outTok = Number(usage.output_tokens ?? 0) || 0;
-            const total = Math.max(0, Math.floor(inTok + cacheCreate + cacheRead + outTok));
-            if (total > 0) {
-                const pct = Math.min(100, Math.max(0, Math.round((total / CLAUDE_DEFAULT_WINDOW) * 100)));
-                return { tokens: total, contextWindow: CLAUDE_DEFAULT_WINDOW, percent: pct };
+            if (!usageInfo) {
+                const usage = obj?.message?.usage ?? obj?.usage;
+                if (usage && typeof usage === "object") {
+                    const inTok = Number(usage.input_tokens ?? 0) || 0;
+                    const cacheCreate = Number(usage.cache_creation_input_tokens ?? 0) || 0;
+                    const cacheRead = Number(usage.cache_read_input_tokens ?? 0) || 0;
+                    const outTok = Number(usage.output_tokens ?? 0) || 0;
+                    const total = Math.max(0, Math.floor(inTok + cacheCreate + cacheRead + outTok));
+                    if (total > 0) {
+                        const pct = Math.min(100, Math.max(0, Math.round((total / CLAUDE_DEFAULT_WINDOW) * 100)));
+                        usageInfo = { tokens: total, contextWindow: CLAUDE_DEFAULT_WINDOW, percent: pct };
+                    }
+                }
             }
+            if (!modelId) {
+                const model = obj?.message?.model ?? obj?.model;
+                if (typeof model === "string" && model.trim()) {
+                    modelId = model.trim();
+                }
+            }
+            if (usageInfo && modelId)
+                break;
         }
         catch {
             /* ignore malformed line */
         }
     }
-    return null;
+    claudeFileMetaCache.set(targetFile, {
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        usage: usageInfo,
+        model: modelId,
+    });
+    return { usage: usageInfo, model: modelId };
+}
+function readClaudeContextUsage(cwd, sessionId, home) {
+    return readClaudeJsonlMetadata(cwd, sessionId, home).usage;
 }
 function sortedRecentSubdirs(parent, limit) {
     try {
@@ -169,34 +250,71 @@ function matchesCodexCwd(filePath, cwd) {
     }
     return true;
 }
+function readCodexFileUsage(filePath) {
+    const st = statFileMeta(filePath);
+    if (!st) {
+        codexFileMetaCache.delete(filePath);
+        return null;
+    }
+    const cached = codexFileMetaCache.get(filePath);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+        return cached.usage;
+    }
+    let usage = null;
+    const lines = readJsonlTailLines(filePath);
+    for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line.startsWith("{"))
+            continue;
+        try {
+            const obj = JSON.parse(line);
+            if (obj?.payload?.type === "token_count" && obj?.payload?.info?.last_token_usage) {
+                const total = Math.max(0, Math.floor(Number(obj.payload.info.last_token_usage.total_tokens ?? 0)));
+                const win = Math.max(1, Math.floor(Number(obj.payload.info.model_context_window ?? CODEX_DEFAULT_WINDOW)));
+                if (total > 0) {
+                    const pct = Math.min(100, Math.max(0, Math.round((total / win) * 100)));
+                    usage = { tokens: total, contextWindow: win, percent: pct };
+                    break;
+                }
+            }
+        }
+        catch {
+            /* ignore */
+        }
+    }
+    codexFileMetaCache.set(filePath, { mtimeMs: st.mtimeMs, size: st.size, usage });
+    return usage;
+}
 function readCodexContextUsage(cwd, sessionId, home) {
     try {
+        const cacheKey = `${home}\0${cwd ? path.resolve(cwd) : ""}\0${sessionId ?? ""}`;
+        const now = Date.now();
+        const cachedDir = codexDirCache.get(cacheKey);
+        if (cachedDir && now - cachedDir.checkedAt < EXTERNAL_DIR_SCAN_TTL_MS) {
+            if (cachedDir.filePath !== null) {
+                if (statFileMeta(cachedDir.filePath)) {
+                    return readCodexFileUsage(cachedDir.filePath);
+                }
+            }
+            else {
+                return null;
+            }
+        }
+        let firstMatchedFile = null;
         for (const full of collectRecentCodexSessionFiles(home)) {
             if (sessionId && !path.basename(full).includes(sessionId))
                 continue;
             if (!sessionId && cwd && !matchesCodexCwd(full, cwd))
                 continue;
-            const lines = readJsonlTailLines(full);
-            for (let i = lines.length - 1; i >= 0; i--) {
-                const line = lines[i].trim();
-                if (!line.startsWith("{"))
-                    continue;
-                try {
-                    const obj = JSON.parse(line);
-                    if (obj?.payload?.type === "token_count" && obj?.payload?.info?.last_token_usage) {
-                        const total = Math.max(0, Math.floor(Number(obj.payload.info.last_token_usage.total_tokens ?? 0)));
-                        const win = Math.max(1, Math.floor(Number(obj.payload.info.model_context_window ?? CODEX_DEFAULT_WINDOW)));
-                        if (total > 0) {
-                            const pct = Math.min(100, Math.max(0, Math.round((total / win) * 100)));
-                            return { tokens: total, contextWindow: win, percent: pct };
-                        }
-                    }
-                }
-                catch {
-                    /* ignore */
-                }
+            if (!firstMatchedFile)
+                firstMatchedFile = full;
+            const usage = readCodexFileUsage(full);
+            if (usage) {
+                codexDirCache.set(cacheKey, { filePath: full, checkedAt: now });
+                return usage;
             }
         }
+        codexDirCache.set(cacheKey, { filePath: firstMatchedFile, checkedAt: now });
     }
     catch {
         /* ignore */
@@ -263,70 +381,110 @@ function extractAgyModelFromGenMetadataBlob(buf) {
     }
     return null;
 }
-export function readAgySessionModel(sessionId, home = os.homedir()) {
+export function readAgySessionModel(sessionId, home = os.homedir(), options) {
     if (!sessionId || !SAFE_CONV_ID_RE.test(sessionId))
         return { model: null, uncertain: false };
-    let tPath = null;
-    try {
-        tPath = resolveAgyTranscriptPath(sessionId, home);
-    }
-    catch {
-        tPath = null;
+    const now = Date.now();
+    const cacheKey = `${home}\0${sessionId}`;
+    const cached = agyModelCache.get(cacheKey);
+    const hasKnownTranscript = options !== undefined && options.knownTranscriptModel !== undefined;
+    const knownModel = hasKnownTranscript ? (options.knownTranscriptModel?.trim() || null) : null;
+    // Fast path: AgyTranscriptReader already parsed a new MODEL_CHANGE_RE in-memory -> avoid disk & SQLite.
+    if (hasKnownTranscript && knownModel && knownModel !== cached?.knownTranscriptModel) {
+        const value = { model: knownModel, uncertain: false };
+        agyModelCache.set(cacheKey, {
+            value,
+            dbMtimeMs: cached?.dbMtimeMs ?? null,
+            transcriptMtimeMs: cached?.transcriptMtimeMs ?? null,
+            knownTranscriptModel: knownModel,
+            checkedAt: now,
+        });
+        return value;
     }
     const dbPath = path.join(home, ".gemini", "antigravity-cli", "conversations", `${sessionId}.db`);
-    const transcriptMtimeMs = tPath ? statMtimeMs(tPath) : null;
+    // Enforce strict wall-clock throttle even when transcript.jsonl or DB mtime changes during streaming.
+    // Only allow an immediate read within the throttle window when forced or when a DB appears for the first time.
+    if (cached && !options?.force && now - cached.checkedAt < AGY_MODEL_CACHE_THROTTLE_MS) {
+        if (cached.dbMtimeMs !== null) {
+            return cached.value;
+        }
+        const appearedMain = statMtimeMs(dbPath);
+        const appearedWal = statMtimeMs(`${dbPath}-wal`);
+        if (appearedMain === null && appearedWal === null) {
+            return cached.value;
+        }
+    }
     const mainDbMtime = statMtimeMs(dbPath);
     const walDbMtime = statMtimeMs(`${dbPath}-wal`);
     const dbMtimeMs = mainDbMtime !== null && walDbMtime !== null
         ? Math.max(mainDbMtime, walDbMtime)
         : (mainDbMtime ?? walDbMtime);
-    const now = Date.now();
-    const cacheKey = `${home}\0${sessionId}`;
-    const cached = agyModelCache.get(cacheKey);
-    if (cached) {
-        const mtimeChanged = cached.dbMtimeMs !== dbMtimeMs || cached.transcriptMtimeMs !== transcriptMtimeMs;
-        if (!mtimeChanged && now - cached.checkedAt < AGY_MODEL_CACHE_THROTTLE_MS) {
-            return cached.value;
-        }
+    // If a known transcript model was accepted and the DB has not been updated since, keep it without re-querying SQLite.
+    if (hasKnownTranscript &&
+        knownModel &&
+        cached &&
+        !options?.force &&
+        cached.knownTranscriptModel === knownModel &&
+        cached.dbMtimeMs !== null &&
+        cached.dbMtimeMs === dbMtimeMs) {
+        agyModelCache.set(cacheKey, { ...cached, checkedAt: now });
+        return cached.value;
     }
-    let transcriptChangeModel = null;
+    let transcriptMtimeMs = cached?.transcriptMtimeMs ?? null;
+    let transcriptChangeModel = hasKnownTranscript ? knownModel : null;
     let lastUserInputChangeModel = null;
-    if (tPath && transcriptMtimeMs !== null) {
+    if (!hasKnownTranscript) {
+        let tPath = null;
         try {
-            const lines = readJsonlTailLines(tPath, 256 * 1024);
-            let seenLatestUserInput = false;
-            for (let i = lines.length - 1; i >= 0; i--) {
-                const line = lines[i].trim();
-                if (!line.startsWith("{"))
-                    continue;
-                try {
-                    const obj = JSON.parse(line);
-                    if (obj?.type === "USER_INPUT" && typeof obj?.content === "string") {
-                        const m = MODEL_CHANGE_RE.exec(obj.content);
-                        if (m?.[1]?.trim()) {
-                            const candidate = m[1].trim();
-                            if (!transcriptChangeModel)
-                                transcriptChangeModel = candidate;
-                            if (!seenLatestUserInput)
-                                lastUserInputChangeModel = candidate;
-                        }
-                        seenLatestUserInput = true;
-                        if (transcriptChangeModel)
-                            break;
-                    }
-                }
-                catch {
-                    /* ignore */
-                }
-            }
+            tPath = resolveAgyTranscriptPath(sessionId, home);
         }
         catch {
-            /* ignore */
+            tPath = null;
+        }
+        transcriptMtimeMs = tPath ? statMtimeMs(tPath) : null;
+        if (tPath && transcriptMtimeMs !== null) {
+            try {
+                const lines = readJsonlTailLines(tPath, 256 * 1024);
+                let seenLatestUserInput = false;
+                for (let i = lines.length - 1; i >= 0; i--) {
+                    const line = lines[i].trim();
+                    if (!line.startsWith("{"))
+                        continue;
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj?.type === "USER_INPUT" && typeof obj?.content === "string") {
+                            const m = MODEL_CHANGE_RE.exec(obj.content);
+                            if (m?.[1]?.trim()) {
+                                const candidate = m[1].trim();
+                                if (!transcriptChangeModel)
+                                    transcriptChangeModel = candidate;
+                                if (!seenLatestUserInput)
+                                    lastUserInputChangeModel = candidate;
+                            }
+                            seenLatestUserInput = true;
+                            if (transcriptChangeModel)
+                                break;
+                        }
+                    }
+                    catch {
+                        /* ignore */
+                    }
+                }
+            }
+            catch {
+                /* ignore */
+            }
         }
     }
     if (lastUserInputChangeModel) {
         const value = { model: lastUserInputChangeModel, uncertain: false };
-        agyModelCache.set(cacheKey, { value, dbMtimeMs, transcriptMtimeMs, checkedAt: now });
+        agyModelCache.set(cacheKey, {
+            value,
+            dbMtimeMs,
+            transcriptMtimeMs,
+            knownTranscriptModel: cached?.knownTranscriptModel ?? null,
+            checkedAt: now,
+        });
         return value;
     }
     let dbError = false;
@@ -339,7 +497,13 @@ export function readAgySessionModel(sessionId, home = os.homedir()) {
                     const fromDb = extractAgyModelFromGenMetadataBlob(Buffer.from(row.data));
                     if (fromDb) {
                         const value = { model: fromDb, uncertain: false };
-                        agyModelCache.set(cacheKey, { value, dbMtimeMs, transcriptMtimeMs, checkedAt: now });
+                        agyModelCache.set(cacheKey, {
+                            value,
+                            dbMtimeMs,
+                            transcriptMtimeMs,
+                            knownTranscriptModel: hasKnownTranscript ? knownModel : (cached?.knownTranscriptModel ?? null),
+                            checkedAt: now,
+                        });
                         return value;
                     }
                 }
@@ -354,81 +518,104 @@ export function readAgySessionModel(sessionId, home = os.homedir()) {
     }
     const fallbackModel = transcriptChangeModel ?? (dbError ? (cached?.value.model ?? null) : null);
     const value = { model: fallbackModel, uncertain: dbError };
-    agyModelCache.set(cacheKey, { value, dbMtimeMs, transcriptMtimeMs, checkedAt: now });
+    agyModelCache.set(cacheKey, {
+        value,
+        dbMtimeMs,
+        transcriptMtimeMs,
+        knownTranscriptModel: hasKnownTranscript ? knownModel : (cached?.knownTranscriptModel ?? null),
+        checkedAt: now,
+    });
     return value;
 }
-export function readExternalAgentModelWithState(agent, cwd, sessionId, home = os.homedir()) {
+function readClaudeFallbackModel(home) {
+    try {
+        const text = readCachedTextFile(path.join(home, ".claude", "settings.json"));
+        if (text) {
+            const parsed = JSON.parse(text);
+            if (typeof parsed?.model === "string" && parsed.model.trim()) {
+                return parsed.model.trim();
+            }
+        }
+    }
+    catch {
+        /* ignore */
+    }
+    return null;
+}
+function readCodexConfigModel(home) {
+    try {
+        const text = readCachedTextFile(path.join(home, ".codex", "config.toml"));
+        if (text) {
+            const m = /^\s*model\s*=\s*["']([^"']+)["']/m.exec(text);
+            if (m?.[1]?.trim())
+                return m[1].trim();
+        }
+    }
+    catch {
+        /* ignore */
+    }
+    return null;
+}
+function readAgyFallbackModel(home) {
+    try {
+        const text = readCachedTextFile(path.join(home, ".gemini", "antigravity-cli", "settings.json"));
+        if (text) {
+            const parsed = JSON.parse(text);
+            if (typeof parsed?.model === "string" && parsed.model.trim()) {
+                return parsed.model.trim();
+            }
+        }
+    }
+    catch {
+        /* ignore */
+    }
+    return null;
+}
+export function readExternalAgentMetadata(agent, cwd, sessionId, terminalText = "", home = os.homedir(), options) {
+    if (agent === "claude") {
+        const { usage: fileUsage, model: fileModel } = readClaudeJsonlMetadata(cwd, sessionId, home);
+        const usage = fileUsage ?? parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW);
+        const modelId = fileModel ?? readClaudeFallbackModel(home) ?? "claude";
+        return { usage, model: { provider: "anthropic", id: modelId }, uncertain: false };
+    }
+    if (agent === "codex") {
+        const usage = readCodexContextUsage(cwd, sessionId, home) ?? parseTerminalContextUsage(terminalText, CODEX_DEFAULT_WINDOW);
+        const modelId = readCodexConfigModel(home) ?? "codex";
+        return { usage, model: { provider: "openai", id: modelId }, uncertain: false };
+    }
     if (agent === "agy") {
-        const { model: sessionModel, uncertain } = readAgySessionModel(sessionId, home);
+        const { model: sessionModel, uncertain } = readAgySessionModel(sessionId, home, options);
+        const modelId = sessionModel ?? readAgyFallbackModel(home) ?? "antigravity";
+        return {
+            usage: parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW),
+            model: { provider: "google", id: modelId },
+            uncertain: sessionModel ? false : uncertain,
+        };
+    }
+    return {
+        usage: parseTerminalContextUsage(terminalText, CLAUDE_DEFAULT_WINDOW),
+        model: { provider: agent, id: "default" },
+        uncertain: false,
+    };
+}
+export function readExternalAgentModelWithState(agent, cwd, sessionId, home = os.homedir(), options) {
+    if (agent === "agy") {
+        const { model: sessionModel, uncertain } = readAgySessionModel(sessionId, home, options);
         if (sessionModel) {
             return { model: { provider: "google", id: sessionModel }, uncertain: false };
         }
-        try {
-            const settingsPath = path.join(home, ".gemini", "antigravity-cli", "settings.json");
-            if (fs.existsSync(settingsPath)) {
-                const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-                if (typeof parsed?.model === "string" && parsed.model.trim()) {
-                    return { model: { provider: "google", id: parsed.model.trim() }, uncertain };
-                }
-            }
-        }
-        catch {
-            /* ignore */
-        }
-        return { model: { provider: "google", id: "antigravity" }, uncertain };
+        const fallback = readAgyFallbackModel(home);
+        return { model: { provider: "google", id: fallback ?? "antigravity" }, uncertain };
     }
     if (agent === "claude") {
-        try {
-            const targetFile = findClaudeProjectJsonl(cwd, sessionId, home);
-            if (targetFile) {
-                const lines = readJsonlTailLines(targetFile);
-                for (let i = lines.length - 1; i >= 0; i--) {
-                    const line = lines[i].trim();
-                    if (!line.startsWith("{"))
-                        continue;
-                    try {
-                        const obj = JSON.parse(line);
-                        const model = obj?.message?.model ?? obj?.model;
-                        if (typeof model === "string" && model.trim()) {
-                            return { model: { provider: "anthropic", id: model.trim() }, uncertain: false };
-                        }
-                    }
-                    catch {
-                        /* ignore */
-                    }
-                }
-            }
-            const claudeSettings = path.join(home, ".claude", "settings.json");
-            if (fs.existsSync(claudeSettings)) {
-                const parsed = JSON.parse(fs.readFileSync(claudeSettings, "utf8"));
-                if (typeof parsed?.model === "string" && parsed.model.trim()) {
-                    return { model: { provider: "anthropic", id: parsed.model.trim() }, uncertain: false };
-                }
-            }
-        }
-        catch {
-            /* ignore */
-        }
-        return { model: { provider: "anthropic", id: "claude" }, uncertain: false };
+        const { model: fileModel } = readClaudeJsonlMetadata(cwd, sessionId, home);
+        return { model: { provider: "anthropic", id: fileModel ?? readClaudeFallbackModel(home) ?? "claude" }, uncertain: false };
     }
     if (agent === "codex") {
-        try {
-            const cfgToml = path.join(home, ".codex", "config.toml");
-            if (fs.existsSync(cfgToml)) {
-                const text = fs.readFileSync(cfgToml, "utf8");
-                const m = /^\s*model\s*=\s*["']([^"']+)["']/m.exec(text);
-                if (m?.[1]?.trim()) {
-                    return { model: { provider: "openai", id: m[1].trim() }, uncertain: false };
-                }
-            }
-        }
-        catch {
-            /* ignore */
-        }
-        return { model: { provider: "openai", id: "codex" }, uncertain: false };
+        return { model: { provider: "openai", id: readCodexConfigModel(home) ?? "codex" }, uncertain: false };
     }
     return { model: { provider: agent, id: "default" }, uncertain: false };
 }
-export function readExternalAgentModel(agent, cwd, sessionId, home = os.homedir()) {
-    return readExternalAgentModelWithState(agent, cwd, sessionId, home).model;
+export function readExternalAgentModel(agent, cwd, sessionId, home = os.homedir(), options) {
+    return readExternalAgentModelWithState(agent, cwd, sessionId, home, options).model;
 }

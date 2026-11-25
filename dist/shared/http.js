@@ -164,37 +164,32 @@ export function toHttpUrl(relayUrl, path) {
 export function toWsUrl(relayUrl, path) {
     return buildRelayEndpointUrl(relayUrl, path, true);
 }
-/** Shared WebSocket client ping + silence-watchdog keepalive timer helper. */
+/** Shared WebSocket activity-aware client ping + silence-watchdog keepalive timer helper. */
 export class WsKeepalive {
     watchdogMs;
     pingIntervalMs;
     watchdog = null;
     pingTimer = null;
-    constructor(watchdogMs, pingIntervalMs = 20_000) {
+    activeWs = null;
+    openState = 1;
+    lastActivityAt = 0;
+    constructor(watchdogMs, pingIntervalMs = 40_000) {
         this.watchdogMs = watchdogMs;
         this.pingIntervalMs = pingIntervalMs;
     }
     start(ws, openState = 1) {
         this.stop();
+        this.activeWs = ws;
+        this.openState = openState;
         this.arm(ws);
-        this.pingTimer = setInterval(() => {
-            if (ws.readyState === openState) {
-                try {
-                    ws.ping();
-                }
-                catch {
-                    try {
-                        ws.terminate();
-                    }
-                    catch {
-                        /* ignore */
-                    }
-                }
-            }
-        }, this.pingIntervalMs);
-        this.pingTimer.unref?.();
+        this.schedulePing(this.pingIntervalMs);
+    }
+    /** Record traffic/keepalive activity to defer the next client ping without resetting the inbound watchdog. */
+    markActivity() {
+        this.lastActivityAt = Date.now();
     }
     arm(ws) {
+        this.lastActivityAt = Date.now();
         if (this.watchdog)
             clearTimeout(this.watchdog);
         this.watchdog = setTimeout(() => {
@@ -207,13 +202,47 @@ export class WsKeepalive {
         }, this.watchdogMs);
         this.watchdog.unref?.();
     }
+    schedulePing(delayMs) {
+        if (this.pingTimer)
+            clearTimeout(this.pingTimer);
+        this.pingTimer = setTimeout(() => {
+            this.pingTimer = null;
+            const ws = this.activeWs;
+            if (!ws)
+                return;
+            const now = Date.now();
+            const elapsed = now - this.lastActivityAt;
+            if (elapsed < this.pingIntervalMs) {
+                this.schedulePing(this.pingIntervalMs - elapsed);
+                return;
+            }
+            if (ws.readyState === this.openState) {
+                try {
+                    ws.ping();
+                }
+                catch {
+                    try {
+                        ws.terminate();
+                    }
+                    catch {
+                        /* ignore */
+                    }
+                    return;
+                }
+            }
+            this.lastActivityAt = now;
+            this.schedulePing(this.pingIntervalMs);
+        }, Math.max(1, delayMs));
+        this.pingTimer.unref?.();
+    }
     stop() {
         if (this.pingTimer)
-            clearInterval(this.pingTimer);
+            clearTimeout(this.pingTimer);
         this.pingTimer = null;
         if (this.watchdog)
             clearTimeout(this.watchdog);
         this.watchdog = null;
+        this.activeWs = null;
     }
 }
 export const DEFAULT_WS_HANDSHAKE_TIMEOUT_MS = 10_000;

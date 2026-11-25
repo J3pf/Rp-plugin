@@ -9,6 +9,7 @@ import { HostError, isInside, resolveWithinRoots } from "./validate.ts";
 export type { GitDiffFile, GitDiffResult, GitDiscardResult };
 
 const MAX_DIFF_FILES = 100;
+const DIFF_BATCH_SIZE = 50;
 const MAX_FILE_PATCH_BYTES = 64 * 1024;
 const MAX_TOTAL_PATCH_BYTES = 512 * 1024;
 const MAX_DIFF_JSON_BYTES = Math.min(MAX_TOTAL_PATCH_BYTES + 64 * 1024, MAX_FRAME_BYTES - 64 * 1024);
@@ -139,13 +140,39 @@ function toCwdRelativePath(repoRelPath: string, cwdPrefix: string): string | nul
   return normalized.slice(prefix.length);
 }
 
-/** Lightweight branch and tracked/untracked dirty status poll using GIT_OPTIONAL_LOCKS=0. */
+/** Parse the `## ...` branch header line from `git status --porcelain=v1 -b`. */
+export function parsePorcelainBranchHeader(headerLine: string): string | null {
+  const line = headerLine.replace(/\r$/, "");
+  if (!line.startsWith("## ")) return null;
+  const rest = line.slice(3).trim();
+  if (!rest) return null;
+  if (rest === "HEAD (no branch)" || rest.startsWith("HEAD (no branch)")) return "HEAD";
+  const unbornMatch = /^(?:No commits yet|Initial commit) on (.+)$/.exec(rest);
+  if (unbornMatch) return unbornMatch[1]!.trim() || null;
+  const dotsIdx = rest.indexOf("...");
+  if (dotsIdx >= 0) return rest.slice(0, dotsIdx).trim() || null;
+  return rest.split(/\s+\[/, 1)[0]!.trim() || null;
+}
+
+/** Lightweight branch and tracked/untracked dirty status poll using a single `git status` spawn. */
 export async function readGitHeadAndDirty(cwd: string, untracked = false): Promise<{ branch: string | null; dirty: boolean } | null> {
-  const head = await execGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"], 2000);
-  if (head.code !== 0) return null;
-  const branch = head.stdout.trim() || null;
-  const st = await execGit(cwd, ["status", "--porcelain", untracked ? "-u" : "-uno"], 2000);
-  return { branch, dirty: st.code === 0 && st.stdout.trim().length > 0 };
+  const st = await execGit(cwd, ["status", "--porcelain=v1", "-b", untracked ? "-u" : "-uno"], 2000);
+  if (st.code !== 0) return null;
+  const lines = st.stdout.split("\n");
+  let branch: string | null = null;
+  let dirty = false;
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, "");
+    if (!line) continue;
+    if (line.startsWith("## ")) {
+      if (branch === null) branch = parsePorcelainBranchHeader(line);
+      continue;
+    }
+    if (line.trim().length > 0) {
+      dirty = true;
+    }
+  }
+  return { branch, dirty };
 }
 
 function validateRepoRelativePath(
@@ -277,8 +304,75 @@ function truncatePatchToJsonBytes(rawPatch: string, maxJsonBytes: number): { pat
   return { patch: best, truncated: true };
 }
 
+function extractDiffChunkPath(chunk: string, knownRepoPaths: Set<string>): string | null {
+  const nl = chunk.indexOf("\n");
+  const header = (nl >= 0 ? chunk.slice(0, nl) : chunk).replace(/\r$/, "");
+  if (!header.startsWith("diff --git ")) return null;
+  const rest = header.slice("diff --git ".length);
+  // Fast exact match for non-renamed files: `<src>/<path> <dst>/<path>` (handles spaces in paths unambiguously)
+  if (rest.length >= 7 && rest[1] === "/" && (rest.length - 5) % 2 === 0) {
+    const pLen = (rest.length - 5) / 2;
+    if (rest[2 + pLen] === " " && rest[4 + pLen] === "/") {
+      const aPath = rest.slice(2, 2 + pLen);
+      const bPath = rest.slice(5 + pLen);
+      if (aPath === bPath) return aPath;
+    }
+  }
+  // Check rename header if present
+  const renameMatch = /^rename to (.+)$/m.exec(chunk);
+  if (renameMatch) {
+    const target = renameMatch[1]!.replace(/\r$/, "");
+    if (target) return target;
+  }
+  // Match against the exact known repository-relative paths requested in this batch
+  let bestKnown: string | null = null;
+  for (const candidate of knownRepoPaths) {
+    const suffixIdx = rest.length - candidate.length;
+    if (
+      suffixIdx >= 3 &&
+      rest.endsWith(candidate) &&
+      rest[suffixIdx - 1] === "/" &&
+      rest[suffixIdx - 3] === " " &&
+      (!bestKnown || candidate.length > bestKnown.length)
+    ) {
+      bestKnown = candidate;
+    }
+  }
+  if (bestKnown) return bestKnown;
+  // Fallback to +++ <dst>/<path> or --- <src>/<path> lines
+  const plusMatch = /^\+\+\+ [a-z]\/(.+)$/m.exec(chunk);
+  if (plusMatch) return plusMatch[1]!.replace(/\r$/, "");
+  const minusMatch = /^--- [a-z]\/(.+)$/m.exec(chunk);
+  if (minusMatch) return minusMatch[1]!.replace(/\r$/, "");
+  return null;
+}
+
+function splitBatchedGitDiff(stdout: string, knownRepoPaths: Set<string>, cwdPrefix: string): Map<string, string> {
+  const patches = new Map<string, string>();
+  if (!stdout) return patches;
+  const chunks = stdout.split(/(?=^diff --git )/m);
+  for (const chunk of chunks) {
+    if (!chunk.startsWith("diff --git ")) continue;
+    const repoPath = extractDiffChunkPath(chunk, knownRepoPaths);
+    if (!repoPath) continue;
+    const cwdRel = toCwdRelativePath(repoPath, cwdPrefix);
+    if (!cwdRel) continue;
+    const norm = path.posix.normalize(cwdRel.replace(/\\/g, "/")).replace(/\/+$/, "");
+    if (norm) patches.set(norm, chunk);
+  }
+  return patches;
+}
+
 export interface GitDiffOptions {
   redactContent?: boolean;
+}
+
+interface ValidatedDiffEntry {
+  code: string;
+  relPath: string;
+  isSymlink: boolean;
+  isDirectory: boolean;
+  status: GitDiffFile["status"];
 }
 
 export async function gitDiff(
@@ -323,6 +417,82 @@ export async function gitDiff(
   }
 
   const entries = parsePorcelainZ(statusRes.stdout);
+  const validatedEntries: ValidatedDiffEntry[] = [];
+  for (const entry of entries) {
+    if (validatedEntries.length >= MAX_DIFF_FILES) break;
+    const cwdRel = toCwdRelativePath(entry.path, repo.cwdPrefix);
+    if (!cwdRel) continue;
+    let validated: { relPath: string; absPath: string; isSymlink: boolean; isDirectory: boolean };
+    try {
+      validated = validateRepoRelativePath(cwd, cwdRel);
+    } catch {
+      continue;
+    }
+    let status: GitDiffFile["status"] = "modified";
+    if (entry.code.includes("A") || entry.code === "??") status = "added";
+    else if (entry.code.includes("D")) status = "deleted";
+    else if (entry.code.includes("R")) status = "renamed";
+    validatedEntries.push({
+      code: entry.code,
+      relPath: validated.relPath,
+      isSymlink: validated.isSymlink,
+      isDirectory: validated.isDirectory,
+      status,
+    });
+  }
+
+  const trackedRelPaths = validatedEntries
+    .filter((e) => !(e.status === "added" && e.code === "??") && !e.isSymlink && !e.isDirectory)
+    .map((e) => e.relPath);
+  const batchedPatches = new Map<string, string>();
+  const batchAttempted = new Set<string>();
+  let nextBatchIdx = 0;
+  let headIsUnborn = branch === null && branchRes.code !== 0;
+
+  const ensureBatchLoaded = async (relPath: string): Promise<void> => {
+    if (batchAttempted.has(relPath)) return;
+    while (nextBatchIdx < trackedRelPaths.length && !batchAttempted.has(relPath)) {
+      const batch = trackedRelPaths.slice(nextBatchIdx, nextBatchIdx + DIFF_BATCH_SIZE);
+      nextBatchIdx += batch.length;
+      for (const p of batch) batchAttempted.add(p);
+      const rem = remainingMs();
+      if (rem <= 0) return;
+      const knownRepoPaths = new Set(batch.map((p) => (repo.cwdPrefix ? `${repo.cwdPrefix}/${p}` : p)));
+      if (!headIsUnborn) {
+        const diffRes = await execGit(
+          cwd,
+          ["diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "-U2", "HEAD", "--", ...batch],
+          Math.max(100, Math.min(5000, rem)),
+          ceilingDirs,
+        );
+        if (diffRes.code === 0) {
+          for (const [k, v] of splitBatchedGitDiff(diffRes.stdout, knownRepoPaths, repo.cwdPrefix)) {
+            batchedPatches.set(k, v);
+          }
+          continue;
+        }
+        if (/unknown revision|bad revision|ambiguous argument 'HEAD'/i.test(diffRes.stderr)) {
+          headIsUnborn = true;
+        }
+      }
+      if (headIsUnborn) {
+        const remCached = remainingMs();
+        if (remCached <= 0) return;
+        const cachedRes = await execGit(
+          cwd,
+          ["diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "-U2", "--cached", "--", ...batch],
+          Math.max(100, Math.min(5000, remCached)),
+          ceilingDirs,
+        );
+        if (cachedRes.code === 0) {
+          for (const [k, v] of splitBatchedGitDiff(cachedRes.stdout, knownRepoPaths, repo.cwdPrefix)) {
+            batchedPatches.set(k, v);
+          }
+        }
+      }
+    }
+  };
+
   const files: GitDiffFile[] = [];
   let totalAdditions = 0;
   let totalDeletions = 0;
@@ -330,24 +500,9 @@ export async function gitDiff(
   let usedJsonBytes =
     Buffer.byteLength(JSON.stringify({ cwd, branch, files: [], totalAdditions: 0, totalDeletions: 0 }), "utf8") + 64;
 
-  for (const entry of entries) {
+  for (const entry of validatedEntries) {
     if (files.length >= MAX_DIFF_FILES) break;
-    const code = entry.code;
-    const cwdRel = toCwdRelativePath(entry.path, repo.cwdPrefix);
-    if (!cwdRel) continue;
-
-    let validated: { relPath: string; absPath: string; isSymlink: boolean; isDirectory: boolean };
-    try {
-      validated = validateRepoRelativePath(cwd, cwdRel);
-    } catch {
-      continue;
-    }
-    const { relPath, isSymlink, isDirectory } = validated;
-
-    let status: GitDiffFile["status"] = "modified";
-    if (code.includes("A") || code === "??") status = "added";
-    else if (code.includes("D")) status = "deleted";
-    else if (code.includes("R")) status = "renamed";
+    const { code, relPath, isSymlink, isDirectory, status } = entry;
 
     const currentRemaining = remainingMs();
     let overBudget =
@@ -371,41 +526,47 @@ export async function gitDiff(
           rawPatch = diffRes.stdout;
         }
       } else {
-        const remHead = remainingMs();
-        if (remHead <= 0) {
-          overBudget = true;
-        } else {
-          const diffRes = await execGit(
-            cwd,
-            ["diff", "--no-color", "--no-ext-diff", "-U2", "HEAD", "--", relPath],
-            Math.max(100, Math.min(5000, remHead)),
-            ceilingDirs,
-          );
-          rawPatch = diffRes.stdout;
-          if (!rawPatch) {
-            const remIndex = remainingMs();
-            if (remIndex <= 0) {
-              overBudget = true;
-            } else {
-              const diffIndex = await execGit(
+        await ensureBatchLoaded(relPath);
+        rawPatch = batchedPatches.get(relPath) ?? "";
+        if (!rawPatch) {
+          const remHead = remainingMs();
+          if (remHead <= 0) {
+            overBudget = true;
+          } else {
+            if (!headIsUnborn) {
+              const diffRes = await execGit(
                 cwd,
-                ["diff", "--no-color", "--no-ext-diff", "-U2", "--", relPath],
-                Math.max(100, Math.min(5000, remIndex)),
+                ["diff", "--no-color", "--no-ext-diff", "-U2", "HEAD", "--", relPath],
+                Math.max(100, Math.min(5000, remHead)),
                 ceilingDirs,
               );
-              rawPatch = diffIndex.stdout;
-              if (!rawPatch) {
-                const remStaged = remainingMs();
-                if (remStaged <= 0) {
-                  overBudget = true;
-                } else {
-                  const diffStaged = await execGit(
-                    cwd,
-                    ["diff", "--no-color", "--no-ext-diff", "-U2", "--cached", "--", relPath],
-                    Math.max(100, Math.min(5000, remStaged)),
-                    ceilingDirs,
-                  );
-                  rawPatch = diffStaged.stdout;
+              rawPatch = diffRes.stdout;
+            }
+            if (!rawPatch) {
+              const remIndex = remainingMs();
+              if (remIndex <= 0) {
+                overBudget = true;
+              } else {
+                const diffIndex = await execGit(
+                  cwd,
+                  ["diff", "--no-color", "--no-ext-diff", "-U2", "--", relPath],
+                  Math.max(100, Math.min(5000, remIndex)),
+                  ceilingDirs,
+                );
+                rawPatch = diffIndex.stdout;
+                if (!rawPatch) {
+                  const remStaged = remainingMs();
+                  if (remStaged <= 0) {
+                    overBudget = true;
+                  } else {
+                    const diffStaged = await execGit(
+                      cwd,
+                      ["diff", "--no-color", "--no-ext-diff", "-U2", "--cached", "--", relPath],
+                      Math.max(100, Math.min(5000, remStaged)),
+                      ceilingDirs,
+                    );
+                    rawPatch = diffStaged.stdout;
+                  }
                 }
               }
             }

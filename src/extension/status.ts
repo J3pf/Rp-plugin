@@ -1,6 +1,8 @@
 import type { AgentStatus, GentleMode } from "../shared/protocol.ts";
 import { parseGentleMode } from "./environment.ts";
 
+const DETAIL_THROTTLE_MS = 500;
+
 /** Derives agent.status and tracks setStatus() texts of every extension (agent.statuses, ≤1/s). */
 export class StatusTracker {
   private base: AgentStatus = "idle";
@@ -8,6 +10,10 @@ export class StatusTracker {
   private waiting = 0;
   private compacting = false;
   private last: { status: AgentStatus; detail?: string } | null = null;
+  private detailTimer: NodeJS.Timeout | null = null;
+  private lastDetailEmitAt = -Infinity;
+  private pendingDetail: string | undefined;
+  private hasPendingDetail = false;
   private items: Record<string, string> = {};
   private dirty = false;
   private timer: NodeJS.Timeout | null = null;
@@ -28,10 +34,52 @@ export class StatusTracker {
     return this.base;
   }
 
+  private clearDetailTimer(): void {
+    if (this.detailTimer) {
+      clearTimeout(this.detailTimer);
+      this.detailTimer = null;
+    }
+    this.hasPendingDetail = false;
+  }
+
   private push(): void {
     const status = this.current;
     const detail = status === "working" ? this.detail : undefined;
-    if (this.last && this.last.status === status && this.last.detail === detail) return;
+    if (this.last && this.last.status === status && this.last.detail === detail) {
+      this.clearDetailTimer();
+      return;
+    }
+    const isDetailOnlyChange = this.last !== null && this.last.status === status && status === "working";
+    if (isDetailOnlyChange) {
+      const elapsed = this.now() - this.lastDetailEmitAt;
+      if (elapsed < DETAIL_THROTTLE_MS) {
+        this.pendingDetail = detail;
+        this.hasPendingDetail = true;
+        if (!this.detailTimer) {
+          const wait = Math.max(1, DETAIL_THROTTLE_MS - elapsed);
+          this.detailTimer = setTimeout(() => {
+            this.detailTimer = null;
+            if (!this.hasPendingDetail) return;
+            this.hasPendingDetail = false;
+            const curStatus = this.current;
+            const curDetail = curStatus === "working" ? this.pendingDetail : undefined;
+            if (curStatus === "working" && (!this.last || this.last.status !== curStatus || this.last.detail !== curDetail)) {
+              this.last = { status: curStatus, detail: curDetail };
+              this.lastDetailEmitAt = this.now();
+              this.emitStatus(curStatus, curDetail);
+            }
+          }, wait);
+          this.detailTimer.unref?.();
+        }
+        return;
+      }
+      this.clearDetailTimer();
+      this.last = { status, detail };
+      this.lastDetailEmitAt = this.now();
+      this.emitStatus(status, detail);
+      return;
+    }
+    this.clearDetailTimer();
     this.last = { status, detail };
     this.emitStatus(status, detail);
   }
@@ -100,6 +148,7 @@ export class StatusTracker {
   }
 
   dispose(): void {
+    this.clearDetailTimer();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
   }

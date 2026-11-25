@@ -11,7 +11,7 @@ export interface Transport {
   readonly name: TransportName;
   start(): void;
   /** Returns false if the message could not be accepted (transport not open). */
-  send(env: Envelope): boolean;
+  send(env: Envelope, payload?: string): boolean;
   drainUnsent?(): Envelope[];
   isSending?(): boolean;
   close(): void;
@@ -48,8 +48,7 @@ export interface ConnectionOptions {
   transportFactory?: (name: TransportName, handlers: TransportHandlers) => Transport;
 }
 
-const WS_KEEPALIVE_WATCHDOG_MS = 45_000;
-const WS_KEEPALIVE_PING_INTERVAL_MS = 20_000;
+const WS_KEEPALIVE_WATCHDOG_MS = 60_000;
 const WS_BACKPRESSURE_LIMIT_BYTES = 1_000_000;
 const WS_CRITICAL_BACKPRESSURE_LIMIT_BYTES = 4 * MAX_FRAME_BYTES;
 const WS_CLOSE_TERMINATE_FALLBACK_MS = 500;
@@ -70,9 +69,14 @@ const DEFAULT_MAX_QUEUE_MESSAGES = 500;
 const DEFAULT_MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_WS_FAILURES_BEFORE_LONG_POLL = 3;
 const DEFAULT_WS_RETRY_MS = 15_000;
+const MAX_WS_RETRY_MS = 600_000;
 const WS_RETRY_BUSY_DEFER_MS = 250;
 const SERVICE_RESTART_MIN_DELAY_MS = 250;
 const SERVICE_RESTART_JITTER_RANGE_MS = 1_251;
+
+function frameByteLength(payload: string): number {
+  return payload.length * 3 <= MAX_FRAME_BYTES ? payload.length : Buffer.byteLength(payload, "utf8");
+}
 
 function sleepUnref(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -93,8 +97,8 @@ export class WsTransport implements Transport {
   private ws: WebSocket | null = null;
   private opened = false;
   private closed = false;
-  /** The relay pings every 25 s, client pings every 20 s; silence beyond 45 s means a dead socket. */
-  private keepalive = new WsKeepalive(WS_KEEPALIVE_WATCHDOG_MS, WS_KEEPALIVE_PING_INTERVAL_MS);
+  /** The relay pings every 25 s; client pings only after 40 s of silence, watchdog terminates at 60 s. */
+  private keepalive = new WsKeepalive(WS_KEEPALIVE_WATCHDOG_MS);
 
   constructor(private url: string, private token: string, private h: TransportHandlers) {}
 
@@ -159,15 +163,16 @@ export class WsTransport implements Transport {
     });
   }
 
-  send(env: Envelope): boolean {
+  send(env: Envelope, preSerialized?: string): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     // backpressure: drop non-critical frames when the socket buffer is saturated, and cap critical frames at 4x MAX_FRAME_BYTES
     if (this.ws.bufferedAmount > WS_CRITICAL_BACKPRESSURE_LIMIT_BYTES) return false;
     if (this.ws.bufferedAmount > WS_BACKPRESSURE_LIMIT_BYTES && !CRITICAL_TYPES.has(env.t)) return false;
     try {
-      const payload = JSON.stringify(env);
-      if (Buffer.byteLength(payload, "utf8") > MAX_FRAME_BYTES) return false;
+      const payload = preSerialized ?? JSON.stringify(env);
+      if (frameByteLength(payload) > MAX_FRAME_BYTES) return false;
       this.ws.send(payload);
+      this.keepalive.markActivity();
       return true;
     } catch {
       return false;
@@ -189,6 +194,7 @@ export class WsTransport implements Transport {
 
 interface OutboxItem {
   env: Envelope;
+  payload: string;
   bytes: number;
 }
 
@@ -301,14 +307,15 @@ export class LongPollTransport implements Transport {
     }
   }
 
-  send(env: Envelope): boolean {
+  send(env: Envelope, preSerialized?: string): boolean {
     if (this.closed) return false;
-    const bytes = Buffer.byteLength(JSON.stringify(env), "utf8");
+    const payload = preSerialized ?? JSON.stringify(env);
+    const bytes = frameByteLength(payload);
     if (bytes > MAX_FRAME_BYTES) return false;
     if (this.outbox.length >= LONG_POLL_OUTBOX_MAX_MESSAGES || this.outboxBytes + bytes > LONG_POLL_OUTBOX_MAX_BYTES) {
       return false;
     }
-    this.outbox.push({ env, bytes });
+    this.outbox.push({ env, payload, bytes });
     this.outboxBytes += bytes;
     if (!this.flushScheduled && !this.flushing) {
       this.flushScheduled = true;
@@ -340,8 +347,8 @@ export class LongPollTransport implements Transport {
         try {
           const res = await httpRequest(this.base + "/v1/agent/send", {
             method: "POST",
-            headers: this.headers(),
-            body: batch.map((item) => item.env),
+            headers: { ...this.headers(), "content-type": "application/json" },
+            body: `[${batch.map((item) => item.payload).join(",")}]`,
             timeoutMs: LONG_POLL_SEND_TIMEOUT_MS,
             signal: this.ac.signal,
           });
@@ -386,6 +393,7 @@ export class LongPollTransport implements Transport {
 
 interface Queued {
   env: Envelope;
+  payload: string;
   critical: boolean;
   bytes: number;
 }
@@ -401,6 +409,7 @@ export class Connection {
   private stopped = false;
   private attempt = 0;
   private wsFailures = 0;
+  private wsRetryFailures = 0;
   private consecutiveServiceRestarts = 0;
   private forceLongPoll = false;
   private wsRetryTimer: NodeJS.Timeout | null = null;
@@ -535,7 +544,7 @@ export class Connection {
 
   private sendHello(): void {
     const env = envelope("agent.hello", this.o.makeHello(), { id: newId() });
-    this.t?.send(env);
+    this.t?.send(env, JSON.stringify(env));
   }
 
   private handle(env: Envelope): void {
@@ -544,17 +553,24 @@ export class Connection {
       this.probingWs = false;
       this.clearStabilityTimer();
       const stabilityMs = this.o.stabilityWindowMs ?? DEFAULT_STABILITY_WINDOW_MS;
+      const welcomedTransport = this.transportName;
       if (stabilityMs <= 0) {
         this.attempt = 0;
-        this.wsFailures = 0;
         this.consecutiveServiceRestarts = 0;
+        if (welcomedTransport === "ws") {
+          this.wsFailures = 0;
+          this.wsRetryFailures = 0;
+        }
       } else {
         this.stabilityTimer = setTimeout(() => {
           this.stabilityTimer = null;
           if (!this.stopped && this.welcomed) {
             this.attempt = 0;
-            this.wsFailures = 0;
             this.consecutiveServiceRestarts = 0;
+            if (this.transportName === "ws") {
+              this.wsFailures = 0;
+              this.wsRetryFailures = 0;
+            }
           }
         }, stabilityMs);
         this.stabilityTimer.unref?.();
@@ -598,7 +614,8 @@ export class Connection {
     if (this.transportName === "ws") {
       if (!info.opened || !wasWelcomed) this.wsFailures++;
       if (probe) {
-        // WS probe from long-poll failed: go back to long-poll without waiting for 3 more failures
+        // WS probe from long-poll failed: go back to long-poll with exponential backoff
+        this.wsRetryFailures++;
         this.probingWs = false;
         this.forceLongPoll = true;
         this.scheduleWsRetry();
@@ -608,7 +625,11 @@ export class Connection {
         this.scheduleWsRetry();
       }
     } else {
-      // Long-poll failed or closed: reset forceLongPoll so next reconnect cycle retries WebSocket
+      // Long-poll failed or closed: clear pending WS retry timer and let next reconnect cycle retry WebSocket
+      if (this.wsRetryTimer) {
+        clearTimeout(this.wsRetryTimer);
+        this.wsRetryTimer = null;
+      }
       this.forceLongPoll = false;
       this.probingWs = false;
     }
@@ -630,8 +651,14 @@ export class Connection {
     this.reconnectTimer.unref?.();
   }
 
-  /** While on long-poll, retry WebSocket periodically (default 15s instead of 10 min). */
-  private scheduleWsRetry(delayMs = this.o.wsRetryMs ?? DEFAULT_WS_RETRY_MS): void {
+  private nextWsRetryDelayMs(): number {
+    const base = this.o.wsRetryMs ?? DEFAULT_WS_RETRY_MS;
+    const cap = Math.max(base, MAX_WS_RETRY_MS);
+    return Math.min(cap, base * 2 ** Math.min(this.wsRetryFailures, 10));
+  }
+
+  /** While on long-poll, retry WebSocket with exponential backoff (base -> 2x -> ... -> 10 min cap). */
+  private scheduleWsRetry(delayMs = this.nextWsRetryDelayMs()): void {
     if (this.wsRetryTimer) return;
     this.wsRetryTimer = setTimeout(() => {
       this.wsRetryTimer = null;
@@ -683,36 +710,39 @@ export class Connection {
   /** Send now if connected, otherwise queue (bounded). */
   send<D>(t: string, d: D, opts: { id?: string; re?: string } = {}): void {
     const env = envelope(t, d, opts);
-    const bytes = Buffer.byteLength(JSON.stringify(env), "utf8");
+    const payload = JSON.stringify(env);
+    const bytes = frameByteLength(payload);
     if (bytes > MAX_FRAME_BYTES) {
       this.log(`dropping oversized frame ${t} (${bytes} bytes > MAX_FRAME_BYTES ${MAX_FRAME_BYTES})`);
       if (t === "agent.event") this.needsSnapshot = true;
       return;
     }
     const critical = CRITICAL_TYPES.has(t);
-    if (this.connected && this.t?.send(env)) return;
-    this.enqueue(env, critical, false);
+    if (this.connected && this.t?.send(env, payload)) return;
+    this.enqueue(env, critical, false, payload, bytes);
   }
 
   /** Send during the onWelcome callback (before the queue is flushed). */
   sendDirect<D>(t: string, d: D): boolean {
     if (!this.t) return false;
     const env = envelope(t, d);
-    const bytes = Buffer.byteLength(JSON.stringify(env), "utf8");
+    const payload = JSON.stringify(env);
+    const bytes = frameByteLength(payload);
     if (bytes > MAX_FRAME_BYTES) {
       this.log(`dropping oversized direct frame ${t} (${bytes} bytes > MAX_FRAME_BYTES ${MAX_FRAME_BYTES})`);
       if (t === "agent.event") this.needsSnapshot = true;
       return false;
     }
-    return this.t.send(env);
+    return this.t.send(env, payload);
   }
 
-  private enqueue(env: Envelope, critical: boolean, front: boolean): void {
-    const bytes = Buffer.byteLength(JSON.stringify(env));
-    const item: Queued = { env, critical, bytes };
+  private enqueue(env: Envelope, critical: boolean, front: boolean, payload?: string, bytes?: number): void {
+    const serialized = payload ?? JSON.stringify(env);
+    const size = bytes ?? frameByteLength(serialized);
+    const item: Queued = { env, payload: serialized, critical, bytes: size };
     if (front) this.queue.unshift(item);
     else this.queue.push(item);
-    this.queueBytes += bytes;
+    this.queueBytes += size;
     while (this.queue.length > this.maxMsgs || this.queueBytes > this.maxBytes) {
       const i = this.queue.findIndex((q) => !q.critical);
       if (i < 0) break;
@@ -733,7 +763,7 @@ export class Connection {
     this.queue = [];
     this.queueBytes = 0;
     for (const item of q) {
-      if (!this.t?.send(item.env)) this.enqueue(item.env, item.critical, false);
+      if (!this.t?.send(item.env, item.payload)) this.enqueue(item.env, item.critical, false, item.payload, item.bytes);
     }
   }
 }

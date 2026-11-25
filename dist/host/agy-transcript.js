@@ -14,6 +14,7 @@ const MAX_SUBAGENT_TOOLS = 100;
 const MAX_SUBAGENT_THINKING_BYTES = 1024;
 const MAX_SUBAGENT_RESULT_BYTES = 4096;
 const MAX_BG_TASKS = 50;
+const CHILD_MODEL_CHECK_THROTTLE_MS = 10_000;
 export const DEFAULT_BG_TASK_MAX_IDLE_MS = 5 * 60 * 1000;
 export const MAX_SNAPSHOT_BYTES = 220 * 1024;
 function compactSnapshotEntry(entry, isRecent) {
@@ -54,10 +55,21 @@ export class AgyTranscriptReader {
     lastTopic = null;
     lastModel = null;
     lastContextUsage = null;
+    fullStepsCache = null;
+    homeDir;
+    siblingRoot;
+    brainRoot;
+    cachedRealSiblingRoot;
+    cachedRealBrainRoot;
     constructor(transcriptPath, redact = () => false, resolveModel = () => null) {
         this.transcriptPath = transcriptPath;
         this.redact = redact;
         this.resolveModel = resolveModel;
+        this.homeDir = inferAgyHomeFromTranscriptPath(this.transcriptPath);
+        this.siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
+        this.brainRoot = path.resolve(this.homeDir, ".gemini", "antigravity-cli", "brain");
+        this.cachedRealSiblingRoot = realpathOrNull(this.siblingRoot);
+        this.cachedRealBrainRoot = realpathOrNull(this.brainRoot);
     }
     hasRunningSubagents() {
         if (this.childCursors.size > 0)
@@ -163,6 +175,10 @@ export class AgyTranscriptReader {
             return null;
         return this.lastTopic;
     }
+    /** Return the most recent model parsed from `USER_SETTINGS_CHANGE` in the transcript, if any. */
+    getLastModel() {
+        return this.lastModel;
+    }
     /** Return the most recent context window token usage observed in the transcript, if any. */
     getContextUsage() {
         if (!this.lastContextUsage)
@@ -243,7 +259,9 @@ export class AgyTranscriptReader {
                 this.convToTaskId.clear();
                 this.childCursors.clear();
                 this.bgTasks.clear();
+                this.lastModel = null;
                 this.lastContextUsage = null;
+                this.fullStepsCache = null;
             }
             this.offset = chunk.nextOffset;
             this.remainder = chunk.nextRemainder;
@@ -275,7 +293,7 @@ export class AgyTranscriptReader {
                         step.tool_calls.some((tc) => tc?.name === "invoke_subagent");
                     if (hasTrunc && (isTailPlannerOrSys || isSubagentToolCall)) {
                         if (fullStepsMap === undefined) {
-                            fullStepsMap = readFullStepsMap(this.transcriptPath);
+                            fullStepsMap = this.getFullStepsMap();
                         }
                         const full = fullStepsMap?.get(idx);
                         if (full)
@@ -292,20 +310,53 @@ export class AgyTranscriptReader {
         this.pollActiveBackgroundTasks(liveEvents);
         return liveEvents;
     }
+    getFullStepsMap() {
+        const fullPath = path.join(path.dirname(this.transcriptPath), "transcript_full.jsonl");
+        let st;
+        try {
+            st = fs.statSync(fullPath);
+        }
+        catch {
+            this.fullStepsCache = null;
+            return null;
+        }
+        if (!st.isFile()) {
+            this.fullStepsCache = null;
+            return null;
+        }
+        if (this.fullStepsCache &&
+            this.fullStepsCache.fullPath === fullPath &&
+            this.fullStepsCache.mtimeMs === st.mtimeMs &&
+            this.fullStepsCache.size === st.size) {
+            return this.fullStepsCache.map;
+        }
+        const map = readFullStepsMap(this.transcriptPath);
+        this.fullStepsCache = { fullPath, mtimeMs: st.mtimeMs, size: st.size, map };
+        return map;
+    }
+    getRealSiblingRoot() {
+        if (this.cachedRealSiblingRoot === null) {
+            this.cachedRealSiblingRoot = realpathOrNull(this.siblingRoot);
+        }
+        return this.cachedRealSiblingRoot;
+    }
+    getRealBrainRoot() {
+        if (this.cachedRealBrainRoot === null) {
+            this.cachedRealBrainRoot = realpathOrNull(this.brainRoot);
+        }
+        return this.cachedRealBrainRoot;
+    }
     isContainedTaskLogPath(candidate, requireExists = false) {
         if (!path.basename(candidate).endsWith(".log"))
             return false;
         const resolved = resolveSafeFileCandidate(candidate, requireExists);
         if (!resolved)
             return false;
-        const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
-        const realSiblingRoot = realpathOrNull(siblingRoot);
+        const realSiblingRoot = this.getRealSiblingRoot();
         if (realSiblingRoot && isInside(path.join(realSiblingRoot, "tasks"), resolved.realPath)) {
             return true;
         }
-        const homeDir = inferAgyHomeFromTranscriptPath(this.transcriptPath);
-        const brainRoot = path.resolve(homeDir, ".gemini", "antigravity-cli", "brain");
-        const realBrainRoot = realpathOrNull(brainRoot);
+        const realBrainRoot = this.getRealBrainRoot();
         if (realBrainRoot &&
             isInside(realBrainRoot, resolved.realPath) &&
             path.basename(path.dirname(resolved.realPath)) === "tasks") {
@@ -318,8 +369,7 @@ export class AgyTranscriptReader {
             return null;
         const parts = taskSender.split("/");
         const taskPart = parts.length === 2 ? parts[1] : parts[0];
-        const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
-        return resolveAllowedFileUri(logUri, (candidate) => this.isContainedTaskLogPath(candidate, false), () => (SAFE_CONV_ID_RE.test(taskPart) ? path.join(siblingRoot, "tasks", `${taskPart}.log`) : null));
+        return resolveAllowedFileUri(logUri, (candidate) => this.isContainedTaskLogPath(candidate, false), () => (SAFE_CONV_ID_RE.test(taskPart) ? path.join(this.siblingRoot, "tasks", `${taskPart}.log`) : null));
     }
     pollActiveBackgroundTasks(outEvents) {
         if (this.bgTasks.size === 0)
@@ -337,16 +387,34 @@ export class AgyTranscriptReader {
     pollBackgroundTaskCursor(bg, outEvents, isRedacted) {
         if (!bg.logPath || isRedacted)
             return;
-        if (!this.isContainedTaskLogPath(bg.logPath, true))
-            return;
         let st;
         try {
             st = fs.lstatSync(bg.logPath);
         }
         catch {
+            bg.verifiedIno = undefined;
             return;
         }
-        if (st.isSymbolicLink() || !st.isFile() || (st.size === bg.lastSize && st.mtimeMs === bg.lastMtimeMs))
+        if (st.isSymbolicLink() || !st.isFile()) {
+            bg.verifiedIno = undefined;
+            return;
+        }
+        const unchangedVerified = bg.verifiedIno !== undefined &&
+            st.ino === bg.verifiedIno &&
+            st.mtimeMs === bg.verifiedMtimeMs &&
+            st.size === bg.verifiedSize;
+        if (unchangedVerified && st.size === bg.lastSize && st.mtimeMs === bg.lastMtimeMs)
+            return;
+        if (!unchangedVerified) {
+            if (!this.isContainedTaskLogPath(bg.logPath, true)) {
+                bg.verifiedIno = undefined;
+                return;
+            }
+            bg.verifiedIno = st.ino;
+            bg.verifiedMtimeMs = st.mtimeMs;
+            bg.verifiedSize = st.size;
+        }
+        if (st.size === bg.lastSize && st.mtimeMs === bg.lastMtimeMs)
             return;
         const tail = readLogTail(bg.logPath);
         if (!tail)
@@ -393,13 +461,10 @@ export class AgyTranscriptReader {
         const resolved = resolveSafeFileCandidate(candidate, requireExists);
         if (!resolved)
             return false;
-        const homeDir = inferAgyHomeFromTranscriptPath(this.transcriptPath);
-        const brainRoot = path.resolve(homeDir, ".gemini", "antigravity-cli", "brain");
-        const realBrainRoot = realpathOrNull(brainRoot);
+        const realBrainRoot = this.getRealBrainRoot();
         if (realBrainRoot && isInside(realBrainRoot, resolved.realPath))
             return true;
-        const siblingRoot = path.dirname(path.dirname(path.resolve(this.transcriptPath)));
-        const realSiblingRoot = realpathOrNull(siblingRoot);
+        const realSiblingRoot = this.getRealSiblingRoot();
         if (realSiblingRoot && isInside(realSiblingRoot, resolved.realPath))
             return true;
         return false;
@@ -409,7 +474,7 @@ export class AgyTranscriptReader {
             return null;
         return resolveAllowedFileUri(logAbsoluteUri, (candidate) => this.isContainedChildTranscriptPath(candidate, false), () => {
             try {
-                return resolveAgyTranscriptPath(convId, inferAgyHomeFromTranscriptPath(this.transcriptPath));
+                return resolveAgyTranscriptPath(convId, this.homeDir);
             }
             catch {
                 return null;
@@ -433,9 +498,35 @@ export class AgyTranscriptReader {
         if (!cursor)
             return;
         const isRedacted = this.redact();
-        const chunk = this.isContainedChildTranscriptPath(cursor.transcriptPath, true)
-            ? readTranscriptChunk(cursor.transcriptPath, cursor.offset, cursor.remainder)
-            : null;
+        let chunk = null;
+        let st = null;
+        try {
+            st = fs.lstatSync(cursor.transcriptPath);
+        }
+        catch {
+            st = null;
+        }
+        if (st && !st.isSymbolicLink() && st.isFile()) {
+            const unchangedVerified = cursor.verifiedIno !== undefined &&
+                st.ino === cursor.verifiedIno &&
+                st.mtimeMs === cursor.verifiedMtimeMs &&
+                st.size === cursor.verifiedSize &&
+                st.size === cursor.offset;
+            if (!unchangedVerified) {
+                if (this.isContainedChildTranscriptPath(cursor.transcriptPath, true)) {
+                    cursor.verifiedIno = st.ino;
+                    cursor.verifiedMtimeMs = st.mtimeMs;
+                    cursor.verifiedSize = st.size;
+                    chunk = readTranscriptChunk(cursor.transcriptPath, cursor.offset, cursor.remainder);
+                }
+                else {
+                    cursor.verifiedIno = undefined;
+                }
+            }
+        }
+        else {
+            cursor.verifiedIno = undefined;
+        }
         if (chunk) {
             if (chunk.reset) {
                 cursor.lastStepIndex = -1;
@@ -498,13 +589,24 @@ export class AgyTranscriptReader {
                     }
                 }
             }
+            if (chunk.lines.length > 0 && !cursor.hadTranscriptData) {
+                cursor.hadTranscriptData = true;
+                if (!cursor.modelFromSession)
+                    cursor.lastModelCheckAt = 0;
+            }
         }
         if (!cursor.modelFromSession) {
-            const homeDir = inferAgyHomeFromTranscriptPath(cursor.transcriptPath);
-            const { model: sessionModel } = readAgySessionModel(cursor.convId, homeDir);
-            if (sessionModel) {
-                cursor.model = sessionModel;
-                cursor.modelFromSession = true;
+            const now = Date.now();
+            if (cursor.lastModelCheckAt === 0 || now - cursor.lastModelCheckAt >= CHILD_MODEL_CHECK_THROTTLE_MS) {
+                cursor.lastModelCheckAt = now;
+                const homeDir = inferAgyHomeFromTranscriptPath(cursor.transcriptPath);
+                const { model: sessionModel } = readAgySessionModel(cursor.convId, homeDir, {
+                    knownTranscriptModel: null,
+                });
+                if (sessionModel) {
+                    cursor.model = sessionModel;
+                    cursor.modelFromSession = true;
+                }
             }
         }
         const sub = this.subagents.get(cursor.taskId);
@@ -798,6 +900,8 @@ export class AgyTranscriptReader {
                             tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
                             ...(sub.model ? { model: sub.model } : {}),
                             modelFromSession: false,
+                            lastModelCheckAt: 0,
+                            hadTranscriptData: false,
                         });
                     }
                     continue;

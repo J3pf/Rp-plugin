@@ -9,6 +9,27 @@ import { gitDiff, gitDiscard } from "./git.js";
 const MAX_CONCURRENT_RPCS = 4;
 const MAX_QUEUED_RPCS = 32;
 const STABILITY_WINDOW_MS = 5_000;
+const QUOTA_HEARTBEAT_MS = 30 * 60 * 1000;
+const QUOTA_HELLO_FRESH_MS = 60_000;
+function quotaSemanticSignature(quotas) {
+    return JSON.stringify(quotas.map((q) => ({
+        family: q.family,
+        label: q.label,
+        plan: q.plan ?? null,
+        ok: q.ok,
+        notConfigured: q.notConfigured ?? false,
+        error: q.error ?? null,
+        primaryWindowId: q.primaryWindowId ?? null,
+        windows: (q.windows ?? []).map((w) => ({
+            id: w.id,
+            label: w.label ?? null,
+            usedPercent: Math.round(w.usedPercent * 10) / 10,
+            remainingPercent: Math.round(w.remainingPercent * 10) / 10,
+            resetsAt: w.resetsAt ?? null,
+            note: w.note ?? null,
+        })),
+    })));
+}
 export class HostConnection {
     o;
     ws = null;
@@ -17,10 +38,13 @@ export class HostConnection {
     restartAttempt = 0;
     timer = null;
     stabilityTimer = null;
-    /** The relay pings every 25 s, client pings every 20 s; silence beyond 70 s means a dead socket. */
-    keepalive = new WsKeepalive(70_000, 20_000);
+    /** The relay pings every 25 s; client pings only after 40 s of silence, watchdog terminates at 70 s. */
+    keepalive = new WsKeepalive(70_000);
     quotaTimer = null;
     quotaPolling = false;
+    lastQuotaSignature = null;
+    lastQuotaSentAt = 0;
+    lastQuotaCollectedAt = 0;
     inFlightRpcs = 0;
     rpcQueue = [];
     constructor(o) {
@@ -176,6 +200,7 @@ export class HostConnection {
             return;
         try {
             this.ws.send(JSON.stringify(e));
+            this.keepalive.markActivity();
         }
         catch {
             /* ignore transient send error */
@@ -203,8 +228,17 @@ export class HostConnection {
         try {
             const quotas = await this.o.manager.collectQuotas();
             if (!this.stopped && this.ws === ws && ws.readyState === WebSocket.OPEN && quotas) {
-                const body = { quotas };
-                this.sendEnv(envelope("host.quotas", body));
+                const now = (this.o.now ?? Date.now)();
+                this.lastQuotaCollectedAt = now;
+                const sig = quotaSemanticSignature(quotas);
+                const changed = sig !== this.lastQuotaSignature;
+                const heartbeatDue = this.lastQuotaSentAt === 0 || now - this.lastQuotaSentAt >= QUOTA_HEARTBEAT_MS;
+                if (changed || heartbeatDue) {
+                    this.lastQuotaSignature = sig;
+                    this.lastQuotaSentAt = now;
+                    const body = { quotas };
+                    this.sendEnv(envelope("host.quotas", body));
+                }
             }
         }
         catch (e) {
@@ -219,6 +253,7 @@ export class HostConnection {
         const def = await this.o.manager.defaultBackend();
         if (this.stopped || (ws && this.ws !== ws))
             return;
+        const now = (this.o.now ?? Date.now)();
         const body = {
             machineId: this.o.machineId,
             hostname: os.hostname(),
@@ -229,11 +264,17 @@ export class HostConnection {
             defaultLauncher: this.o.cfg.defaultLauncher,
         };
         const quotas = this.o.manager.getLastQuotas?.() ?? null;
-        if (quotas && quotas.length > 0) {
+        const hasCachedQuotas = !!(quotas && quotas.length > 0);
+        if (hasCachedQuotas) {
             body.quotas = quotas;
+            this.lastQuotaSignature = quotaSemanticSignature(quotas);
+            this.lastQuotaSentAt = now;
         }
         this.sendEnv(envelope("host.hello", body));
-        void this.pollQuotas();
+        const cacheFresh = hasCachedQuotas && this.lastQuotaCollectedAt > 0 && now - this.lastQuotaCollectedAt < QUOTA_HELLO_FRESH_MS;
+        if (!cacheFresh) {
+            void this.pollQuotas();
+        }
     }
     async acquireRpcSlot() {
         const maxConcurrent = Math.max(1, this.o.maxConcurrentRpcs ?? MAX_CONCURRENT_RPCS);

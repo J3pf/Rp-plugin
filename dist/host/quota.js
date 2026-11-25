@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { run as realRun } from "./runner.js";
 import { splitCommand } from "./validate.js";
+const DEFAULT_MISSING_BACKOFF_MS = 30 * 60 * 1000;
 function parseNum(val, fallback) {
     if (typeof val === "number" && Number.isFinite(val))
         return val;
@@ -98,13 +99,19 @@ export class QuotaCollector {
     runner;
     command;
     timeoutMs;
+    missingBackoffMs;
+    now;
     onLog;
     fallbackScripts;
     lastQuotas = null;
+    resolvedCmd = null;
+    missingUntil = 0;
     constructor(opts = {}) {
         this.runner = opts.runner ?? realRun;
         this.command = opts.command ?? "piquota --json";
         this.timeoutMs = opts.timeoutMs ?? 15_000;
+        this.missingBackoffMs = opts.missingBackoffMs ?? DEFAULT_MISSING_BACKOFF_MS;
+        this.now = opts.now ?? (() => Date.now());
         this.onLog = opts.onLog;
         this.fallbackScripts = opts.fallbackScripts ?? (() => piquotaScriptCandidates());
     }
@@ -117,14 +124,40 @@ export class QuotaCollector {
             this.onLog?.("empty quota command");
             return this.lastQuotas;
         }
+        const now = this.now();
+        if (this.missingUntil > 0 && now < this.missingUntil) {
+            return this.lastQuotas;
+        }
         const [bin, ...args] = parts;
         try {
-            let res = await this.runner(bin, args, { timeoutMs: this.timeoutMs });
+            let res;
+            if (this.resolvedCmd) {
+                res = await this.runner(this.resolvedCmd.bin, this.resolvedCmd.args, { timeoutMs: this.timeoutMs });
+                if (res.code === -1) {
+                    this.resolvedCmd = null;
+                }
+            }
+            else {
+                res = await this.runner(bin, args, { timeoutMs: this.timeoutMs });
+                if (res.code !== -1) {
+                    this.resolvedCmd = { bin: bin, args };
+                    this.missingUntil = 0;
+                }
+            }
             if (res.code === -1 && bin === "piquota") {
                 // Not on PATH (typical for a service): run the Pi-installed script with this same node.
                 const script = this.fallbackScripts().find((f) => fs.existsSync(f));
-                if (script)
-                    res = await this.runner(process.execPath, [script, ...args], { timeoutMs: this.timeoutMs });
+                if (script) {
+                    const fallbackArgs = [script, ...args];
+                    res = await this.runner(process.execPath, fallbackArgs, { timeoutMs: this.timeoutMs });
+                    if (res.code !== -1) {
+                        this.resolvedCmd = { bin: process.execPath, args: fallbackArgs };
+                        this.missingUntil = 0;
+                    }
+                }
+            }
+            if (res.code === -1) {
+                this.missingUntil = now + this.missingBackoffMs;
             }
             if (res.code !== 0) {
                 const errSnippet = (res.stderr || res.stdout || "").trim().slice(0, 200);

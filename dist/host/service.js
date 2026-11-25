@@ -14,6 +14,18 @@ function isNodeBinaryName(nodePath) {
     return /(?:^|[\\/])node(?:\.exe)?$/i.test(nodePath.trim());
 }
 export function resolveStableNodePath(env, platform = process.platform, execPath) {
+    const targetExecPath = execPath ?? process.execPath;
+    const targetIsNode = Boolean(targetExecPath && isNodeBinaryName(targetExecPath));
+    // Fast path: execPath is already a valid, non-versioned node binary — skip scanning PATH.
+    if (targetIsNode && !isVersionedNodePath(targetExecPath) && fs.existsSync(targetExecPath)) {
+        try {
+            fs.realpathSync(targetExecPath);
+            return targetExecPath;
+        }
+        catch {
+            // Broken symlink: fall through to scan PATH.
+        }
+    }
     const searchEnv = env ?? process.env;
     const searchPath = platform === "win32"
         ? searchEnv.PATH ?? searchEnv.Path ?? ""
@@ -22,8 +34,6 @@ export function resolveStableNodePath(env, platform = process.platform, execPath
     const nodeName = platform === "win32" ? "node.exe" : "node";
     const directories = searchPath.split(platform === "win32" ? ";" : path.delimiter);
     const candidates = [];
-    const targetExecPath = execPath ?? process.execPath;
-    const targetIsNode = Boolean(targetExecPath && isNodeBinaryName(targetExecPath));
     let realExecPath;
     if (targetIsNode) {
         try {
@@ -300,9 +310,11 @@ function isLaunchdJobRunning(status) {
 }
 async function inspectLinuxService(home, inspection, run) {
     const unitPath = systemdUnitPath(home);
-    const enabled = await run("systemctl", ["--user", "is-enabled", "rp-host"]);
-    const active = await run("systemctl", ["--user", "is-active", "rp-host"]);
-    const linger = await checkLinger(undefined, run);
+    const [enabled, active, linger] = await Promise.all([
+        run("systemctl", ["--user", "is-enabled", "rp-host"]),
+        run("systemctl", ["--user", "is-active", "rp-host"]),
+        checkLinger(undefined, run),
+    ]);
     inspection.details = { linger: linger.lingering, ...(linger.error ? { lingerError: linger.error } : {}) };
     inspection.enabled = enabled.code === 0;
     if (!fs.existsSync(unitPath))

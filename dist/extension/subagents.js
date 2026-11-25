@@ -2,15 +2,54 @@ import { safeDurationMs, toEpochMs, truncateBytes } from "../shared/util.js";
 const MAX_SUBAGENT_TASKS = 100;
 const MAX_SUBAGENT_TOOLS = 100;
 const MAX_SUBAGENT_RESULT_BYTES = 4096;
+const CHILD_TOOL_COALESCE_MS = 250;
+function toolsEqual(a, b) {
+    if (!a || a.length !== b.length)
+        return false;
+    for (let i = 0; i < b.length; i++) {
+        if (a[i] !== b[i])
+            return false;
+    }
+    return true;
+}
 export class SubagentTracker {
     deps;
     tasks = new Map();
     childTools = new Map();
     callToTaskId = new Map();
+    pendingChildTimers = new Map();
     now;
     constructor(deps) {
         this.deps = deps;
         this.now = deps.now ?? (() => Date.now());
+    }
+    clearChildTimer(taskId) {
+        const timer = this.pendingChildTimers.get(taskId);
+        if (timer) {
+            clearTimeout(timer);
+            this.pendingChildTimers.delete(taskId);
+        }
+    }
+    scheduleChildEmit(taskId) {
+        if (this.pendingChildTimers.has(taskId))
+            return;
+        const timer = setTimeout(() => {
+            this.pendingChildTimers.delete(taskId);
+            const task = this.tasks.get(taskId);
+            if (task)
+                this.deps.emit(this.sanitizeTask(task));
+        }, CHILD_TOOL_COALESCE_MS);
+        timer.unref?.();
+        this.pendingChildTimers.set(taskId, timer);
+    }
+    dispose() {
+        for (const [taskId, timer] of [...this.pendingChildTimers.entries()]) {
+            clearTimeout(timer);
+            this.pendingChildTimers.delete(taskId);
+            const task = this.tasks.get(taskId);
+            if (task)
+                this.deps.emit(this.sanitizeTask(task));
+        }
     }
     isRedacted() {
         return !!this.deps.isRedacted?.();
@@ -44,6 +83,7 @@ export class SubagentTracker {
             }
             if (!victimId)
                 break;
+            this.clearChildTimer(victimId);
             this.tasks.delete(victimId);
             this.childTools.delete(victimId);
             for (const [callId, mappedId] of this.callToTaskId) {
@@ -106,7 +146,7 @@ export class SubagentTracker {
                 this.childTools.set(taskId, list);
                 task.tools = list.map((t) => t.name);
                 task.toolCalls = (task.toolCalls ?? 0) + 1;
-                this.deps.emit(this.sanitizeTask(task));
+                this.scheduleChildEmit(taskId);
             }
         }
     }
@@ -114,6 +154,7 @@ export class SubagentTracker {
         if (name === "subagent_run" && toolCallId) {
             const taskId = this.callToTaskId.get(toolCallId) ?? toolCallId;
             this.callToTaskId.delete(toolCallId);
+            this.clearChildTimer(taskId);
             const task = this.tasks.get(taskId);
             if (task) {
                 task.status = isError ? "failed" : "completed";
@@ -145,8 +186,11 @@ export class SubagentTracker {
                         t.durationMs = Math.round(durationMs);
                     }
                 }
-                task.tools = list.map((x) => x.name);
-                this.deps.emit(this.sanitizeTask(task));
+                const nextTools = list.map((x) => x.name);
+                if (!toolsEqual(task.tools, nextTools)) {
+                    task.tools = nextTools;
+                    this.scheduleChildEmit(taskId);
+                }
             }
         }
     }
@@ -182,6 +226,7 @@ export class SubagentTracker {
                     : undefined;
             task.durationMs = safeDurationMs(task.startedAt, task.endedAt, sourceDuration);
         }
+        this.clearChildTimer(ev.taskId);
         this.setTask(ev.taskId, task);
         this.deps.emit(this.sanitizeTask(task));
     }
@@ -230,6 +275,7 @@ export class SubagentTracker {
             }
             task.turns = (task.turns ?? 0) + ev.responses.length;
         }
+        this.clearChildTimer(ev.taskId);
         this.deps.emit(this.sanitizeTask(task));
     }
 }

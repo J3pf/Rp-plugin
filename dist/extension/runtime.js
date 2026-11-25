@@ -5,7 +5,8 @@ import { parseTodoTasks, redactTodoTasks, replayTodoBranch } from "./todos.js";
 import { errMsg, preview, safeUser } from "../shared/util.js";
 import { readGitHeadAndDirty } from "../host/git.js";
 import { resolveInboxDir } from "./config.js";
-import { detectPiVersion, detectGentleVersion, detectActiveTheme, gentleVersionSupported, hasGentleAskTools, terminalStdin, toolNames, warnOnce } from "./compat.js";
+import { GENTLE_ASK_TOOLS } from "./environment.js";
+import { detectPiVersion, detectGentleVersion, detectActiveTheme, gentleVersionSupported, terminalStdin, toolNames, warnOnce } from "./compat.js";
 import { Connection } from "./connection.js";
 import { Forwarder } from "./forwarder.js";
 import { buildSnapshotEntries } from "./snapshot.js";
@@ -64,6 +65,11 @@ export class Runtime {
     everConnected = false;
     lastCtx;
     detectTheme;
+    initialBranch = null;
+    cachedToolCount = -1;
+    cachedToolMap = null;
+    cachedHasGentleAskTools = false;
+    cachedGentleVersion = undefined;
     /** Static facts copied from ctx: reading a stale ctx (after reload/dispose) throws in Pi. */
     info;
     constructor(pi, ctx, cfg, env, reason, opts = {}) {
@@ -76,8 +82,10 @@ export class Runtime {
         this.readInfo(ctx);
         this.sessionId = ctx.sessionManager.getSessionId();
         this.agentId = `${cfg.machineId}:${this.sessionId}`;
-        this.allowed = allowedFromBranch(this.safeBranch());
-        this.currentTodos = replayTodoBranch(this.safeBranch());
+        const branch = this.safeBranch();
+        this.initialBranch = branch;
+        this.allowed = allowedFromBranch(branch);
+        this.currentTodos = replayTodoBranch(branch);
         this.herdrBlocker = new HerdrBlocker(pi.events, !!env.herdr);
         this.detectTheme = opts.detectTheme ?? (() => detectActiveTheme());
         this.statuses = new StatusTracker((status, detail) => this.conn.send("agent.status", { status, ...(detail ? { detail } : {}) }), (items) => {
@@ -193,8 +201,10 @@ export class Runtime {
     // ---------- lifecycle ----------
     start() {
         const ctx = this.lastCtx;
+        const branch = this.initialBranch ?? this.safeBranch();
+        this.initialBranch = null;
         this.comm.reset();
-        this.comm.seedSeen(this.safeBranch());
+        this.comm.seedSeen(branch);
         this.adapters.enabled = this.adaptersAllowed();
         // always installed (setStatus is observed for agent.statuses); dialogs are patched only when mirrorDialogs is on
         this.mirror = installMirror(ctx, this.broker, this.adapters, this.statuses, { dialogs: this.cfg.mirrorDialogs });
@@ -204,7 +214,7 @@ export class Runtime {
         const theme = this.detectTheme();
         if (theme)
             this.statuses.observe("pi:theme", theme);
-        this.syncContextUsage();
+        this.syncContextUsage(branch);
         void this.refreshGit();
         this.conn.start();
     }
@@ -219,6 +229,7 @@ export class Runtime {
             this.broker.shutdown({ keepLocal: keepLocalPrompts });
             this.herdrBlocker.releaseAll();
             this.forwarder.dispose();
+            this.subagents.dispose();
             this.statuses.dispose();
             this.mirror.uninstall();
             if (shouldSendClosed) {
@@ -428,7 +439,7 @@ export class Runtime {
         }
         return out;
     }
-    readContextUsage() {
+    readContextUsage(branch) {
         try {
             const cu = this.lastCtx?.getContextUsage?.();
             if (cu &&
@@ -444,9 +455,9 @@ export class Runtime {
         catch {
             /* ignore */
         }
-        const branch = this.safeBranch();
-        for (let i = branch.length - 1; i >= 0; i--) {
-            const m = branch[i]?.message;
+        const entries = branch ?? this.safeBranch();
+        for (let i = entries.length - 1; i >= 0; i--) {
+            const m = entries[i]?.message;
             const u = m?.usage;
             if (m?.role === "assistant" && u && typeof u === "object") {
                 const total = typeof u.totalTokens === "number" && u.totalTokens > 0
@@ -463,8 +474,8 @@ export class Runtime {
         }
         return null;
     }
-    syncContextUsage() {
-        const cu = this.readContextUsage();
+    syncContextUsage(branch) {
+        const cu = this.readContextUsage(branch);
         if (cu) {
             this.statuses.observe("rp:context", `${cu.tokens}/${cu.contextWindow}`);
         }
@@ -478,11 +489,47 @@ export class Runtime {
         }
     }
     // ---------- hello ----------
+    syncToolsCache() {
+        let tools;
+        try {
+            const raw = this.pi.getAllTools();
+            tools = Array.isArray(raw) ? raw : [];
+        }
+        catch {
+            this.cachedToolCount = 0;
+            this.cachedToolMap = new Map();
+            this.cachedHasGentleAskTools = false;
+            this.cachedGentleVersion = null;
+            return;
+        }
+        if (tools.length === this.cachedToolCount && this.cachedToolMap !== null)
+            return;
+        const map = new Map();
+        for (const t of tools) {
+            if (t && typeof t.name === "string")
+                map.set(t.name, t);
+        }
+        this.cachedToolCount = tools.length;
+        this.cachedToolMap = map;
+        this.cachedHasGentleAskTools = GENTLE_ASK_TOOLS.some((n) => map.has(n));
+        this.cachedGentleVersion = undefined;
+    }
+    hasGentleTools() {
+        this.syncToolsCache();
+        return this.cachedHasGentleAskTools;
+    }
+    cachedGentleVer() {
+        this.syncToolsCache();
+        if (this.cachedGentleVersion === undefined) {
+            this.cachedGentleVersion = detectGentleVersion(this.pi);
+        }
+        return this.cachedGentleVersion;
+    }
     gentleInfo() {
-        const present = hasGentleAskTools(this.pi) || this.statuses.sawGentleStatus;
+        const present = this.hasGentleTools() || this.statuses.sawGentleStatus;
         if (!present)
             return null;
-        return { version: detectGentleVersion(this.pi), mode: this.statuses.gentleMode ?? "unknown" };
+        return { version: this.cachedGentleVer(), mode: this.statuses.gentleMode ?? "unknown" };
     }
     features() {
         const f = ["attachments", "statuses", "comm"];
@@ -503,6 +550,7 @@ export class Runtime {
     makeHello() {
         const { mode, cwd, sessionFile, sessionName } = this.info;
         const gentle = this.gentleInfo();
+        const subs = this.subagents.getSnapshot();
         return {
             agentId: this.agentId,
             kind: "pi",
@@ -525,7 +573,7 @@ export class Runtime {
             status: this.statuses.current,
             openPrompts: this.broker.openPrompts(),
             todos: this.currentTodos.length > 0 ? { tasks: this.cfg.redactContent ? redactTodoTasks(this.currentTodos) : this.currentTodos } : null,
-            subagents: this.subagents.getSnapshot().length > 0 ? this.subagents.getSnapshot() : undefined,
+            subagents: subs.length > 0 ? subs : undefined,
         };
     }
     refreshGit() {
@@ -579,7 +627,7 @@ export class Runtime {
         }
     }
     gateMode() {
-        const gentle = hasGentleAskTools(this.pi) || this.statuses.sawGentleStatus;
+        const gentle = this.hasGentleTools() || this.statuses.sawGentleStatus;
         return effectiveMode(this.cfg.gate.mode, gentle);
     }
     safeIdle() {
@@ -591,15 +639,11 @@ export class Runtime {
         }
     }
     toolInfo(name) {
-        try {
-            return this.pi.getAllTools().find((t) => t.name === name);
-        }
-        catch {
-            return undefined;
-        }
+        this.syncToolsCache();
+        return this.cachedToolMap?.get(name);
     }
     adaptersAllowed() {
-        const v = detectGentleVersion(this.pi);
+        const v = this.cachedGentleVer();
         if (v === null)
             return true; // shape guards in each adapter protect us
         if (!gentleVersionSupported(v)) {

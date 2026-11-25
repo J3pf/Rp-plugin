@@ -7,8 +7,8 @@ import { LruSet, errMsg, preview, safeUser } from "../shared/util.ts";
 import { readGitHeadAndDirty } from "../host/git.ts";
 import type { RpConfig } from "./config.ts";
 import { resolveInboxDir } from "./config.ts";
-import type { StaticEnv, HerdrLocation } from "./environment.ts";
-import { detectPiVersion, detectGentleVersion, detectActiveTheme, gentleVersionSupported, hasGentleAskTools, terminalStdin, toolNames, warnOnce } from "./compat.ts";
+import { GENTLE_ASK_TOOLS, type StaticEnv, type HerdrLocation } from "./environment.ts";
+import { detectPiVersion, detectGentleVersion, detectActiveTheme, gentleVersionSupported, terminalStdin, toolNames, warnOnce } from "./compat.ts";
 import { Connection, type ConnState, type TransportName } from "./connection.ts";
 import { Forwarder, type ForwardedEvent } from "./forwarder.ts";
 import { buildSnapshotEntries } from "./snapshot.ts";
@@ -94,6 +94,11 @@ export class Runtime {
   private everConnected = false;
   private lastCtx: ExtensionContext;
   private detectTheme: () => string | null;
+  private initialBranch: any[] | null = null;
+  private cachedToolCount = -1;
+  private cachedToolMap: Map<string, any> | null = null;
+  private cachedHasGentleAskTools = false;
+  private cachedGentleVersion: string | null | undefined = undefined;
   /** Static facts copied from ctx: reading a stale ctx (after reload/dispose) throws in Pi. */
   private info: { mode: string; cwd: string; hasUI: boolean; sessionFile: string | null; sessionName: string | null };
 
@@ -110,8 +115,10 @@ export class Runtime {
     this.readInfo(ctx);
     this.sessionId = ctx.sessionManager.getSessionId();
     this.agentId = `${cfg.machineId}:${this.sessionId}`;
-    this.allowed = allowedFromBranch(this.safeBranch());
-    this.currentTodos = replayTodoBranch(this.safeBranch());
+    const branch = this.safeBranch();
+    this.initialBranch = branch;
+    this.allowed = allowedFromBranch(branch);
+    this.currentTodos = replayTodoBranch(branch);
     this.herdrBlocker = new HerdrBlocker(pi.events as any, !!env.herdr);
     this.detectTheme = opts.detectTheme ?? (() => detectActiveTheme());
 
@@ -236,8 +243,10 @@ export class Runtime {
 
   start(): void {
     const ctx = this.lastCtx;
+    const branch = this.initialBranch ?? this.safeBranch();
+    this.initialBranch = null;
     this.comm.reset();
-    this.comm.seedSeen(this.safeBranch());
+    this.comm.seedSeen(branch);
     this.adapters.enabled = this.adaptersAllowed();
     // always installed (setStatus is observed for agent.statuses); dialogs are patched only when mirrorDialogs is on
     this.mirror = installMirror(ctx, this.broker, this.adapters, this.statuses, { dialogs: this.cfg.mirrorDialogs });
@@ -246,7 +255,7 @@ export class Runtime {
     this.thinking = ctx.thinkingLevel ?? null;
     const theme = this.detectTheme();
     if (theme) this.statuses.observe("pi:theme", theme);
-    this.syncContextUsage();
+    this.syncContextUsage(branch);
     void this.refreshGit();
     this.conn.start();
   }
@@ -261,6 +270,7 @@ export class Runtime {
       this.broker.shutdown({ keepLocal: keepLocalPrompts });
       this.herdrBlocker.releaseAll();
       this.forwarder.dispose();
+      this.subagents.dispose();
       this.statuses.dispose();
       this.mirror.uninstall();
       if (shouldSendClosed) {
@@ -458,7 +468,7 @@ export class Runtime {
     return out;
   }
 
-  private readContextUsage(): { tokens: number; contextWindow: number } | null {
+  private readContextUsage(branch?: any[]): { tokens: number; contextWindow: number } | null {
     try {
       const cu = (this.lastCtx as any)?.getContextUsage?.();
       if (
@@ -475,9 +485,9 @@ export class Runtime {
     } catch {
       /* ignore */
     }
-    const branch = this.safeBranch();
-    for (let i = branch.length - 1; i >= 0; i--) {
-      const m = branch[i]?.message;
+    const entries = branch ?? this.safeBranch();
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const m = entries[i]?.message;
       const u = m?.usage;
       if (m?.role === "assistant" && u && typeof u === "object") {
         const total =
@@ -496,8 +506,8 @@ export class Runtime {
     return null;
   }
 
-  private syncContextUsage(): void {
-    const cu = this.readContextUsage();
+  private syncContextUsage(branch?: any[]): void {
+    const cu = this.readContextUsage(branch);
     if (cu) {
       this.statuses.observe("rp:context", `${cu.tokens}/${cu.contextWindow}`);
     }
@@ -513,10 +523,46 @@ export class Runtime {
 
   // ---------- hello ----------
 
+  private syncToolsCache(): void {
+    let tools: any[];
+    try {
+      const raw = this.pi.getAllTools();
+      tools = Array.isArray(raw) ? raw : [];
+    } catch {
+      this.cachedToolCount = 0;
+      this.cachedToolMap = new Map();
+      this.cachedHasGentleAskTools = false;
+      this.cachedGentleVersion = null;
+      return;
+    }
+    if (tools.length === this.cachedToolCount && this.cachedToolMap !== null) return;
+    const map = new Map<string, any>();
+    for (const t of tools) {
+      if (t && typeof t.name === "string") map.set(t.name, t);
+    }
+    this.cachedToolCount = tools.length;
+    this.cachedToolMap = map;
+    this.cachedHasGentleAskTools = GENTLE_ASK_TOOLS.some((n) => map.has(n));
+    this.cachedGentleVersion = undefined;
+  }
+
+  private hasGentleTools(): boolean {
+    this.syncToolsCache();
+    return this.cachedHasGentleAskTools;
+  }
+
+  private cachedGentleVer(): string | null {
+    this.syncToolsCache();
+    if (this.cachedGentleVersion === undefined) {
+      this.cachedGentleVersion = detectGentleVersion(this.pi);
+    }
+    return this.cachedGentleVersion;
+  }
+
   gentleInfo(): { version: string | null; mode: GentleMode } | null {
-    const present = hasGentleAskTools(this.pi) || this.statuses.sawGentleStatus;
+    const present = this.hasGentleTools() || this.statuses.sawGentleStatus;
     if (!present) return null;
-    return { version: detectGentleVersion(this.pi), mode: this.statuses.gentleMode ?? "unknown" };
+    return { version: this.cachedGentleVer(), mode: this.statuses.gentleMode ?? "unknown" };
   }
 
   features(): string[] {
@@ -533,6 +579,7 @@ export class Runtime {
   makeHello(): AgentHelloBody {
     const { mode, cwd, sessionFile, sessionName } = this.info;
     const gentle = this.gentleInfo();
+    const subs = this.subagents.getSnapshot();
     return {
       agentId: this.agentId,
       kind: "pi",
@@ -555,7 +602,7 @@ export class Runtime {
       status: this.statuses.current as AgentStatus,
       openPrompts: this.broker.openPrompts(),
       todos: this.currentTodos.length > 0 ? { tasks: this.cfg.redactContent ? redactTodoTasks(this.currentTodos) : this.currentTodos } : null,
-      subagents: this.subagents.getSnapshot().length > 0 ? this.subagents.getSnapshot() : undefined,
+      subagents: subs.length > 0 ? subs : undefined,
     };
   }
 
@@ -609,7 +656,7 @@ export class Runtime {
   }
 
   private gateMode(): EffectiveGateMode {
-    const gentle = hasGentleAskTools(this.pi) || this.statuses.sawGentleStatus;
+    const gentle = this.hasGentleTools() || this.statuses.sawGentleStatus;
     return effectiveMode(this.cfg.gate.mode, gentle);
   }
 
@@ -622,15 +669,12 @@ export class Runtime {
   }
 
   private toolInfo(name: string) {
-    try {
-      return this.pi.getAllTools().find((t) => t.name === name) as any;
-    } catch {
-      return undefined;
-    }
+    this.syncToolsCache();
+    return this.cachedToolMap?.get(name);
   }
 
   private adaptersAllowed(): boolean {
-    const v = detectGentleVersion(this.pi);
+    const v = this.cachedGentleVer();
     if (v === null) return true; // shape guards in each adapter protect us
     if (!gentleVersionSupported(v)) {
       warnOnce(this.lastCtx, "gentle-range", `RP: gentle-pi ${v} fuera del rango probado (>=4.0 <5); las preguntas de ask_user_* se notificarán como "esperando en la terminal".`);

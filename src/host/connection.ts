@@ -1,7 +1,7 @@
 // rp-host ⇄ relay: wss://<relay>/ws/host (PROTOCOLO §9).
 import os from "node:os";
 import WebSocket from "ws";
-import { CLOSE, envelope, parseEnvelope, type Envelope, type HostHelloBody, type HostQuotasBody } from "../shared/protocol.ts";
+import { CLOSE, envelope, parseEnvelope, type Envelope, type HostHelloBody, type HostQuotasBody, type MachineQuota } from "../shared/protocol.ts";
 import { WsKeepalive, createRelayWebSocket, isFatalCloseCode, toWsUrl } from "../shared/http.ts";
 import { backoffDelay, errMsg } from "../shared/util.ts";
 import type { HostConfig } from "./config.ts";
@@ -12,6 +12,30 @@ import { gitDiff, gitDiscard } from "./git.ts";
 const MAX_CONCURRENT_RPCS = 4;
 const MAX_QUEUED_RPCS = 32;
 const STABILITY_WINDOW_MS = 5_000;
+const QUOTA_HEARTBEAT_MS = 30 * 60 * 1000;
+const QUOTA_HELLO_FRESH_MS = 60_000;
+
+function quotaSemanticSignature(quotas: MachineQuota[]): string {
+  return JSON.stringify(
+    quotas.map((q) => ({
+      family: q.family,
+      label: q.label,
+      plan: q.plan ?? null,
+      ok: q.ok,
+      notConfigured: q.notConfigured ?? false,
+      error: q.error ?? null,
+      primaryWindowId: q.primaryWindowId ?? null,
+      windows: (q.windows ?? []).map((w) => ({
+        id: w.id,
+        label: w.label ?? null,
+        usedPercent: Math.round(w.usedPercent * 10) / 10,
+        remainingPercent: Math.round(w.remainingPercent * 10) / 10,
+        resetsAt: w.resetsAt ?? null,
+        note: w.note ?? null,
+      })),
+    })),
+  );
+}
 
 export interface HostConnectionOptions {
   relayUrl: string;
@@ -23,6 +47,7 @@ export interface HostConnectionOptions {
   onLog?: (m: string) => void;
   backoff?: (attempt: number) => number;
   random?: () => number;
+  now?: () => number;
   maxConcurrentRpcs?: number;
   maxQueuedRpcs?: number;
 }
@@ -34,10 +59,13 @@ export class HostConnection {
   private restartAttempt = 0;
   private timer: NodeJS.Timeout | null = null;
   private stabilityTimer: NodeJS.Timeout | null = null;
-  /** The relay pings every 25 s, client pings every 20 s; silence beyond 70 s means a dead socket. */
-  private keepalive = new WsKeepalive(70_000, 20_000);
+  /** The relay pings every 25 s; client pings only after 40 s of silence, watchdog terminates at 70 s. */
+  private keepalive = new WsKeepalive(70_000);
   private quotaTimer: NodeJS.Timeout | null = null;
   private quotaPolling = false;
+  private lastQuotaSignature: string | null = null;
+  private lastQuotaSentAt = 0;
+  private lastQuotaCollectedAt = 0;
   private inFlightRpcs = 0;
   private rpcQueue: Array<() => void> = [];
 
@@ -185,6 +213,7 @@ export class HostConnection {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     try {
       this.ws.send(JSON.stringify(e));
+      this.keepalive.markActivity();
     } catch {
       /* ignore transient send error */
     }
@@ -212,8 +241,17 @@ export class HostConnection {
     try {
       const quotas = await this.o.manager.collectQuotas();
       if (!this.stopped && this.ws === ws && ws.readyState === WebSocket.OPEN && quotas) {
-        const body: HostQuotasBody = { quotas };
-        this.sendEnv(envelope("host.quotas", body));
+        const now = (this.o.now ?? Date.now)();
+        this.lastQuotaCollectedAt = now;
+        const sig = quotaSemanticSignature(quotas);
+        const changed = sig !== this.lastQuotaSignature;
+        const heartbeatDue = this.lastQuotaSentAt === 0 || now - this.lastQuotaSentAt >= QUOTA_HEARTBEAT_MS;
+        if (changed || heartbeatDue) {
+          this.lastQuotaSignature = sig;
+          this.lastQuotaSentAt = now;
+          const body: HostQuotasBody = { quotas };
+          this.sendEnv(envelope("host.quotas", body));
+        }
       }
     } catch (e) {
       this.log(`error polling quotas: ${(e as Error).message}`);
@@ -226,6 +264,7 @@ export class HostConnection {
     const rep = await this.o.manager.detect(true);
     const def = await this.o.manager.defaultBackend();
     if (this.stopped || (ws && this.ws !== ws)) return;
+    const now = (this.o.now ?? Date.now)();
     const body: HostHelloBody = {
       machineId: this.o.machineId,
       hostname: os.hostname(),
@@ -236,11 +275,18 @@ export class HostConnection {
       defaultLauncher: this.o.cfg.defaultLauncher,
     };
     const quotas = this.o.manager.getLastQuotas?.() ?? null;
-    if (quotas && quotas.length > 0) {
+    const hasCachedQuotas = !!(quotas && quotas.length > 0);
+    if (hasCachedQuotas) {
       body.quotas = quotas;
+      this.lastQuotaSignature = quotaSemanticSignature(quotas);
+      this.lastQuotaSentAt = now;
     }
     this.sendEnv(envelope("host.hello", body));
-    void this.pollQuotas();
+    const cacheFresh =
+      hasCachedQuotas && this.lastQuotaCollectedAt > 0 && now - this.lastQuotaCollectedAt < QUOTA_HELLO_FRESH_MS;
+    if (!cacheFresh) {
+      void this.pollQuotas();
+    }
   }
 
   private async acquireRpcSlot(): Promise<boolean> {

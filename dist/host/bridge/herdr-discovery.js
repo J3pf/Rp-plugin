@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SAFE_CONV_ID_RE } from "../../shared/util.js";
+import { LruMap, SAFE_CONV_ID_RE } from "../../shared/util.js";
 import { parseJson, pick } from "../backends/herdr.js";
 const CONV_RE = /--conversation\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
 export function mapHerdrAgentStatus(rawStatus) {
@@ -32,15 +32,24 @@ export function herdrPriorityStatusRank(item) {
             return 1;
     }
 }
+const panelSortModeCache = new LruMap(32);
 export function readHerdrPanelSortMode(env = process.env) {
     const cfgPath = env.HERDR_CONFIG_PATH || path.join(os.homedir(), ".config", "herdr", "config.toml");
     try {
+        const st = fs.statSync(cfgPath, { throwIfNoEntry: false });
+        if (!st || !st.isFile()) {
+            panelSortModeCache.delete(cfgPath);
+            return "priority";
+        }
+        const cached = panelSortModeCache.get(cfgPath);
+        if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+            return cached.mode;
+        }
         const text = fs.readFileSync(cfgPath, "utf8");
         const m = /^\s*agent_panel_sort\s*=\s*["']?(priority|spaces|workspaces)["']?/m.exec(text);
-        if (m?.[1] === "spaces" || m?.[1] === "workspaces")
-            return "spaces";
-        if (m?.[1] === "priority")
-            return "priority";
+        const mode = m?.[1] === "spaces" || m?.[1] === "workspaces" ? "spaces" : "priority";
+        panelSortModeCache.set(cfgPath, { mtimeMs: st.mtimeMs, size: st.size, mode });
+        return mode;
     }
     catch {
         /* ignore missing config */
