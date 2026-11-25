@@ -20,6 +20,7 @@ import { readGitHeadAndDirty } from "./git.ts";
 import {
   parseTerminalContextUsage,
   readExternalAgentContextUsage,
+  readExternalAgentMetadata,
   readExternalAgentModel,
   readExternalAgentModelWithState,
 } from "./bridge/external-metadata.ts";
@@ -66,6 +67,7 @@ export {
   parseHerdrAgentList,
   parseTerminalContextUsage,
   readExternalAgentContextUsage,
+  readExternalAgentMetadata,
   readExternalAgentModel,
   readHerdrPanelSortMode,
   runAgyHook,
@@ -76,6 +78,10 @@ export {
 };
 
 const OPTIMISTIC_WORKING_MS = 8_000;
+const HERDR_FAIL_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000] as const;
+const HERDR_ZERO_SESSIONS_POLL_MS = 15_000;
+const ORDER_HELLO_DEBOUNCE_MS = 1_500;
+const GIT_REFRESH_DEBOUNCE_MS = 3_000;
 
 interface BridgedSessionDeps {
   relayUrl: string;
@@ -87,6 +93,8 @@ interface BridgedSessionDeps {
   onLog?: (msg: string) => void;
   connectionFactory?: (o: ConstructorParameters<typeof Connection>[0]) => Connection;
   startDelayMs?: number;
+  activePollIntervalMs?: number;
+  idlePollIntervalMs?: number;
   retireOnly?: boolean;
   onSessionClosedByCommand?: (sessionKey: string, paneId: string) => void;
 }
@@ -117,8 +125,12 @@ export class BridgedAgentSession {
   private watchDebounce: NodeJS.Timeout | null = null;
   private lastSentName = "";
   private lastSentTabId: string | null = null;
+  private lastSentOrderIndex: number | undefined = undefined;
   private lastSentContextSpec = "";
   private lastSentModelId = "";
+  private lastSentModel: { provider: string; id: string } | null = null;
+  private orderHelloTimer: NodeJS.Timeout | null = null;
+  private gitRefreshTimer: NodeJS.Timeout | null = null;
   private externalContextUsage: ContextUsageInfo | null = null;
   private currentStatus: AgentStatus;
   private lastEmittedStatus: AgentStatus;
@@ -222,16 +234,23 @@ export class BridgedAgentSession {
   }
 
   private activeAgyModelId(): string | null {
+    const fromTranscript = this.transcriptReader?.getLastModel();
+    if (fromTranscript) return fromTranscript;
     if (this.lastSentModelId) return this.lastSentModelId;
-    const { model } = readExternalAgentModelWithState(this.info.agent, this.info.cwd, this.info.sessionId);
+    const { model } = readExternalAgentModelWithState(
+      this.info.agent,
+      this.info.cwd,
+      this.info.sessionId,
+      undefined,
+      this.transcriptReader ? { knownTranscriptModel: null } : undefined,
+    );
     return model.id || null;
   }
 
-  private syncContextIfChanged(direct = false, sendHelloOnTabChange = true): void {
+  private syncContextIfChanged(direct = false): void {
     const ctx = this.getContextUsage();
     if (!ctx || ctx.tokens <= 0 || ctx.contextWindow <= 0) return;
     const spec = `${ctx.tokens}/${ctx.contextWindow}`;
-    const nextTab = this.encodedTabId();
     if (spec !== this.lastSentContextSpec) {
       this.lastSentContextSpec = spec;
       if (direct) {
@@ -239,9 +258,6 @@ export class BridgedAgentSession {
       } else {
         this.conn.send("agent.statuses", { items: { "rp:context": spec } });
       }
-    }
-    if (sendHelloOnTabChange && this.conn.connected && this.initialSnapshotSent && nextTab !== this.lastSentTabId) {
-      this.conn.sendDirect("agent.hello", this.makeHello());
     }
   }
 
@@ -261,18 +277,46 @@ export class BridgedAgentSession {
     }
   }
 
+  private applyExternalModel(nextModel: { provider: string; id: string }, uncertain: boolean): void {
+    if (!this.conn.connected || !this.initialSnapshotSent) return;
+    if (uncertain || !nextModel.id || nextModel.id === this.lastSentModelId) return;
+    this.lastSentModel = nextModel;
+    this.lastSentModelId = nextModel.id;
+    this.syncContextIfChanged(false);
+    this.conn.sendDirect("agent.hello", this.makeHello());
+    this.sendEvent({ type: "model_select", model: nextModel });
+  }
+
   private syncModelIfChanged(): void {
     if (!this.conn.connected || !this.initialSnapshotSent) return;
     const { model: nextModel, uncertain } = readExternalAgentModelWithState(
       this.info.agent,
       this.info.cwd,
       this.info.sessionId,
+      undefined,
+      this.transcriptReader ? { knownTranscriptModel: this.transcriptReader.getLastModel() } : undefined,
     );
-    if (uncertain || !nextModel.id || nextModel.id === this.lastSentModelId) return;
-    this.lastSentModelId = nextModel.id;
-    this.syncContextIfChanged(false, false);
-    this.conn.sendDirect("agent.hello", this.makeHello());
-    this.sendEvent({ type: "model_select", model: nextModel });
+    this.applyExternalModel(nextModel, uncertain);
+  }
+
+  private clearOrderHelloTimer(): void {
+    if (this.orderHelloTimer) {
+      clearTimeout(this.orderHelloTimer);
+      this.orderHelloTimer = null;
+    }
+  }
+
+  private scheduleOrderHello(): void {
+    if (this.disposed || !this.conn.connected || !this.initialSnapshotSent) return;
+    this.clearOrderHelloTimer();
+    this.orderHelloTimer = setTimeout(() => {
+      this.orderHelloTimer = null;
+      if (this.disposed || !this.conn.connected || !this.initialSnapshotSent) return;
+      if (this.info.orderIndex !== this.lastSentOrderIndex) {
+        this.conn.sendDirect("agent.hello", this.makeHello());
+      }
+    }, ORDER_HELLO_DEBOUNCE_MS);
+    this.orderHelloTimer.unref?.();
   }
 
   private effectiveStatus(): AgentStatus {
@@ -363,14 +407,21 @@ export class BridgedAgentSession {
       this.transcriptReader?.pruneStaleBackgroundTasks?.();
     }
 
-    const prevTab = this.encodedTabId();
+    const prevTabId = this.info.tabId;
+    const prevOrderIndex = this.info.orderIndex;
+    const prevIsDone = this.effectiveStatus() === "done";
     const prevEmitted = this.lastEmittedStatus;
     this.info = { ...this.info, ...next };
     this.currentStatus = next.status;
-    const nextTab = this.encodedTabId();
+    const nextIsDone = this.effectiveStatus() === "done";
 
-    if (this.conn.connected && prevTab !== nextTab && this.initialSnapshotSent) {
-      this.conn.sendDirect("agent.hello", this.makeHello());
+    if (this.conn.connected && this.initialSnapshotSent) {
+      if (prevTabId !== this.info.tabId || prevIsDone !== nextIsDone) {
+        this.clearOrderHelloTimer();
+        this.conn.sendDirect("agent.hello", this.makeHello());
+      } else if (prevOrderIndex !== this.info.orderIndex) {
+        this.scheduleOrderHello();
+      }
     }
 
     if (
@@ -395,17 +446,29 @@ export class BridgedAgentSession {
   }
 
   makeHello(): AgentHelloBody {
+    this.clearOrderHelloTimer();
     const subagents = this.transcriptReader?.getSubagents() ?? [];
     const name = this.sessionDisplayName();
     this.lastSentName = name;
     const encodedTab = this.encodedTabId();
     this.lastSentTabId = encodedTab;
+    this.lastSentOrderIndex = this.info.orderIndex;
     const rawBranch = this.git?.branch ?? null;
     const gitDirty = this.git?.dirty ?? false;
     const formattedBranch =
       rawBranch && gitDirty && !rawBranch.endsWith(" *") ? `${rawBranch} *` : rawBranch;
-    const model = readExternalAgentModel(this.info.agent, this.info.cwd, this.info.sessionId);
-    this.lastSentModelId = model.id;
+    let model = this.lastSentModel;
+    if (!model) {
+      model = readExternalAgentModel(
+        this.info.agent,
+        this.info.cwd,
+        this.info.sessionId,
+        undefined,
+        this.transcriptReader ? { knownTranscriptModel: this.transcriptReader.getLastModel() } : undefined,
+      );
+      this.lastSentModel = model;
+      this.lastSentModelId = model.id;
+    }
     return {
       agentId: this.agentId,
       kind: this.info.agent,
@@ -625,7 +688,9 @@ export class BridgedAgentSession {
     if (this.disposed) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     const isWorking = this.effectiveStatus() === "working" || this.hasRunningTranscriptWork();
-    const delayMs = isWorking ? 900 : this.watcher ? 15_000 : 4_500;
+    const delayMs = isWorking
+      ? (this.d.activePollIntervalMs ?? (this.transcriptReader ? 900 : 2_000))
+      : (this.d.idlePollIntervalMs ?? (this.watcher ? 15_000 : 20_000));
     this.pollTimer = setTimeout(() => {
       void this.pollTranscriptNow().finally(() => this.scheduleNextPoll());
     }, delayMs);
@@ -637,6 +702,26 @@ export class BridgedAgentSession {
     this.scheduleNextPoll();
   }
 
+  private syncExternalMetadata(terminalText: string): void {
+    const meta = readExternalAgentMetadata(
+      this.info.agent,
+      this.info.cwd,
+      this.info.sessionId,
+      terminalText,
+    );
+    if (meta.usage) {
+      this.externalContextUsage = meta.usage;
+      this.syncContextIfChanged();
+    }
+    this.applyExternalModel(meta.model, meta.uncertain);
+  }
+
+  private willPollPaneFallback(commandText?: string): boolean {
+    if (this.disposed || !this.info.paneId || this.d.cfg.redactContent) return false;
+    if (this.initialFallbackDone && !commandText && this.effectiveStatus() !== "working") return false;
+    return true;
+  }
+
   pollTranscriptNow(): Promise<void> {
     if (this.disposed) return Promise.resolve();
     if (this.pollInFlight) return this.pollInFlight;
@@ -645,7 +730,7 @@ export class BridgedAgentSession {
         if (this.transcriptReader) {
           if (!this.watcher) this.setupFileWatcher();
           const hadRunning = this.hasRunningTranscriptWork();
-          const prevTab = this.encodedTabId();
+          const prevIsDone = this.effectiveStatus() === "done";
           const prevOffset = this.transcriptReader.byteOffset;
           const events = this.transcriptReader.pollNewEvents();
           const prunedBg =
@@ -673,27 +758,24 @@ export class BridgedAgentSession {
           }
           if (events.length > 0 || prunedBg > 0) {
             this.reconcileStatus();
-            const nextTab = this.encodedTabId();
-            if (this.conn.connected && this.initialSnapshotSent && nextTab !== prevTab && nextTab !== this.lastSentTabId) {
+            const nextIsDone = this.effectiveStatus() === "done";
+            if (this.conn.connected && this.initialSnapshotSent && nextIsDone !== prevIsDone) {
               this.conn.sendDirect("agent.hello", this.makeHello());
             }
             if (shouldRefreshGit) {
-              void this.refreshGit();
+              this.scheduleGitRefresh();
             }
           }
           return;
         }
-        const extUsage = readExternalAgentContextUsage(
-          this.info.agent,
-          this.info.cwd,
-          this.info.sessionId,
-          this.lastTerminalSnapshot,
-        );
-        if (extUsage) {
-          this.externalContextUsage = extUsage;
-          this.syncContextIfChanged();
+        if (this.willPollPaneFallback()) {
+          const polled = await this.pollPaneFallback();
+          if (!polled) {
+            this.syncExternalMetadata(this.lastTerminalSnapshot);
+          }
+        } else {
+          this.syncExternalMetadata(this.lastTerminalSnapshot);
         }
-        await this.pollPaneFallback();
       } catch (e) {
         this.d.onLog?.(`poll transcript error: ${errMsg(e)}`);
       }
@@ -704,31 +786,25 @@ export class BridgedAgentSession {
     return p;
   }
 
-  private async pollPaneFallback(commandText?: string): Promise<void> {
-    if (this.disposed || !this.info.paneId || this.d.cfg.redactContent) return;
-    if (this.initialFallbackDone && !commandText && this.effectiveStatus() !== "working") return;
+  private async pollPaneFallback(commandText?: string): Promise<boolean> {
+    if (!this.willPollPaneFallback(commandText)) return false;
     try {
       const res = await this.d.runner("herdr", ["pane", "read", "--source", "recent", "--lines", "60", this.info.paneId], {
         timeoutMs: 3_000,
         env: this.d.herdrSession ? { HERDR_SESSION: this.d.herdrSession } : {},
       });
-      if (res.code !== 0) return;
+      if (res.code !== 0) return false;
       const parsed = parseJson(res.stdout);
       const rawText = (typeof parsed?.result?.text === "string" ? parsed.result.text : res.stdout).trim();
       const text = stripAnsi(rawText).trim();
-      if (!text) return;
+      if (!text) return false;
       const snippet = extractRecentCommandOutput(text, commandText);
-      const termUsage = readExternalAgentContextUsage(this.info.agent, this.info.cwd, this.info.sessionId, text);
-      if (termUsage) {
-        this.externalContextUsage = termUsage;
-        this.syncContextIfChanged();
-      }
-      this.syncModelIfChanged();
-      if (snippet === this.lastTerminalSnapshot) return;
+      this.syncExternalMetadata(text);
+      if (snippet === this.lastTerminalSnapshot) return true;
       this.lastTerminalSnapshot = truncateBytes(snippet, 16 * 1024).text;
       if (!this.initialFallbackDone) {
         this.initialFallbackDone = true;
-        return;
+        return true;
       }
       this.lastTerminalSnapshotTs = Date.now();
       if (!this.fallbackTurnTs) {
@@ -752,8 +828,9 @@ export class BridgedAgentSession {
           content: [{ type: "text", text: "```text\n" + this.lastTerminalSnapshot + "\n```" }],
         },
       });
+      return true;
     } catch {
-      /* ignore */
+      return false;
     }
   }
 
@@ -1036,7 +1113,26 @@ export class BridgedAgentSession {
     }
   }
 
+  private clearGitRefreshTimer(): void {
+    if (this.gitRefreshTimer) {
+      clearTimeout(this.gitRefreshTimer);
+      this.gitRefreshTimer = null;
+    }
+  }
+
+  private scheduleGitRefresh(): void {
+    if (this.disposed) return;
+    if (this.git?.dirty === true && this.effectiveStatus() === "working") return;
+    this.clearGitRefreshTimer();
+    this.gitRefreshTimer = setTimeout(() => {
+      this.gitRefreshTimer = null;
+      if (!this.disposed) void this.refreshGit();
+    }, GIT_REFRESH_DEBOUNCE_MS);
+    this.gitRefreshTimer.unref?.();
+  }
+
   private refreshGit(): Promise<void> {
+    this.clearGitRefreshTimer();
     const cwd = this.info.cwd;
     if (!cwd) return Promise.resolve();
     if (this.gitInFlight) return this.gitInFlight;
@@ -1086,6 +1182,8 @@ export class BridgedAgentSession {
     if (this.disposed) return;
     this.disposed = true;
     this.clearOptimisticWorking();
+    this.clearOrderHelloTimer();
+    this.clearGitRefreshTimer();
     if (this.closeTimer) clearTimeout(this.closeTimer);
     this.closeTimer = null;
     if (this.reconnectDebounce) clearTimeout(this.reconnectDebounce);
@@ -1137,6 +1235,7 @@ export class HerdrAgentBridge {
   private pollPromise: Promise<void> | null = null;
   private stopped = false;
   private herdrListFailing = false;
+  private consecutiveListFailures = 0;
   private gate: AgyGateServer;
   private runner: Runner;
   private stateFile: string | null;
@@ -1196,7 +1295,15 @@ export class HerdrAgentBridge {
   private savePersistedSessions(): void {
     if (!this.stateFile) return;
     try {
-      const items = [...this.persistedSessions.values()];
+      const items = [...this.persistedSessions.values()].map((item) => ({
+        agent: item.agent,
+        sessionId: item.sessionId,
+        paneId: item.paneId,
+        cwd: item.cwd,
+        tabId: item.tabId,
+        workspaceId: item.workspaceId,
+        title: item.title,
+      }));
       const serialized = JSON.stringify(items, null, 2);
       if (serialized === this.lastSavedSessionsJson) return;
       atomicWriteFileSync(this.stateFile, serialized, 0o600);
@@ -1226,14 +1333,34 @@ export class HerdrAgentBridge {
   private scheduleNextBridgePoll(): void {
     if (this.stopped) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
-    const hasActiveSession = [...this.sessionsByKey.values()].some(
-      (s) => s.discoveredInfo.status === "working" || s.discoveredInfo.status === "waiting_input",
-    );
-    const interval = this.o.pollIntervalMs ?? (hasActiveSession ? 2_500 : 5_000);
+    let interval: number;
+    if (this.o.pollIntervalMs !== undefined) {
+      interval = this.o.pollIntervalMs;
+    } else if (this.consecutiveListFailures > 0) {
+      const idx = Math.min(this.consecutiveListFailures - 1, HERDR_FAIL_BACKOFF_MS.length - 1);
+      interval = HERDR_FAIL_BACKOFF_MS[idx]!;
+    } else if (this.sessionsByKey.size === 0) {
+      interval = HERDR_ZERO_SESSIONS_POLL_MS;
+    } else {
+      const hasActiveSession = [...this.sessionsByKey.values()].some(
+        (s) => s.discoveredInfo.status === "working" || s.discoveredInfo.status === "waiting_input",
+      );
+      interval = hasActiveSession ? 2_500 : 5_000;
+    }
     this.pollTimer = setTimeout(() => {
       void this.poll().finally(() => this.scheduleNextBridgePoll());
     }, interval);
     this.pollTimer.unref?.();
+  }
+
+  /** Wake the bridge poll loop immediately (e.g. after spawning a new Herdr session) and reschedule. */
+  triggerPoll(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+    return this.poll().finally(() => this.scheduleNextBridgePoll());
   }
 
   start(): void {
@@ -1295,6 +1422,7 @@ export class HerdrAgentBridge {
       const res = await this.runner("herdr", ["agent", "list"], { timeoutMs: 5_000, env });
       if (this.stopped) return;
       if (res.code !== 0) {
+        this.consecutiveListFailures += 1;
         if (!this.herdrListFailing) {
           this.herdrListFailing = true;
           const detail = (res.stderr || res.stdout || "").trim().slice(0, 200);
@@ -1302,6 +1430,7 @@ export class HerdrAgentBridge {
         }
         return;
       }
+      this.consecutiveListFailures = 0;
       if (this.herdrListFailing) {
         this.herdrListFailing = false;
         this.o.onLog?.("herdr agent list recovered");
@@ -1408,6 +1537,7 @@ export class HerdrAgentBridge {
 
       this.savePersistedSessions();
     } catch (e) {
+      this.consecutiveListFailures += 1;
       this.o.onLog?.(`herdr bridge poll error: ${errMsg(e)}`);
     }
   }

@@ -991,18 +991,22 @@ function makeTestSocketPath(dir: string, name = "gate.sock"): string {
       vi.advanceTimersByTime(5_500);
       expect(readAgySessionModel(convId, home)).toEqual({ model: "gemini-4-unseen-yet", uncertain: false });
 
-      // Update DB + bump mtime -> cache invalidates immediately even within 10s
+      // Update DB + bump mtime within 10s -> stays throttled by wall-clock window, then refreshes after 10s
       writeDbModel("claude-sonnet-4.5");
       const future = new Date(Date.now() + 2_000);
       fs.utimesSync(dbPath, future, future);
+      expect(readAgySessionModel(convId, home)).toEqual({ model: "gemini-4-unseen-yet", uncertain: false });
+      vi.advanceTimersByTime(10_500);
       expect(readAgySessionModel(convId, home)).toEqual({ model: "claude-sonnet-4.5", uncertain: false });
 
-      // Corrupt/lock DB on next refresh -> preserves cached model instead of dropping to null
+      // Corrupt/lock DB on next refresh after throttle window -> preserves cached model instead of dropping to null
       fs.writeFileSync(dbPath, "not a sqlite db");
-      const future2 = new Date(Date.now() + 4_000);
+      const future2 = new Date(Date.now() + 14_000);
       fs.utimesSync(dbPath, future2, future2);
+      vi.advanceTimersByTime(10_500);
       const afterErr = readAgySessionModel(convId, home);
       expect(afterErr.model).toBe("claude-sonnet-4.5");
+      expect(afterErr.uncertain).toBe(true);
     });
   });
 });
