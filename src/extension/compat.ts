@@ -8,7 +8,12 @@ import { LruMap } from "../shared/util.ts";
 import { GENTLE_ASK_TOOLS } from "./environment.ts";
 
 /** Tested range of gentle-pi (PLAN §8.5). */
-export const GENTLE_RANGE = { min: [4, 0, 0], maxExclusive: [5, 0, 0] } as const;
+export const GENTLE_RANGE = { min: [4, 0, 0], maxExclusive: [6, 0, 0] } as const;
+
+/** Human-readable tested range, shared by the warning and `/rp doctor`. */
+export function gentleRangeLabel(): string {
+  return `>=${GENTLE_RANGE.min.join(".")} <${GENTLE_RANGE.maxExclusive.join(".")}`;
+}
 
 export function parseVersion(v: string): [number, number, number] | null {
   const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
@@ -25,6 +30,16 @@ export function gentleVersionSupported(version: string | null): boolean {
   const v = parseVersion(version);
   if (!v) return false;
   return cmp(v, GENTLE_RANGE.min) >= 0 && cmp(v, GENTLE_RANGE.maxExclusive) < 0;
+}
+
+/**
+ * gentle-pi 5.0.0 changed the `ask_user_choice` default: the free-text "Type your answer" row is
+ * always offered unless the caller passes `allowCustomResponse: false` (4.x required `true`).
+ * The mobile prompt must mirror whichever default the loaded gentle-pi actually applies.
+ */
+export function gentleFreeTextByDefault(version: string | null): boolean {
+  const v = version ? parseVersion(version) : null;
+  return !!v && cmp(v, [5, 0, 0]) >= 0;
 }
 
 const warned = new Set<string>();

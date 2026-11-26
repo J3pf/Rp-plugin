@@ -9,7 +9,7 @@ import { CLOSE } from "../shared/protocol.ts";
 import { piHomes } from "../shared/platform.ts";
 import { errMsg, splitCommand } from "../shared/util.ts";
 import { GATE_MODES, updateConfigFile, type GateMode, type RpConfig } from "./config.ts";
-import { GENTLE_RANGE, detectGentleVersion, gentleVersionSupported, hasGentleAskTools } from "./compat.ts";
+import { detectGentleVersion, gentleRangeLabel, gentleVersionSupported, hasGentleAskTools } from "./compat.ts";
 import type { Runtime } from "./runtime.ts";
 import { promptContext } from "./prompts/classify.ts";
 import type WebSocket from "ws";
@@ -284,7 +284,7 @@ export async function runDoctor(pi: ExtensionAPI | null, cfg: RpConfig, env = pr
       checks.push({
         level: v === null ? "warn" : ok ? "ok" : "warn",
         label: "gentle-pi",
-        detail: v === null ? "versión desconocida" : ok ? `${v} (soportada)` : `${v} fuera del rango >=${GENTLE_RANGE.min.join(".")} <${GENTLE_RANGE.maxExclusive[0]}`,
+        detail: v === null ? "versión desconocida" : ok ? `${v} (soportada)` : `${v} fuera del rango ${gentleRangeLabel()}`,
       });
     }
   }

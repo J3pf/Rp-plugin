@@ -8,7 +8,7 @@ import { CLOSE } from "../shared/protocol.js";
 import { piHomes } from "../shared/platform.js";
 import { errMsg, splitCommand } from "../shared/util.js";
 import { GATE_MODES, updateConfigFile } from "./config.js";
-import { GENTLE_RANGE, detectGentleVersion, gentleVersionSupported, hasGentleAskTools } from "./compat.js";
+import { detectGentleVersion, gentleRangeLabel, gentleVersionSupported, hasGentleAskTools } from "./compat.js";
 import { promptContext } from "./prompts/classify.js";
 export const PLUGIN_PACKAGE = "@j3pf/pi-rp";
 export const PLUGIN_GIT_SOURCE = "git:github.com/J3pf/Rp-plugin";
@@ -278,7 +278,7 @@ export async function runDoctor(pi, cfg, env = process.env) {
             checks.push({
                 level: v === null ? "warn" : ok ? "ok" : "warn",
                 label: "gentle-pi",
-                detail: v === null ? "versión desconocida" : ok ? `${v} (soportada)` : `${v} fuera del rango >=${GENTLE_RANGE.min.join(".")} <${GENTLE_RANGE.maxExclusive[0]}`,
+                detail: v === null ? "versión desconocida" : ok ? `${v} (soportada)` : `${v} fuera del rango ${gentleRangeLabel()}`,
             });
         }
     }

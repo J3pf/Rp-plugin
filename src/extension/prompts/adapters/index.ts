@@ -1,13 +1,15 @@
 // Registry that resolves custom() dialogs of known tools through the broker (PLAN §8.5).
 import type { Broker, OpenPrompt } from "../broker.ts";
-import type { CustomDialogAdapter } from "./types.ts";
+import type { AdapterCaps, CustomDialogAdapter } from "./types.ts";
+import { DEFAULT_ADAPTER_CAPS } from "./types.ts";
 import { gentleAskUserChoice } from "./gentle-ask-user-choice.ts";
 import { gentleAskUserQuestion } from "./gentle-ask-user-question.ts";
 import { piAskUser } from "./pi-ask-user.ts";
 import { reviewConsent } from "./review-consent.ts";
 import type { CustomInterceptor } from "../mirror.ts";
 
-export type { ComponentDialogAdapter, CustomDialogAdapter } from "./types.ts";
+export type { AdapterCaps, ComponentDialogAdapter, CustomDialogAdapter } from "./types.ts";
+export { DEFAULT_ADAPTER_CAPS } from "./types.ts";
 export { gentleAskUserChoice, gentleAskUserQuestion, piAskUser, reviewConsent };
 
 export const BUILTIN_ADAPTERS: CustomDialogAdapter[] = [gentleAskUserChoice, gentleAskUserQuestion, piAskUser, reviewConsent];
@@ -23,6 +25,8 @@ export class AdapterRegistry implements CustomInterceptor {
   private stack: Current[] = [];
   private mirroredComponents = new WeakSet<object>();
   enabled = true;
+  /** Version-dependent behavior of the loaded gentle-pi; the runtime sets it from the detected version. */
+  caps: AdapterCaps = { ...DEFAULT_ADAPTER_CAPS };
 
   constructor(private broker: Broker, adapters: CustomDialogAdapter[] = BUILTIN_ADAPTERS) {
     for (const a of adapters) this.byTool.set(a.tool, a);
@@ -111,7 +115,7 @@ export class AdapterRegistry implements CustomInterceptor {
       });
       settled = true;
       if (prompt && !prompt.closed && !answeredRemotely) {
-        this.broker.resolved(prompt, "local", cur.adapter.fromResult(cur.args, value));
+        this.broker.resolved(prompt, "local", cur.adapter.fromResult(cur.args, value, this.caps));
       }
       return value;
     } catch (error) {
@@ -165,7 +169,7 @@ export class AdapterRegistry implements CustomInterceptor {
         deliverDone(done);
         return factory(tui, theme, kb, done);
       };
-      attachPrompt(this.broker.openSpec(cur.adapter.toPrompt(cur.args)));
+      attachPrompt(this.broker.openSpec(cur.adapter.toPrompt(cur.args, this.caps)));
       return runOrig(wrapped as any);
     });
   }

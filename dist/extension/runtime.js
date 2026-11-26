@@ -6,7 +6,7 @@ import { errMsg, preview, safeUser } from "../shared/util.js";
 import { readGitHeadAndDirty } from "../host/git.js";
 import { resolveInboxDir } from "./config.js";
 import { GENTLE_ASK_TOOLS } from "./environment.js";
-import { detectPiVersion, detectGentleVersion, detectActiveTheme, gentleVersionSupported, terminalStdin, toolNames, warnOnce } from "./compat.js";
+import { detectPiVersion, detectGentleVersion, detectActiveTheme, gentleFreeTextByDefault, gentleRangeLabel, gentleVersionSupported, terminalStdin, toolNames, warnOnce } from "./compat.js";
 import { Connection } from "./connection.js";
 import { Forwarder } from "./forwarder.js";
 import { buildSnapshotEntries } from "./snapshot.js";
@@ -206,6 +206,8 @@ export class Runtime {
         this.comm.reset();
         this.comm.seedSeen(branch);
         this.adapters.enabled = this.adaptersAllowed();
+        // gentle-pi 5.0.0 flipped the ask_user_choice free-text default; the mobile prompt must mirror it.
+        this.adapters.caps = { freeTextByDefault: gentleFreeTextByDefault(this.cachedGentleVer()) };
         // always installed (setStatus is observed for agent.statuses); dialogs are patched only when mirrorDialogs is on
         this.mirror = installMirror(ctx, this.broker, this.adapters, this.statuses, { dialogs: this.cfg.mirrorDialogs });
         this.maybeRegisterAskUser();
@@ -647,7 +649,7 @@ export class Runtime {
         if (v === null)
             return true; // shape guards in each adapter protect us
         if (!gentleVersionSupported(v)) {
-            warnOnce(this.lastCtx, "gentle-range", `RP: gentle-pi ${v} fuera del rango probado (>=4.0 <5); las preguntas de ask_user_* se notificarán como "esperando en la terminal".`);
+            warnOnce(this.lastCtx, "gentle-range", `RP: gentle-pi ${v} fuera del rango probado (${gentleRangeLabel()}); las preguntas de ask_user_* se notificarán como "esperando en la terminal".`);
             return false;
         }
         return true;

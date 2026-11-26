@@ -214,6 +214,18 @@ describe("gentle-pi 4.1.0 adapters (fixtures taken from the real tool source)", 
     expect(gentleAskUserChoice.fromResult(choiceArgs, { customResponse: "z" })).toEqual({ text: "z" });
     expect(gentleAskUserChoice.fromResult(choiceArgs, undefined)).toEqual({ cancelled: true });
   });
+  it("ask_user_choice mirrors gentle-pi 5.0.0, where free text is the default", () => {
+    const caps = { freeTextByDefault: true };
+    // no allowCustomResponse at all: 4.x hid the free-text row, 5.x offers "Type your answer"
+    const { allowCustomResponse: _dropped, ...noFlag } = choiceArgs;
+    expect(gentleAskUserChoice.toPrompt(noFlag).allowFreeText).toBe(false);
+    expect(gentleAskUserChoice.toPrompt(noFlag, caps).allowFreeText).toBe(true);
+    // an explicit false still closes it, exactly as the terminal dialog does
+    expect(gentleAskUserChoice.toPrompt({ ...noFlag, allowCustomResponse: false }, caps).allowFreeText).toBe(false);
+    expect(gentleAskUserChoice.toResult(noFlag, { text: "my own" })).toBeUndefined();
+    expect(gentleAskUserChoice.toResult(noFlag, { text: "my own" }, caps)).toEqual({ customResponse: "my own" });
+    expect(gentleAskUserChoice.toResult({ ...noFlag, allowCustomResponse: false }, { text: "my own" }, caps)).toBeUndefined();
+  });
 
   const qArgs = {
     questions: [

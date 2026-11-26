@@ -1,7 +1,9 @@
+import { DEFAULT_ADAPTER_CAPS } from "./types.js";
 import { gentleAskUserChoice } from "./gentle-ask-user-choice.js";
 import { gentleAskUserQuestion } from "./gentle-ask-user-question.js";
 import { piAskUser } from "./pi-ask-user.js";
 import { reviewConsent } from "./review-consent.js";
+export { DEFAULT_ADAPTER_CAPS } from "./types.js";
 export { gentleAskUserChoice, gentleAskUserQuestion, piAskUser, reviewConsent };
 export const BUILTIN_ADAPTERS = [gentleAskUserChoice, gentleAskUserQuestion, piAskUser, reviewConsent];
 export class AdapterRegistry {
@@ -10,6 +12,8 @@ export class AdapterRegistry {
     stack = [];
     mirroredComponents = new WeakSet();
     enabled = true;
+    /** Version-dependent behavior of the loaded gentle-pi; the runtime sets it from the detected version. */
+    caps = { ...DEFAULT_ADAPTER_CAPS };
     constructor(broker, adapters = BUILTIN_ADAPTERS) {
         this.broker = broker;
         for (const a of adapters)
@@ -89,7 +93,7 @@ export class AdapterRegistry {
             });
             settled = true;
             if (prompt && !prompt.closed && !answeredRemotely) {
-                this.broker.resolved(prompt, "local", cur.adapter.fromResult(cur.args, value));
+                this.broker.resolved(prompt, "local", cur.adapter.fromResult(cur.args, value, this.caps));
             }
             return value;
         }
@@ -149,7 +153,7 @@ export class AdapterRegistry {
                 deliverDone(done);
                 return factory(tui, theme, kb, done);
             };
-            attachPrompt(this.broker.openSpec(cur.adapter.toPrompt(cur.args)));
+            attachPrompt(this.broker.openSpec(cur.adapter.toPrompt(cur.args, this.caps)));
             return runOrig(wrapped);
         });
     }

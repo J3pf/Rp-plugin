@@ -7,7 +7,7 @@ import { configDir, configPath, defaultInboxDir, hostConfigPath, expandHome } fr
 import { envelope, parseEnvelope } from "../src/shared/protocol.ts";
 import { normalizeConfig, saveConfig, loadConfig, updateConfigFile, DEFAULT_CONFIG } from "../src/extension/config.ts";
 import { detectStaticEnv, parseGentleMode, isAskLikeTool } from "../src/extension/environment.ts";
-import { detectActiveTheme, gentleVersionSupported, parseVersion } from "../src/extension/compat.ts";
+import { detectActiveTheme, gentleFreeTextByDefault, gentleRangeLabel, gentleVersionSupported, parseVersion } from "../src/extension/compat.ts";
 
 describe("util", () => {
   it("truncates by UTF-8 bytes without splitting code points", () => {
@@ -184,14 +184,23 @@ describe("environment detection", () => {
 });
 
 describe("gentle version range", () => {
-  it("accepts 4.x only", () => {
+  it("accepts 4.x and 5.x", () => {
     expect(parseVersion("4.1.0")).toEqual([4, 1, 0]);
     expect(gentleVersionSupported("4.0.0")).toBe(true);
     expect(gentleVersionSupported("4.9.3")).toBe(true);
+    expect(gentleVersionSupported("5.0.0")).toBe(true);
+    expect(gentleVersionSupported("5.4.2")).toBe(true);
     expect(gentleVersionSupported("3.9.9")).toBe(false);
-    expect(gentleVersionSupported("5.0.0")).toBe(false);
+    expect(gentleVersionSupported("6.0.0")).toBe(false);
     expect(gentleVersionSupported(null)).toBe(false);
     expect(gentleVersionSupported("nonsense")).toBe(false);
+    expect(gentleRangeLabel()).toBe(">=4.0.0 <6.0.0");
+  });
+  it("tracks the free-text default flip introduced by gentle-pi 5.0.0", () => {
+    expect(gentleFreeTextByDefault(null)).toBe(false);
+    expect(gentleFreeTextByDefault("4.9.3")).toBe(false);
+    expect(gentleFreeTextByDefault("5.0.0")).toBe(true);
+    expect(gentleFreeTextByDefault("5.4.2")).toBe(true);
   });
 });
 

@@ -263,8 +263,12 @@ adapters.race(factory, opts, runOrig) {
 - Gentle-pi ejecuta su `captureAnswer(selection)` con el resultado → la respuesta remota queda registrada como respuesta
   humana igual que la local.
 - `compat.ts` comprueba la versión de gentle-pi (lee `package.json` subiendo desde `pi.getAllTools()[i].sourceInfo.baseDir`/`path`, `ToolInfo.sourceInfo` en `types.ts:2122-2130`)
-  contra el rango probado (`>=4.0 <5`). Fuera de rango → adaptador desactivado y se usa la notificación
+  contra el rango probado (`>=4.0 <6`). Fuera de rango → adaptador desactivado y se usa la notificación
   "esperando en la terminal". Tests de contrato con fixtures de parámetros/resultados de gentle-pi en CI.
+  gentle-pi 5.0.0 conserva los nombres (`ask_user_choice`, `ask_user_question`), sus parámetros y sus resultados,
+  pero invierte el valor por defecto del texto libre: el renglón "Type your answer" se ofrece salvo
+  `allowCustomResponse: false` (en 4.x hacía falta `true`). `gentleFreeTextByDefault()` detecta esa versión y el
+  registro de adaptadores publica el prompt móvil con el mismo valor por defecto que el diálogo de la terminal.
 - Adaptadores adicionales (p. ej. `@eko24ive/pi-ask`, ejemplo `question.ts` de Pi) se añaden con la misma interfaz.
 
 ### 8.5.1 Consentimiento de review de gentle-pi (`gentle_review`)
@@ -477,7 +481,7 @@ Todo lo descrito arriba está implementado en este repositorio. Resumen por tare
 - **Modo gentle desconocido**: gentle-pi publica `gentle:mode` a partir del primer turno. Mientras no se conoce, el plugin
   asume que *podría* ser Auto y teclea (correcto en cualquier modo).
 - **Versión de gentle-pi**: se lee del `package.json` de nombre `gentle-pi` más cercano a la ruta de la herramienta; si no se
-  encuentra, los adaptadores siguen activos (cada uno valida la forma de los parámetros) y sólo se desactivan fuera de `>=4.0 <5`.
+  encuentra, los adaptadores siguen activos (cada uno valida la forma de los parámetros) y sólo se desactivan fuera de `>=4.0 <6`.
 - **SDK de Pi**: `session.dispose()` no emite `session_shutdown`; el socket está `unref()`-ado para no retener el proceso.
 - **Agent Mesh (handover entrante)**: en `pi-intercom`, los mensajes de tipo `handover` se inyectan sin un marcador específico en `Message` (su payload llega como mensaje de texto estándar en `pi.sendMessage`), por lo que el lado receptor emite el evento `comm` con `action: "send"`. En cambio, el lado emisor sí intercepta la herramienta `intercom` con `action: "handover"` y emite `action: "handover"`.
 - **Modo Vim**: la detección es heurística (estado de pie de página que contenga «vim»); pendiente de confirmar en S7.
