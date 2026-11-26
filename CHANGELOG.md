@@ -5,6 +5,17 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] - 2026-11-25
+
+Bidirectional Antigravity CLI (`agy`) `ask_question` mirroring, performance optimizations, and 4R hardening.
+
+### Added
+- **Bidirectional AGY `ask_question` Mirroring**: Detects pending `ask_question` tool calls in `agy` transcripts (including truncated `tool_calls` recovery from `transcript_full.jsonl`), mirrors them to `Rp-relay`/`Rp-app` as `questionnaire` prompts with `waiting_input` status (batched cleanly to 4 questions), and delivers mobile answers or cancellations back into the live `agy` pane via `herdr pane send-keys` / `herdr pane send-text` without blocking the terminal. Dismisses mobile prompts immediately with `by: "local"` when answered on desktop, and syncs on-disk state before/during delivery to prevent stray keystrokes.
+
+### Improved & Hardened
+- **Performance & Battery**: Optimized Herdr bridge polling, external metadata disk caching (`dbMtimeMs` fast-path), keepalive/long-poll backoff, quota probes, git diff batching, and startup overhead; wired Herdr spawn wakeups directly to the bridge.
+- **4R Security & Modularization**: Fail-closed HMAC gate authentication, symlink/root confinement, Windows shell-injection elimination, shared WebSocket/OS-service helpers, modularized `herdr-bridge` & `agy-transcript`, and CI `dist/` parity checks.
+
 ## [0.4.6] - 2026-11-16
 
 Per-model Antigravity CLI (`agy`) context window telemetry instead of a hardcoded `256k` cap.
