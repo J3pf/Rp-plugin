@@ -743,51 +743,58 @@ export class BridgedAgentSession {
     return true;
   }
 
+  private drainTranscriptEvents(reconcileAsk = true): void {
+    if (this.disposed || !this.transcriptReader) return;
+    if (!this.watcher) this.setupFileWatcher();
+    const hadRunning = this.hasRunningTranscriptWork();
+    const prevIsDone = this.effectiveStatus() === "done";
+    const prevOffset = this.transcriptReader.byteOffset;
+    const events = this.transcriptReader.pollNewEvents();
+    const prunedBg =
+      this.currentStatus === "idle" || this.currentStatus === "done"
+        ? (this.transcriptReader.pruneStaleBackgroundTasks?.() ?? 0)
+        : 0;
+    const offsetAdvanced = this.transcriptReader.byteOffset !== prevOffset;
+    let shouldRefreshGit = false;
+    for (const ev of events) {
+      this.sendEvent(ev);
+      if (
+        ev.type === "tool_execution_end" &&
+        (ev.toolName === "edit" || ev.toolName === "write" || ev.toolName === "bash")
+      ) {
+        shouldRefreshGit = true;
+      }
+    }
+    if (!hadRunning && this.hasRunningTranscriptWork()) {
+      this.scheduleNextPoll();
+    }
+    if (reconcileAsk) {
+      this.reconcileAskQuestion();
+    }
+    if (offsetAdvanced || events.length > 0) {
+      this.syncSessionNameIfChanged();
+      this.syncContextIfChanged();
+      this.syncModelIfChanged();
+    }
+    if (events.length > 0 || prunedBg > 0) {
+      this.reconcileStatus();
+      const nextIsDone = this.effectiveStatus() === "done";
+      if (this.conn.connected && this.initialSnapshotSent && nextIsDone !== prevIsDone) {
+        this.conn.sendDirect("agent.hello", this.makeHello());
+      }
+      if (shouldRefreshGit) {
+        this.scheduleGitRefresh();
+      }
+    }
+  }
+
   pollTranscriptNow(): Promise<void> {
     if (this.disposed) return Promise.resolve();
     if (this.pollInFlight) return this.pollInFlight;
     const p = (async () => {
       try {
         if (this.transcriptReader) {
-          if (!this.watcher) this.setupFileWatcher();
-          const hadRunning = this.hasRunningTranscriptWork();
-          const prevIsDone = this.effectiveStatus() === "done";
-          const prevOffset = this.transcriptReader.byteOffset;
-          const events = this.transcriptReader.pollNewEvents();
-          const prunedBg =
-            this.currentStatus === "idle" || this.currentStatus === "done"
-              ? (this.transcriptReader.pruneStaleBackgroundTasks?.() ?? 0)
-              : 0;
-          const offsetAdvanced = this.transcriptReader.byteOffset !== prevOffset;
-          let shouldRefreshGit = false;
-          for (const ev of events) {
-            this.sendEvent(ev);
-            if (
-              ev.type === "tool_execution_end" &&
-              (ev.toolName === "edit" || ev.toolName === "write" || ev.toolName === "bash")
-            ) {
-              shouldRefreshGit = true;
-            }
-          }
-          if (!hadRunning && this.hasRunningTranscriptWork()) {
-            this.scheduleNextPoll();
-          }
-          this.reconcileAskQuestion();
-          if (offsetAdvanced || events.length > 0) {
-            this.syncSessionNameIfChanged();
-            this.syncContextIfChanged();
-            this.syncModelIfChanged();
-          }
-          if (events.length > 0 || prunedBg > 0) {
-            this.reconcileStatus();
-            const nextIsDone = this.effectiveStatus() === "done";
-            if (this.conn.connected && this.initialSnapshotSent && nextIsDone !== prevIsDone) {
-              this.conn.sendDirect("agent.hello", this.makeHello());
-            }
-            if (shouldRefreshGit) {
-              this.scheduleGitRefresh();
-            }
-          }
+          this.drainTranscriptEvents(true);
           return;
         }
         if (this.willPollPaneFallback()) {
@@ -1163,7 +1170,10 @@ export class BridgedAgentSession {
     if (this.activeAskQuestion && (!pending || pending.key !== this.activeAskQuestion.key)) {
       const prev = this.activeAskQuestion;
       this.activeAskQuestion = null;
-      if (!prev.prompt.closed && !prev.prompt.answered) {
+      if (!prev.prompt.closed) {
+        if (prev.prompt.answered && !prev.prompt.cancelledBySystem) {
+          this.broker.ack(prev.prompt.id, false);
+        }
         this.broker.close(prev.prompt);
         this.broker.resolved(prev.prompt, "local", null);
       }
@@ -1190,6 +1200,16 @@ export class BridgedAgentSession {
     });
   }
 
+  private isAskQuestionStillPendingOnDisk(key: string): boolean {
+    if (this.disposed || !this.transcriptReader) return false;
+    try {
+      this.drainTranscriptEvents(false);
+    } catch (e) {
+      this.d.onLog?.(`ask_question disk sync error: ${errMsg(e)}`);
+    }
+    return this.transcriptReader.getPendingAskQuestion()?.key === key;
+  }
+
   private handleAskQuestionRemoteAnswer(
     key: string,
     spec: AgyAskQuestionSpec,
@@ -1197,15 +1217,15 @@ export class BridgedAgentSession {
     prompt: OpenPrompt,
     answer: Answer,
   ): void {
-    if (this.disposed || prompt.cancelledBySystem) return;
+    if (this.disposed || prompt.cancelledBySystem || prompt.closed) return;
     if (this.activeAskQuestion?.prompt.id !== prompt.id) return;
 
-    const currentPending = this.transcriptReader?.getPendingAskQuestion();
-    if (!currentPending || currentPending.key !== key) {
+    if (!this.isAskQuestionStillPendingOnDisk(key)) {
       this.activeAskQuestion = null;
       this.broker.ack(prompt.id, false);
       this.broker.close(prompt);
       this.broker.resolved(prompt, "local", null);
+      this.reconcileAskQuestion();
       return;
     }
 
@@ -1248,11 +1268,11 @@ export class BridgedAgentSession {
   ): Promise<void> {
     try {
       if (this.disposed) return;
-      if (this.transcriptReader?.getPendingAskQuestion()?.key !== key) return;
+      if (!this.isAskQuestionStillPendingOnDisk(key)) return;
 
       const ok = await deliverAskQuestionPlan(this.d.runner, this.info.paneId, env, plan, {
         stepDelayMs: this.d.askQuestionStepDelayMs,
-        shouldAbort: () => this.disposed || this.transcriptReader?.getPendingAskQuestion()?.key !== key,
+        shouldAbort: () => this.disposed || !this.isAskQuestionStillPendingOnDisk(key),
       });
       if (!ok) {
         this.handledAskQuestionKeys.add(key);
@@ -1262,7 +1282,7 @@ export class BridgedAgentSession {
       if (this.disposed) return;
 
       if (hasMoreBatches) {
-        if (this.transcriptReader?.getPendingAskQuestion()?.key === key) {
+        if (this.isAskQuestionStillPendingOnDisk(key)) {
           this.openAskQuestionBatch(key, spec, nextOffset);
         }
         return;
@@ -1274,6 +1294,9 @@ export class BridgedAgentSession {
     } finally {
       if (this.deliveringAskQuestionKey === key) {
         this.deliveringAskQuestionKey = null;
+      }
+      if (!this.disposed && !this.activeAskQuestion) {
+        this.reconcileAskQuestion();
       }
     }
   }

@@ -286,7 +286,12 @@ export async function deliverAskQuestionPlan(
       step.type === "keys"
         ? ["pane", "send-keys", paneId, ...step.keys]
         : ["pane", "send-text", paneId, ...(step.text.startsWith("-") ? ["--", step.text] : [step.text])];
-    const res = await runner("herdr", args, { timeoutMs, env });
+    let res: { code: number; stdout: string; stderr: string };
+    try {
+      res = await runner("herdr", args, { timeoutMs, env });
+    } catch {
+      return false;
+    }
     if (res.code !== 0) return false;
     if (delayMs > 0 && i < plan.length - 1) {
       await new Promise((r) => setTimeout(r, delayMs));

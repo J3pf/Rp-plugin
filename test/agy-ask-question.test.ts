@@ -841,4 +841,208 @@ describe("BridgedAgentSession bidirectional ask_question mirroring", () => {
       ["pane", "send-keys", "w1:p9", "enter"],
     ]);
   });
+
+  it("clears prompt without zombie waiting_input when [prompt.answer, resync] arrive synchronously after local resolution", async () => {
+    const { session, transport, tPath, herdrCalls } = setupSession();
+
+    fs.appendFileSync(
+      tPath,
+      JSON.stringify({
+        step_index: 2,
+        type: "PLANNER_RESPONSE",
+        tool_calls: [
+          {
+            id: "tc-race-sync",
+            name: "ask_question",
+            args: { questions: JSON.stringify([{ question: "Race?", options: ["A", "B"] }]) },
+          },
+        ],
+      }) + "\n",
+      "utf8",
+    );
+    await session.pollTranscriptNow();
+    const opened = transport.sent.filter((e) => e.t === "prompt.open")[0]!.d as any;
+
+    // Terminal answers locally on disk
+    fs.appendFileSync(
+      tPath,
+      JSON.stringify({ step_index: 3, type: "GENERIC", status: "DONE", content: "A1: A" }) + "\n",
+      "utf8",
+    );
+
+    // Long-poll style synchronous batch: prompt.answer followed immediately by agent.resync before microtasks drain
+    transport.receive(
+      inbound("prompt.answer", {
+        promptId: opened.promptId,
+        answer: { answers: [{ questionIndex: 0, optionIds: ["1"] }] },
+      }),
+    );
+    transport.receive(inbound("agent.resync", {}));
+    await flushAsync();
+
+    expect(session.broker.openCount).toBe(0);
+    expect(session.makeHello().status).not.toBe("waiting_input");
+    expect(session.makeHello().openPrompts).toEqual([]);
+    expect(herdrCalls).toEqual([]);
+    expect(
+      transport.sent.filter((e) => e.t === "prompt.ack" && (e.d as any).promptId === opened.promptId),
+    ).toMatchObject([{ d: { promptId: opened.promptId, accepted: false } }]);
+    expect(
+      transport.sent.filter((e) => e.t === "prompt.resolved" && (e.d as any).promptId === opened.promptId),
+    ).toMatchObject([{ d: { promptId: opened.promptId, by: "local", answer: null } }]);
+  });
+
+  it("syncs transcript from disk on prompt.answer so already-answered terminal dialogs receive zero stray keys", async () => {
+    const { session, transport, tPath, herdrCalls } = setupSession();
+
+    fs.appendFileSync(
+      tPath,
+      JSON.stringify({
+        step_index: 2,
+        type: "PLANNER_RESPONSE",
+        tool_calls: [
+          {
+            id: "tc-stale-window",
+            name: "ask_question",
+            args: { questions: JSON.stringify([{ question: "Proceed?", options: ["Yes", "No"] }]) },
+          },
+        ],
+      }) + "\n",
+      "utf8",
+    );
+    await session.pollTranscriptNow();
+    const opened = transport.sent.filter((e) => e.t === "prompt.open")[0]!.d as any;
+
+    // Terminal answers locally on disk, WITHOUT calling pollTranscriptNow() first (simulates 150-900ms debounce window)
+    fs.appendFileSync(
+      tPath,
+      JSON.stringify({ step_index: 3, type: "GENERIC", status: "DONE", content: "A1: Yes" }) + "\n",
+      "utf8",
+    );
+
+    transport.receive(
+      inbound("prompt.answer", {
+        promptId: opened.promptId,
+        answer: { answers: [{ questionIndex: 0, optionIds: ["1"] }] },
+      }),
+    );
+    await flushAsync();
+
+    expect(herdrCalls).toEqual([]);
+    expect(session.broker.openCount).toBe(0);
+    expect(
+      transport.sent.some(
+        (e) => e.t === "prompt.ack" && (e.d as any).promptId === opened.promptId && (e.d as any).accepted === false,
+      ),
+    ).toBe(true);
+    expect(
+      transport.sent.some(
+        (e) =>
+          e.t === "prompt.resolved" &&
+          (e.d as any).promptId === opened.promptId &&
+          (e.d as any).by === "local" &&
+          (e.d as any).answer === null,
+      ),
+    ).toBe(true);
+  });
+
+  it("aborts remaining keystrokes mid-delivery if local terminal answers on disk between steps", async () => {
+    const herdrCalls: string[][] = [];
+    let tPathRef = "";
+    const runner = vi.fn(async (_cmd: string, args: string[]) => {
+      herdrCalls.push(args);
+      if (herdrCalls.length === 1) {
+        // Simulate terminal answering right after first step
+        fs.appendFileSync(
+          tPathRef,
+          JSON.stringify({ step_index: 3, type: "GENERIC", status: "DONE", content: "A1: A" }) + "\n",
+          "utf8",
+        );
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    });
+
+    const { session, transport, tPath } = setupSession({ runner });
+    tPathRef = tPath;
+    fs.appendFileSync(
+      tPath,
+      JSON.stringify({
+        step_index: 2,
+        type: "PLANNER_RESPONSE",
+        tool_calls: [
+          {
+            id: "tc-mid-abort",
+            name: "ask_question",
+            args: { questions: JSON.stringify([{ question: "Pick?", options: ["A", "B", "C"] }]) },
+          },
+        ],
+      }) + "\n",
+      "utf8",
+    );
+    await session.pollTranscriptNow();
+    const opened = transport.sent.filter((e) => e.t === "prompt.open")[0]!.d as any;
+
+    transport.receive(
+      inbound("prompt.answer", {
+        promptId: opened.promptId,
+        answer: { answers: [{ questionIndex: 0, optionIds: ["2"] }] },
+      }),
+    );
+    await flushAsync();
+
+    // Only the first step (down, down) ran; enter was aborted because GENERIC appeared on disk
+    expect(herdrCalls).toEqual([["pane", "send-keys", "w1:p9", "down", "down"]]);
+  });
+
+  it("handles rejecting runner on non-final >4-question batch without re-opening batch 0", async () => {
+    const runner = vi.fn(async () => {
+      throw new Error("herdr boom");
+    });
+    const { session, transport, tPath } = setupSession({ runner });
+
+    fs.appendFileSync(
+      tPath,
+      JSON.stringify({
+        step_index: 2,
+        type: "PLANNER_RESPONSE",
+        tool_calls: [
+          {
+            id: "tc-5q-err",
+            name: "ask_question",
+            args: {
+              questions: JSON.stringify([
+                { question: "Q1", options: ["A", "B"] },
+                { question: "Q2", options: ["A", "B"] },
+                { question: "Q3", options: ["A", "B"] },
+                { question: "Q4", options: ["A", "B"] },
+                { question: "Q5", options: ["A", "B"] },
+              ]),
+            },
+          },
+        ],
+      }) + "\n",
+      "utf8",
+    );
+    await session.pollTranscriptNow();
+    const firstPrompt = transport.sent.filter((e) => e.t === "prompt.open")[0]!.d as any;
+
+    transport.receive(
+      inbound("prompt.answer", {
+        promptId: firstPrompt.promptId,
+        answer: {
+          answers: [
+            { questionIndex: 0, optionIds: ["0"] },
+            { questionIndex: 1, optionIds: ["0"] },
+            { questionIndex: 2, optionIds: ["0"] },
+            { questionIndex: 3, optionIds: ["0"] },
+          ],
+        },
+      }),
+    );
+    await flushAsync();
+    await session.pollTranscriptNow();
+
+    expect(transport.sent.filter((e) => e.t === "prompt.open")).toHaveLength(1);
+    expect(session.broker.openCount).toBe(0);
+  });
 });
