@@ -450,9 +450,10 @@ describe("gentle-pi 4.1.0 adapters (fixtures taken from the real tool source)", 
     expect(piAskUser.fromResult(askUserArgs, undefined)).toEqual({ cancelled: true });
   });
 
-  async function runRegistry(args: any, tool: string, phoneAnswer: any | null, localValue?: any) {
+  async function runRegistry(args: any, tool: string, phoneAnswer: any | null, localValue?: any, caps?: { freeTextByDefault: boolean }) {
     const { broker, of } = mkBroker();
     const reg = new AdapterRegistry(broker);
+    if (caps) reg.caps = caps;
     reg.onStart({ toolCallId: "tc1", toolName: tool, args });
     expect(reg.active()).toBe(true);
     let done!: (v: unknown) => void;
@@ -476,6 +477,16 @@ describe("gentle-pi 4.1.0 adapters (fixtures taken from the real tool source)", 
     expect(r.open).toMatchObject({ kind: "select", category: "question", source: { extension: "gentle-pi", tool: "ask_user_choice" } });
     expect(r.of("prompt.ack")).toEqual([{ promptId: r.open.promptId, accepted: true }]);
     expect(r.of("prompt.resolved")).toHaveLength(0);
+  });
+  it("registry: a free-text phone answer reaches done() when gentle-pi 5.x defaults to it", async () => {
+    const { allowCustomResponse: _dropped, ...noFlag } = choiceArgs;
+    const r = await runRegistry(noFlag, "ask_user_choice", { text: "my own" }, undefined, { freeTextByDefault: true });
+    expect(r.open).toMatchObject({ kind: "select", allowFreeText: true });
+    expect(r.v).toEqual({ customResponse: "my own" });
+    // same call under the 4.x default: the tool never offered free text, so only options are accepted
+    const legacy = await runRegistry(noFlag, "ask_user_choice", { optionIds: ["0"] }, undefined, { freeTextByDefault: false });
+    expect(legacy.open).toMatchObject({ kind: "select", allowFreeText: false });
+    expect(legacy.v).toEqual({ value: "tok-fast", label: "Fast", index: 1 });
   });
   it("registry: terminal answers resolve the prompt as local", async () => {
     const r = await runRegistry(choiceArgs, "ask_user_choice", null, { value: "tok-safe", label: "Safe", index: 2 });

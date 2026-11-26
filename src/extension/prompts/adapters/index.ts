@@ -82,7 +82,7 @@ export class AdapterRegistry implements CustomInterceptor {
         .then((answer) => {
           if (p.closed || p.cancelledBySystem || settled) return;
           answeredRemotely = true;
-          const result = cur.adapter.toResult(cur.args, answer);
+          const result = cur.adapter.toResult(cur.args, answer, this.caps);
           if (doneRef) {
             doneRef(result);
           } else {
