@@ -5,6 +5,13 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-26
+
+Fix for the phone free-text answer path added in 0.5.0.
+
+### Fixed
+- **Free-text answers were dropped**: `AdapterRegistry` passed the resolved capabilities to `toPrompt` but not to `toResult` (`src/extension/prompts/adapters/index.ts:85`). With gentle-pi 5.0.0, an `ask_user_choice` call that omits `allowCustomResponse` was mirrored with the free-text row, but a free-text answer typed on the phone reached `done(undefined)` — the tool read it as a cancellation. The capabilities now reach both directions, pinned by a registry test that fails without the fix.
+
 ## [0.5.0] - 2026-11-26
 
 Support for gentle-pi 5.x: `ask_user_*` questions are mirrored to the phone again instead of falling back to the terminal-only notification.
