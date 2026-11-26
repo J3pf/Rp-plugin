@@ -9,7 +9,7 @@ import { Connection } from "../extension/connection.ts";
 import { resolveInboxDir, type RpConfig } from "../extension/config.ts";
 import { relayBlobFetcher, resolveAttachments } from "../extension/attachments.ts";
 import { routeInbound, pendingAnswers } from "../extension/inbound.ts";
-import { Broker } from "../extension/prompts/broker.ts";
+import { Broker, type OpenPrompt } from "../extension/prompts/broker.ts";
 import { Classifier, promptContext } from "../extension/prompts/classify.ts";
 import { ALLOW, ALLOW_SESSION, DENY, DENY_REASON, allowKey, compilePatterns, decide } from "../extension/prompts/gate.ts";
 import { pluginVersion } from "../extension/version.ts";
@@ -34,6 +34,14 @@ import {
 } from "./bridge/agy-hooks.ts";
 import { AgyGateServer, type GateSocketRequest } from "./bridge/gate-server.ts";
 import {
+  MAX_AGY_QUESTIONNAIRE_BATCH,
+  buildAskQuestionKeystrokePlan,
+  buildAskQuestionPromptSpec,
+  deliverAskQuestionPlan,
+  type AgyAskQuestionSpec,
+  type HerdrInputStep,
+} from "./bridge/agy-ask-question.ts";
+import {
   extractRecentCommandOutput,
   herdrPriorityStatusRank,
   mapHerdrAgentStatus,
@@ -51,6 +59,7 @@ import {
   type AgentClosedReason,
   type AgentHelloBody,
   type AgentStatus,
+  type Answer,
   type DeliveryError,
   type Envelope,
   type UserMessageBody,
@@ -95,6 +104,7 @@ interface BridgedSessionDeps {
   startDelayMs?: number;
   activePollIntervalMs?: number;
   idlePollIntervalMs?: number;
+  askQuestionStepDelayMs?: number;
   retireOnly?: boolean;
   onSessionClosedByCommand?: (sessionKey: string, paneId: string) => void;
 }
@@ -143,6 +153,15 @@ export class BridgedAgentSession {
   private deliveryTail: Promise<void> = Promise.resolve();
   private seenClientMsgIds = new LruSet(500);
   private lastActiveTask: string | null = null;
+  private activeAskQuestion: {
+    key: string;
+    spec: AgyAskQuestionSpec;
+    questionOffset: number;
+    prompt: OpenPrompt;
+  } | null = null;
+  private deliveringAskQuestionKey: string | null = null;
+  private handledAskQuestionKeys = new LruSet(100);
+  private askQuestionPollTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private info: HerdrDiscoveredAgent,
@@ -597,6 +616,7 @@ export class BridgedAgentSession {
         ...(lastActivityAt ? { lastActivityAt } : {}),
       });
       this.emitSnapshotFollowupEvents(direct, events, entries);
+      this.reconcileAskQuestion();
       if (!hadRunning && this.hasRunningTranscriptWork()) {
         this.scheduleNextPoll();
       }
@@ -687,8 +707,9 @@ export class BridgedAgentSession {
   private scheduleNextPoll(): void {
     if (this.disposed) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
-    const isWorking = this.effectiveStatus() === "working" || this.hasRunningTranscriptWork();
-    const delayMs = isWorking
+    const status = this.effectiveStatus();
+    const isActive = status === "working" || status === "waiting_input" || this.hasRunningTranscriptWork();
+    const delayMs = isActive
       ? (this.d.activePollIntervalMs ?? (this.transcriptReader ? 900 : 2_000))
       : (this.d.idlePollIntervalMs ?? (this.watcher ? 15_000 : 20_000));
     this.pollTimer = setTimeout(() => {
@@ -751,6 +772,7 @@ export class BridgedAgentSession {
           if (!hadRunning && this.hasRunningTranscriptWork()) {
             this.scheduleNextPoll();
           }
+          this.reconcileAskQuestion();
           if (offsetAdvanced || events.length > 0) {
             this.syncSessionNameIfChanged();
             this.syncContextIfChanged();
@@ -1113,6 +1135,149 @@ export class BridgedAgentSession {
     }
   }
 
+  private clearAskQuestionPollTimer(): void {
+    if (this.askQuestionPollTimer) {
+      clearTimeout(this.askQuestionPollTimer);
+      this.askQuestionPollTimer = null;
+    }
+  }
+
+  private scheduleAskQuestionFollowupPoll(): void {
+    if (this.disposed) return;
+    this.clearAskQuestionPollTimer();
+    this.askQuestionPollTimer = setTimeout(() => {
+      this.askQuestionPollTimer = null;
+      if (!this.disposed) void this.pollTranscriptNow();
+    }, 300);
+    this.askQuestionPollTimer.unref?.();
+  }
+
+  /**
+   * Mirror pending agy `ask_question` tool calls to the mobile PromptSheet and dismiss them
+   * immediately when resolved locally in the terminal.
+   */
+  private reconcileAskQuestion(): void {
+    if (this.disposed || !this.transcriptReader) return;
+    const pending = this.transcriptReader.getPendingAskQuestion();
+
+    if (this.activeAskQuestion && (!pending || pending.key !== this.activeAskQuestion.key)) {
+      const prev = this.activeAskQuestion;
+      this.activeAskQuestion = null;
+      if (!prev.prompt.closed && !prev.prompt.answered) {
+        this.broker.close(prev.prompt);
+        this.broker.resolved(prev.prompt, "local", null);
+      }
+    }
+
+    if (
+      pending &&
+      this.info.paneId &&
+      !this.activeAskQuestion &&
+      this.deliveringAskQuestionKey !== pending.key &&
+      !this.handledAskQuestionKeys.has(pending.key)
+    ) {
+      this.openAskQuestionBatch(pending.key, pending.spec, 0);
+    }
+  }
+
+  private openAskQuestionBatch(key: string, spec: AgyAskQuestionSpec, questionOffset: number): void {
+    if (this.disposed) return;
+    const promptSpec = buildAskQuestionPromptSpec(spec, questionOffset);
+    const prompt = this.broker.openSpec(promptSpec, true);
+    this.activeAskQuestion = { key, spec, questionOffset, prompt };
+    void prompt.remoteAnswer.then((answer) => {
+      this.handleAskQuestionRemoteAnswer(key, spec, questionOffset, prompt, answer);
+    });
+  }
+
+  private handleAskQuestionRemoteAnswer(
+    key: string,
+    spec: AgyAskQuestionSpec,
+    questionOffset: number,
+    prompt: OpenPrompt,
+    answer: Answer,
+  ): void {
+    if (this.disposed || prompt.cancelledBySystem) return;
+    if (this.activeAskQuestion?.prompt.id !== prompt.id) return;
+
+    const currentPending = this.transcriptReader?.getPendingAskQuestion();
+    if (!currentPending || currentPending.key !== key) {
+      this.activeAskQuestion = null;
+      this.broker.ack(prompt.id, false);
+      this.broker.close(prompt);
+      this.broker.resolved(prompt, "local", null);
+      return;
+    }
+
+    const plan = buildAskQuestionKeystrokePlan(spec, answer, questionOffset);
+    if (!plan || !this.info.paneId) {
+      this.d.onLog?.(`[${this.agentId}] rejected malformed or undeliverable ask_question answer`);
+      this.broker.ack(prompt.id, false);
+      this.broker.close(prompt);
+      return;
+    }
+
+    const cancelled = (answer as { cancelled?: boolean }).cancelled === true;
+    const nextOffset = questionOffset + MAX_AGY_QUESTIONNAIRE_BATCH;
+    const hasMoreBatches = !cancelled && nextOffset < spec.questions.length;
+    if (!hasMoreBatches) {
+      this.handledAskQuestionKeys.add(key);
+    }
+
+    this.activeAskQuestion = null;
+    this.deliveringAskQuestionKey = key;
+    this.broker.ack(prompt.id, true);
+    this.broker.close(prompt);
+    this.broker.resolved(prompt, "remote", answer);
+
+    const env: Record<string, string> = this.d.herdrSession ? { HERDR_SESSION: this.d.herdrSession } : {};
+    const run = this.deliveryTail.then(
+      () => this.deliverAskQuestionBatch(key, spec, nextOffset, hasMoreBatches, plan, env),
+      () => this.deliverAskQuestionBatch(key, spec, nextOffset, hasMoreBatches, plan, env),
+    );
+    this.deliveryTail = run.catch(() => {});
+  }
+
+  private async deliverAskQuestionBatch(
+    key: string,
+    spec: AgyAskQuestionSpec,
+    nextOffset: number,
+    hasMoreBatches: boolean,
+    plan: readonly HerdrInputStep[],
+    env: Record<string, string>,
+  ): Promise<void> {
+    try {
+      if (this.disposed) return;
+      if (this.transcriptReader?.getPendingAskQuestion()?.key !== key) return;
+
+      const ok = await deliverAskQuestionPlan(this.d.runner, this.info.paneId, env, plan, {
+        stepDelayMs: this.d.askQuestionStepDelayMs,
+        shouldAbort: () => this.disposed || this.transcriptReader?.getPendingAskQuestion()?.key !== key,
+      });
+      if (!ok) {
+        this.handledAskQuestionKeys.add(key);
+        this.d.onLog?.(`[${this.agentId}] failed to deliver ask_question answer to pane ${this.info.paneId}`);
+        return;
+      }
+      if (this.disposed) return;
+
+      if (hasMoreBatches) {
+        if (this.transcriptReader?.getPendingAskQuestion()?.key === key) {
+          this.openAskQuestionBatch(key, spec, nextOffset);
+        }
+        return;
+      }
+
+      this.armOptimisticWorking();
+      this.reconcileStatus();
+      this.scheduleAskQuestionFollowupPoll();
+    } finally {
+      if (this.deliveringAskQuestionKey === key) {
+        this.deliveringAskQuestionKey = null;
+      }
+    }
+  }
+
   private clearGitRefreshTimer(): void {
     if (this.gitRefreshTimer) {
       clearTimeout(this.gitRefreshTimer);
@@ -1184,6 +1349,9 @@ export class BridgedAgentSession {
     this.clearOptimisticWorking();
     this.clearOrderHelloTimer();
     this.clearGitRefreshTimer();
+    this.clearAskQuestionPollTimer();
+    this.activeAskQuestion = null;
+    this.deliveringAskQuestionKey = null;
     if (this.closeTimer) clearTimeout(this.closeTimer);
     this.closeTimer = null;
     if (this.reconnectDebounce) clearTimeout(this.reconnectDebounce);

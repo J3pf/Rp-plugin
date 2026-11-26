@@ -48,6 +48,12 @@ import {
   type ContextUsageInfo,
 } from "./bridge/agy-paths.ts";
 import { readAgySessionModel } from "./bridge/external-metadata.ts";
+import {
+  isAgyAskQuestionToolName,
+  parseAgyAskQuestionArgs,
+  type AgyAskQuestionSpec,
+  type PendingAgyAskQuestion,
+} from "./bridge/agy-ask-question.ts";
 import { isInside } from "./validate.ts";
 
 export {
@@ -67,11 +73,13 @@ export {
   resolveAgyContextWindow,
   resolveAgyTranscriptPath,
   summarizeAgyToolTask,
+  type AgyAskQuestionSpec,
   type AgyMediaRaw,
   type AgyStepRaw,
   type AgyToolCallRaw,
   type ContextUsageInfo,
   type NormalizedAgyTool,
+  type PendingAgyAskQuestion,
 };
 
 const MAX_SUBAGENTS = 100;
@@ -106,6 +114,7 @@ interface ChildCursor {
 }
 
 interface PendingTool {
+  stepIndex: number;
   toolCallId: string;
   name: string;
   args: Record<string, unknown>;
@@ -114,6 +123,7 @@ interface PendingTool {
   killTaskSender?: string;
   subagentSpec?: { role: string; typeName: string; prompt: string; model?: string };
   subagentIds?: string[];
+  askQuestionSpec?: AgyAskQuestionSpec;
 }
 
 interface BackgroundTaskCursor {
@@ -309,12 +319,30 @@ export class AgyTranscriptReader {
     return this.offset;
   }
 
+  /** Return the currently pending interactive `ask_question` tool call, if any. */
+  getPendingAskQuestion(): PendingAgyAskQuestion | null {
+    for (let i = this.pendingTools.length - 1; i >= 0; i--) {
+      const t = this.pendingTools[i]!;
+      if (t.askQuestionSpec) {
+        return {
+          key: `${t.toolCallId}@${t.stepIndex}`,
+          stepIndex: t.stepIndex,
+          toolCallId: t.toolCallId,
+          spec: t.askQuestionSpec,
+          at: t.at,
+        };
+      }
+    }
+    return null;
+  }
+
   /** Return a compact description of the currently executing tool call, if any. */
   getActiveTask(): string | null {
     if (this.redact()) return null;
-    if (this.pendingTools.length > 0) {
-      const latest = this.pendingTools[this.pendingTools.length - 1]!;
-      return summarizeAgyToolTask(latest.name, latest.args);
+    for (let i = this.pendingTools.length - 1; i >= 0; i--) {
+      const t = this.pendingTools[i]!;
+      if (t.askQuestionSpec || isAgyAskQuestionToolName(t.name)) continue;
+      return summarizeAgyToolTask(t.name, t.args);
     }
     let latestBg: BackgroundTaskCursor | null = null;
     for (const bg of this.bgTasks.values()) {
@@ -406,13 +434,13 @@ export class AgyTranscriptReader {
           const isTailPlannerOrSys =
             (isTailLine && (step.type === "PLANNER_RESPONSE" || step.type === "SYSTEM_MESSAGE")) ||
             (step.type === "SYSTEM_MESSAGE" && (this.convToTaskId.size > 0 || this.bgTasks.size > 0));
-          const isSubagentToolCall =
+          const needsFullToolCalls =
             step.type === "PLANNER_RESPONSE" &&
             Boolean(truncFields?.includes("tool_calls")) &&
             Array.isArray(step.tool_calls) &&
-            step.tool_calls.some((tc) => tc?.name === "invoke_subagent");
+            step.tool_calls.some((tc) => tc?.name === "invoke_subagent" || isAgyAskQuestionToolName(tc?.name));
 
-          if (hasTrunc && (isTailPlannerOrSys || isSubagentToolCall)) {
+          if (hasTrunc && (isTailPlannerOrSys || needsFullToolCalls)) {
             if (fullStepsMap === undefined) {
               fullStepsMap = this.getFullStepsMap();
             }
@@ -954,11 +982,18 @@ export class AgyTranscriptReader {
       }
     }
 
-    for (const norms of expandedPerCall) {
+    for (let ci = 0; ci < expandedPerCall.length; ci++) {
+      const norms = expandedPerCall[ci]!;
       if (norms.length === 0) continue;
+      const rawCall = calls[ci];
       const first = norms[0]!;
       const subagentIds = norms.filter((n) => Boolean(n.subagentSpec)).map((n) => n.toolCallId);
+      const askQuestionSpec =
+        rawCall && isAgyAskQuestionToolName(rawCall.name)
+          ? parseAgyAskQuestionArgs(rawCall.args ?? rawCall.arguments) ?? undefined
+          : undefined;
       this.pendingTools.push({
+        stepIndex,
         toolCallId: first.toolCallId,
         name: first.name,
         args: first.args,
@@ -967,6 +1002,7 @@ export class AgyTranscriptReader {
         ...(first.killTaskSender ? { killTaskSender: first.killTaskSender } : {}),
         subagentSpec: first.subagentSpec,
         ...(subagentIds.length > 0 ? { subagentIds } : {}),
+        ...(askQuestionSpec ? { askQuestionSpec } : {}),
       });
       for (const norm of norms) {
         outEvents.push({

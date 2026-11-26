@@ -7,6 +7,7 @@ import { SAFE_CONV_ID_RE, truncateBytes } from "../shared/util.js";
 import { AGY_CLAUDE_CONTEXT_WINDOW, AGY_CONTEXT_WINDOW, AGY_GEMINI_CONTEXT_WINDOW, AGY_GPT_OSS_CONTEXT_WINDOW, computeContextUsage, extractAgyUserText, extractSessionTopic, isBackgroundTaskError, isFinalBackgroundWakeup, isSafeSystemSender, normalizeAgyToolCall, normalizeAgyToolCalls, parseAgyArgs, parseBackgroundTaskAck, parseSpawnedSubagentRefs, parseSystemWakeup, readFullStepsMap, readLogTail, readTranscriptChunk, realpathOrNull, resolveAgyContextWindow, resolveAllowedFileUri, resolveSafeFileCandidate, stepTimestampMs, subagentChanged, summarizeAgyToolTask, toNonNegInt, } from "./bridge/agy-normalize.js";
 import { AGY_TAIL_WINDOW_BYTES, MODEL_CHANGE_RE, inferAgyHomeFromTranscriptPath, readTailBuffer, resolveAgyTranscriptPath, } from "./bridge/agy-paths.js";
 import { readAgySessionModel } from "./bridge/external-metadata.js";
+import { isAgyAskQuestionToolName, parseAgyAskQuestionArgs, } from "./bridge/agy-ask-question.js";
 import { isInside } from "./validate.js";
 export { AGY_CLAUDE_CONTEXT_WINDOW, AGY_CONTEXT_WINDOW, AGY_GEMINI_CONTEXT_WINDOW, AGY_GPT_OSS_CONTEXT_WINDOW, AGY_TAIL_WINDOW_BYTES, MODEL_CHANGE_RE, extractAgyUserText, extractSessionTopic, inferAgyHomeFromTranscriptPath, normalizeAgyToolCall, normalizeAgyToolCalls, parseAgyArgs, readTailBuffer, resolveAgyContextWindow, resolveAgyTranscriptPath, summarizeAgyToolTask, };
 const MAX_SUBAGENTS = 100;
@@ -189,13 +190,31 @@ export class AgyTranscriptReader {
     get byteOffset() {
         return this.offset;
     }
+    /** Return the currently pending interactive `ask_question` tool call, if any. */
+    getPendingAskQuestion() {
+        for (let i = this.pendingTools.length - 1; i >= 0; i--) {
+            const t = this.pendingTools[i];
+            if (t.askQuestionSpec) {
+                return {
+                    key: `${t.toolCallId}@${t.stepIndex}`,
+                    stepIndex: t.stepIndex,
+                    toolCallId: t.toolCallId,
+                    spec: t.askQuestionSpec,
+                    at: t.at,
+                };
+            }
+        }
+        return null;
+    }
     /** Return a compact description of the currently executing tool call, if any. */
     getActiveTask() {
         if (this.redact())
             return null;
-        if (this.pendingTools.length > 0) {
-            const latest = this.pendingTools[this.pendingTools.length - 1];
-            return summarizeAgyToolTask(latest.name, latest.args);
+        for (let i = this.pendingTools.length - 1; i >= 0; i--) {
+            const t = this.pendingTools[i];
+            if (t.askQuestionSpec || isAgyAskQuestionToolName(t.name))
+                continue;
+            return summarizeAgyToolTask(t.name, t.args);
         }
         let latestBg = null;
         for (const bg of this.bgTasks.values()) {
@@ -287,11 +306,11 @@ export class AgyTranscriptReader {
                     const isTailLine = li >= chunk.lines.length - 5;
                     const isTailPlannerOrSys = (isTailLine && (step.type === "PLANNER_RESPONSE" || step.type === "SYSTEM_MESSAGE")) ||
                         (step.type === "SYSTEM_MESSAGE" && (this.convToTaskId.size > 0 || this.bgTasks.size > 0));
-                    const isSubagentToolCall = step.type === "PLANNER_RESPONSE" &&
+                    const needsFullToolCalls = step.type === "PLANNER_RESPONSE" &&
                         Boolean(truncFields?.includes("tool_calls")) &&
                         Array.isArray(step.tool_calls) &&
-                        step.tool_calls.some((tc) => tc?.name === "invoke_subagent");
-                    if (hasTrunc && (isTailPlannerOrSys || isSubagentToolCall)) {
+                        step.tool_calls.some((tc) => tc?.name === "invoke_subagent" || isAgyAskQuestionToolName(tc?.name));
+                    if (hasTrunc && (isTailPlannerOrSys || needsFullToolCalls)) {
                         if (fullStepsMap === undefined) {
                             fullStepsMap = this.getFullStepsMap();
                         }
@@ -789,12 +808,18 @@ export class AgyTranscriptReader {
                 outEvents.push({ type: "message_end", message: msg });
             }
         }
-        for (const norms of expandedPerCall) {
+        for (let ci = 0; ci < expandedPerCall.length; ci++) {
+            const norms = expandedPerCall[ci];
             if (norms.length === 0)
                 continue;
+            const rawCall = calls[ci];
             const first = norms[0];
             const subagentIds = norms.filter((n) => Boolean(n.subagentSpec)).map((n) => n.toolCallId);
+            const askQuestionSpec = rawCall && isAgyAskQuestionToolName(rawCall.name)
+                ? parseAgyAskQuestionArgs(rawCall.args ?? rawCall.arguments) ?? undefined
+                : undefined;
             this.pendingTools.push({
+                stepIndex,
                 toolCallId: first.toolCallId,
                 name: first.name,
                 args: first.args,
@@ -803,6 +828,7 @@ export class AgyTranscriptReader {
                 ...(first.killTaskSender ? { killTaskSender: first.killTaskSender } : {}),
                 subagentSpec: first.subagentSpec,
                 ...(subagentIds.length > 0 ? { subagentIds } : {}),
+                ...(askQuestionSpec ? { askQuestionSpec } : {}),
             });
             for (const norm of norms) {
                 outEvents.push({
