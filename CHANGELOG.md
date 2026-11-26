@@ -5,6 +5,17 @@ All notable changes to `@j3pf/pi-rp` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-26
+
+Support for gentle-pi 5.x: `ask_user_*` questions are mirrored to the phone again instead of falling back to the terminal-only notification.
+
+### Fixed
+- **gentle-pi 5.0.0 range**: the tested range is now `>=4.0 <6`. Loading gentle-pi 5.0.0 no longer disables the prompt adapters with `RP: gentle-pi 5.0.0 fuera del rango probado`, so questions from `ask_user_choice` / `ask_user_question` reach the phone and their answers are delivered back into the running tool. gentle-pi 5.0.0 keeps both tool names, parameter schemas, `ctx.ui.custom` dialogs, and result shapes; the range and the warning text now come from `GENTLE_RANGE` / `gentleRangeLabel()` instead of hardcoded literals.
+- **Free-text default**: gentle-pi 5.0.0 offers the "Type your answer" row unless a caller passes `allowCustomResponse: false` (4.x required `true`). `gentleFreeTextByDefault()` resolves the loaded version and the adapter registry publishes the mobile prompt — and maps its answer — with the same default the terminal dialog uses.
+
+### Changed
+- Development dependency on `gentle-pi` moved to `^5.0.0`, so the adapter and contract tests run against the version users actually load.
+
 ## [0.4.7] - 2026-11-25
 
 Bidirectional Antigravity CLI (`agy`) `ask_question` mirroring, performance optimizations, and 4R hardening.
